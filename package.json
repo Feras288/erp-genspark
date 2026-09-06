@@ -1,0 +1,28 @@
+{
+  "name": "erp-system",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ERP monorepo for Saudi market (NestJS + Next.js + PostgreSQL). Single-client today, SaaS-ready.",
+  "packageManager": "pnpm@8.15.4",
+  "scripts": {
+    "dev:backend": "pnpm --filter @erp/backend dev",
+    "dev:frontend": "pnpm --filter @erp/frontend dev",
+    "dev": "pnpm run dev:backend",
+    "build:backend": "pnpm --filter @erp/backend build",
+    "build:frontend": "pnpm --filter @erp/frontend build",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "db:generate": "pnpm --filter @erp/backend prisma:generate",
+    "db:migrate:dev": "pnpm --filter @erp/backend prisma:migrate:dev",
+    "db:migrate:deploy": "pnpm --filter @erp/backend prisma:migrate:deploy",
+    "db:seed": "pnpm --filter @erp/backend prisma:seed",
+    "db:studio": "pnpm --filter @erp/backend prisma:studio",
+    "db:reset": "pnpm --filter @erp/backend prisma:reset",
+    "format": "pnpm -r format"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.0",
+    "typescript": "^5.4.5"
+  }
+}

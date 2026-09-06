@@ -1,0 +1,162 @@
+// =====================================================
+// ERP System — Prisma schema
+// Saudi-market ERP, single-client today, SaaS-ready.
+// All commercial rows will carry companyId for multi-tenancy later.
+// =====================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================
+// Core: company (the tenant-equivalent for the future)
+// =====================================================
+
+model Company {
+  id        String   @id @default(cuid())
+  name      String
+  vatNumber String?  @unique
+  crNumber  String?  // Saudi Commercial Registration
+  address   String?
+  phone     String?
+  email     String?
+  logoUrl   String?
+  currency  String   @default("SAR")
+  vatRate   Decimal  @default(15.00) @db.Decimal(5, 2) // Saudi VAT default
+  fiscalYearStartMonth Int @default(1)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users     User[]
+  roles     Role[]
+
+  @@index([name])
+  @@map("companies")
+}
+
+// =====================================================
+// RBAC: users, roles, permissions
+// Every user belongs to ONE company today.
+// In phase 1 we add: login, JWT, refresh tokens, audit log.
+// =====================================================
+
+model User {
+  id           String   @id @default(cuid())
+  companyId    String
+  email        String
+  passwordHash String
+  fullName     String
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // SaaS-ready paranoid fields
+  deletedAt DateTime?
+
+  company     Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userRoles   UserRole[]
+  refreshTokens RefreshToken[]
+
+  @@unique([companyId, email])           // no duplicate emails inside one company
+  @@index([email])
+  @@index([companyId])
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  companyId   String?  // null => global / system role
+  name        String   // e.g. "Company Admin", "Accountant"
+  key         String   // machine key e.g. "company_admin"
+  description String?
+  isSystem    Boolean  @default(false)   // built-in system role, cannot be deleted
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  company            Company?         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userRoles          UserRole[]
+  rolePermissions    RolePermission[]
+
+  @@unique([companyId, key])
+  @@index([companyId])
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  key         String   @unique // e.g. "users.read", "sales.invoice.create"
+  module      String   // e.g. "users", "sales"
+  action      String   // e.g. "read", "create", "update", "delete"
+  description String?
+
+  rolePermissions RolePermission[]
+
+  @@index([module])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String
+  roleId String
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+// Refresh tokens for JWT rotation. Hashed at rest.
+model RefreshToken {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// Append-only audit trail of sensitive operations.
+model AuditLog {
+  id         String   @id @default(cuid())
+  companyId  String
+  userId     String?
+  action     String   // e.g. "auth.login", "user.create", "invoice.issue"
+  entity     String?  // e.g. "User", "SalesInvoice"
+  entityId   String?
+  metadata   Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([companyId, createdAt])
+  @@index([userId])
+  @@index([action])
+  @@map("audit_logs")
+}

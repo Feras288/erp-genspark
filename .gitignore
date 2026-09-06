@@ -1,0 +1,55 @@
+# =====================================================
+# ERP system — global .gitignore
+# =====================================================
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+
+# Build outputs
+dist/
+.next/
+out/
+build/
+.turbo/
+
+# Env files (SECURITY: never commit secrets)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+coverage/
+.nyc_output
+
+# Prisma generated client
+backend/prisma/migrations/dev.db*
+
+# Postgres local data
+.pgdata/
+
+# Backups
+*.tar.gz
+*.backup
+*.bak
+
+# OS
+Thumbs.db

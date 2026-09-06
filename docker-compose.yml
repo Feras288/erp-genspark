@@ -1,0 +1,63 @@
+# =====================================================
+# ERP System — Local development stack
+# Currently exposes PostgreSQL only.
+# Backend & frontend run via pnpm dev (hot reload).
+# =====================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: erp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-erp_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_dev_password_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-erp_dev}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - erp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_user} -d ${POSTGRES_DB:-erp_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend service (uncomment when you add backend Dockerfile)
+  # backend:
+  #   build:
+  #     context: ./backend
+  #     dockerfile: Dockerfile
+  #   container_name: erp_backend
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DATABASE_URL: postgresql://erp_user:erp_dev_password_change_me@postgres:5432/erp_dev?schema=public
+  #     JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+  #     JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+  #   ports:
+  #     - "${BACKEND_PORT:-3001}:3001"
+  #   volumes:
+  #     - ./backend:/app
+  #     - /app/node_modules
+
+  # Frontend service (uncomment when you add frontend Dockerfile)
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: erp_frontend
+  #   depends_on:
+  #     - backend
+  #   environment:
+  #     NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+  #   ports:
+  #     - "${FRONTEND_PORT:-3000}:3000"
+  #   volumes:
+  #     - ./frontend:/app
+  #     - /app/node_modules
+
+volumes:
+  erp_pgdata:
+    driver: local

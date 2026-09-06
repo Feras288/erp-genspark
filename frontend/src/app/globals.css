@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-sans: 'Cairo', 'Tajawal', 'Noto Sans Arabic', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+}
