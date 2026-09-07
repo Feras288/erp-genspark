@@ -7,6 +7,8 @@
 // Phase 4B-1: Sales backend skeleton (read-only list/get +
 //             DTOs/build-only; full create/issue/cancel/POS
 //             land in Phase 4B-2 and 4B-3).
+// Phase 5: Purchases Core (DRAFT create/update/delete, receive, cancel).
+// Phase 6: Accounting Core (Chart of Accounts + Manual Journal Entries only).
 // =====================================================
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
@@ -25,6 +27,7 @@ import { InventoryModule } from './inventory/inventory.module';
 import { SalesModule } from './sales/sales.module';
 import { PosModule } from './pos/pos.module';
 import { PurchasesModule } from './purchases/purchases.module';
+import { AccountingModule } from './accounting/accounting.module';
 
 @Module({
   imports: [
@@ -55,6 +58,10 @@ import { PurchasesModule } from './purchases/purchases.module';
     // Phase 5 — Purchases Core (DRAFT create/update/delete, receive, cancel).
     // No accounting, no GL, no COGS, no supplier balance, no payments.
     PurchasesModule,
+    // Phase 6 — Accounting Core (Chart of Accounts + Manual Journal Entries only).
+    // No reports, no ZATCA, no automated posting, no AR/AP, no payments,
+    // no cost accounting, no payroll, no SaaS billing, no returns/debit/credit notes.
+    AccountingModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.
