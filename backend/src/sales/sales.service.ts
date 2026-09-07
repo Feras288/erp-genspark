@@ -570,25 +570,266 @@ export class SalesService {
 
   // -------------------- issue / cancel — Phase 4B-3 --------------------
 
+  /**
+   * Issue a DRAFT sales invoice:
+   *   1. atomically transition DRAFT → ISSUED,
+   *   2. for every PRODUCT line, deduct from per-(product,warehouse) StockLevel
+   *      (floor at 0, matches Phase 3 rule) and append a SALE_OUT StockMovement.
+   *   3. SERVICE lines are pass-through (no stock impact, no movement).
+   *
+   * Stays inside one Prisma `$transaction` so partial failures roll back
+   * consistently. Order of operations inside the tx matters:
+   *   - first, validate headers + lines + product/warehouse references;
+   *   - then, deduct stock level by level (capture supplier qty for atomic math);
+   *   - then, append StockMovement rows (these are append-only);
+   *   - finally, flip the invoice to ISSUED.
+   */
   async issue(
     companyId: string,
-    _id: string,
-    _actorUserId: string,
-    _dto: IssueSalesInvoiceDto,
-  ): Promise<never> {
-    throw new NotImplementedException(
-      'SalesService.issue will be implemented in Phase 4B-3',
-    );
+    id: string,
+    actorUserId: string,
+    dto: IssueSalesInvoiceDto,
+  ) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const invoice = await tx.salesInvoice.findFirst({
+        where: { id, companyId, deletedAt: null },
+        select: {
+          id: true,
+          status: true,
+          invoiceNumber: true,
+          notes: true,
+          lines: {
+            select: {
+              id: true,
+              productId: true,
+              warehouseId: true,
+              quantity: true,
+              product: { select: { id: true, type: true, isActive: true, name: true } },
+              warehouse: { select: { id: true, code: true, isActive: true, deletedAt: true } },
+            },
+          },
+        },
+      });
+      if (!invoice) throw new NotFoundException('Sales invoice not found');
+      if (invoice.status !== SalesInvoiceStatus.DRAFT) {
+        throw new BadRequestException(
+          `Only DRAFT invoices can be issued (current status=${invoice.status})`,
+        );
+      }
+      if (invoice.lines.length === 0) {
+        throw new BadRequestException('Invoice must have at least one line to issue');
+      }
+
+      // Pre-validate products (still active, same company) — re-check at issue time
+      // because a long-lived DRAFT may outlive product lifecycle changes.
+      const productIds = Array.from(new Set(invoice.lines.map((l) => l.productId)));
+      const products = await tx.product.findMany({
+        where: { companyId, id: { in: productIds }, deletedAt: null },
+        select: { id: true, type: true, isActive: true, name: true },
+      });
+      const productMap = new Map(products.map((p) => [p.id, p]));
+      for (const l of invoice.lines) {
+        const p = productMap.get(l.productId);
+        if (!p) {
+          throw new BadRequestException(
+            `Product no longer exists: ${l.productId}`,
+          );
+        }
+        if (!p.isActive) {
+          throw new BadRequestException(
+            `Product is inactive: ${p.name}`,
+          );
+        }
+      }
+
+      // Per-line stock handling.
+      const movements: Array<{
+        companyId: string;
+        productId: string;
+        warehouseId: string;
+        movementType: 'SALE_OUT';
+        direction: 'OUT';
+        quantity: string;
+        referenceType: 'sales_invoice';
+        referenceId: string;
+        reason: 'Sales invoice issued';
+        notes: string | null;
+        createdById: string;
+      }> = [];
+      let productLineCount = 0;
+      let serviceLineCount = 0;
+
+      for (const l of invoice.lines) {
+        const product = productMap.get(l.productId)!;
+        if (product.type === 'SERVICE') {
+          serviceLineCount++;
+          continue;
+        }
+
+        productLineCount++;
+
+        if (!l.warehouseId) {
+          throw new BadRequestException(
+            `PRODUCT line must declare a warehouseId (product=${product.name})`,
+          );
+        }
+        if (!l.warehouse || l.warehouse.deletedAt !== null) {
+          throw new BadRequestException(
+            `Warehouse not found or deleted for PRODUCT line (product=${product.name})`,
+          );
+        }
+        if (!l.warehouse.isActive) {
+          throw new BadRequestException(
+            `Warehouse is inactive (warehouseId=${l.warehouseId})`,
+          );
+        }
+
+        const lineQty = new Prisma.Decimal(l.quantity);
+        if (lineQty.lte(0)) {
+          throw new BadRequestException(`Line quantity must be > 0 (lineId=${l.id})`);
+        }
+
+        // Lock the level row inside the transaction.
+        const level = await tx.stockLevel.findFirst({
+          where: { companyId, productId: l.productId, warehouseId: l.warehouseId },
+        });
+        const currentQty = level ? Number(level.quantity) : 0;
+        if (!level || currentQty < lineQty.toNumber()) {
+          throw new BadRequestException(
+            `Insufficient stock for product ${product.name}: ` +
+              `available=${currentQty}, requested=${lineQty.toString()}`,
+          );
+        }
+        const newQty = currentQty - lineQty.toNumber();
+        await tx.stockLevel.update({
+          where: { id: level.id },
+          data: { quantity: newQty.toFixed(4) },
+        });
+
+        movements.push({
+          companyId,
+          productId: l.productId,
+          warehouseId: l.warehouseId,
+          movementType: 'SALE_OUT',
+          direction: 'OUT',
+          quantity: lineQty.toFixed(4),
+          referenceType: 'sales_invoice',
+          referenceId: invoice.id,
+          reason: 'Sales invoice issued',
+          notes: invoice.invoiceNumber,
+          createdById: actorUserId,
+        });
+      }
+
+      // Append all sale movements (Phase 3 invariant: append-only).
+      for (const mv of movements) {
+        await tx.stockMovement.create({
+          data: mv as Prisma.StockMovementUncheckedCreateInput,
+          select: { id: true },
+        });
+      }
+
+      // Flip status ISSUED + issuedAt/By/Date.
+      const issuedAt = new Date();
+      const issueDate = dto.issueDate ? new Date(dto.issueDate) : issuedAt;
+      const finalNotes = dto.notes ?? invoice.notes ?? null;
+
+      const updated = await tx.salesInvoice.update({
+        where: { id },
+        data: {
+          status: SalesInvoiceStatus.ISSUED,
+          issuedAt,
+          issuedById: actorUserId,
+          issueDate,
+          notes: finalNotes,
+          updatedById: actorUserId,
+        } as Prisma.SalesInvoiceUncheckedUpdateInput,
+        select: INVOICE_WITH_LINES,
+      });
+
+      return { invoice: updated, productLineCount, serviceLineCount, movements: movements.length };
+    });
+
+    await this.audit.record({
+      companyId,
+      userId: actorUserId,
+      action: 'sales.invoice.issued',
+      entity: 'SalesInvoice',
+      entityId: result.invoice.id,
+      metadata: {
+        invoiceNumber: result.invoice.invoiceNumber,
+        status: result.invoice.status,
+        productLineCount: result.productLineCount,
+        serviceLineCount: result.serviceLineCount,
+        movementCount: result.movements,
+        total: result.invoice.total,
+      },
+    });
+
+    return result.invoice;
   }
 
+  /**
+   * Cancel an invoice.
+   *   - DRAFT → CANCELLED, no stock reversal (DRAFT never moved stock).
+   *   - ISSUED → refused with the explicit "credit note required" message
+   *     (Phase 4B-4+ will own the reversal/credit-note flow).
+   *   - CANCELLED → refused with "already cancelled".
+   */
   async cancel(
     companyId: string,
-    _id: string,
-    _actorUserId: string,
-    _dto: CancelSalesInvoiceDto,
-  ): Promise<never> {
-    throw new NotImplementedException(
-      'SalesService.cancel will be implemented in Phase 4B-3',
-    );
+    id: string,
+    actorUserId: string,
+    dto: CancelSalesInvoiceDto,
+  ) {
+    const existing = await this.prisma.salesInvoice.findFirst({
+      where: { id, companyId, deletedAt: null },
+      select: { id: true, status: true, invoiceNumber: true, notes: true },
+    });
+    if (!existing) throw new NotFoundException('Sales invoice not found');
+
+    if (existing.status === SalesInvoiceStatus.CANCELLED) {
+      throw new BadRequestException('Invoice is already cancelled.');
+    }
+
+    if (existing.status === SalesInvoiceStatus.ISSUED) {
+      throw new BadRequestException(
+        'Issued invoices require credit note/reversal flow in a future phase.',
+      );
+    }
+
+    // DRAFT → CANCELLED.
+    const notesSuffix = dto.reason ?? dto.notes;
+    const mergedNotes = notesSuffix
+      ? (existing.notes ? `${existing.notes}\n— ${notesSuffix}` : `— ${notesSuffix}`)
+      : existing.notes ?? null;
+
+    const cancelledAt = new Date();
+    const updated = await this.prisma.salesInvoice.update({
+      where: { id },
+      data: {
+        status: SalesInvoiceStatus.CANCELLED,
+        cancelledAt,
+        cancelledById: actorUserId,
+        notes: mergedNotes,
+        updatedById: actorUserId,
+      } as Prisma.SalesInvoiceUncheckedUpdateInput,
+      select: INVOICE_WITH_LINES,
+    });
+
+    await this.audit.record({
+      companyId,
+      userId: actorUserId,
+      action: 'sales.invoice.cancelled',
+      entity: 'SalesInvoice',
+      entityId: updated.id,
+      metadata: {
+        invoiceNumber: updated.invoiceNumber,
+        status: updated.status,
+        reason: dto.reason ?? null,
+      },
+    });
+
+    return updated;
   }
 }

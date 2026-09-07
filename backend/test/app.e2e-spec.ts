@@ -939,3 +939,313 @@ describe('Phase 3: Inventory (e2e)', () => {
     expect(typesB.has('TRANSFER_IN')).toBe(true);
   });
 });
+
+// =====================================================
+// Phase 4 — Sales (e2e).
+// companyId scoped strictly from JWT. Sales invoice issue flow deducts
+// PRODUCT stock and appends a SALE_OUT StockMovement; SERVICE lines are
+// pass-through. Cancel: DRAFT→CANCELLED; ISSUED→blocked-by-credit-note.
+// =====================================================
+describe('Phase 4: Sales (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+
+  // Per-run unique codes/skus so re-running the suite doesn't hit dedupe.
+  const unique = Date.now().toString(36);
+  const SKU_PROD = `S4-PROD-${unique}`;
+  const SKU_SVC = `S4-SVC-${unique}`;
+  const WH_CODE = `S4-WH-${unique}`;
+
+  let productProdId = '';
+  let productSvcId = '';
+  let warehouseId = '';
+  // Filled in by issue tests so each test can find its own invoice id.
+  let lastIssuedInvoiceId = '';
+  let secondDraftId = '';
+  let firstIssueAvailableStock = 0;
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+
+    // Seed: 1 PRODUCT + 1 SERVICE + 1 warehouse + initial stock 100 in WH.
+    const pProd = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_PROD, name: 'Phase 4 Sales Product', type: 'PRODUCT' });
+    expect(pProd.status).toBe(201);
+    productProdId = pProd.body.id;
+
+    const pSvc = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_SVC, name: 'Phase 4 Sales Service', type: 'SERVICE' });
+    expect(pSvc.status).toBe(201);
+    productSvcId = pSvc.body.id;
+
+    const w = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: WH_CODE, name: 'Sales test warehouse' });
+    expect(w.status).toBe(201);
+    warehouseId = w.body.id;
+
+    const adj = await request(http)
+      .post(`${API_PREFIX}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        productId: productProdId,
+        warehouseId,
+        adjustmentType: 'ADJUSTMENT_IN',
+        quantity: '100.0000',
+        reason: 'Phase 4 e2e seed',
+      });
+    expect(adj.status).toBe(201);
+    firstIssueAvailableStock = 100;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('1) GET /sales/invoices without token => 401', async () => {
+    const res = await request(http).get(`${API_PREFIX}/sales/invoices`);
+    expect(res.status).toBe(401);
+  });
+
+  it('2) GET /sales/invoices as admin => 200 + paginated shape', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  it('3) POST /sales/invoices (SERVICE line) => 201 + server-side totals', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'e2e service-only draft',
+        lines: [
+          {
+            productId: productSvcId,
+            quantity: '3.0000',
+            unitPrice: '200.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBeDefined();
+    expect(res.body.status).toBe('DRAFT');
+    expect(res.body.invoiceNumber).toMatch(/^SI-\d{8}-\d{4}$/);
+    // 3 * 200 = 600; vat = 600 * 0.15 = 90; total = 690.
+    expect(Number(res.body.subtotal)).toBe(600);
+    expect(Number(res.body.vatTotal)).toBe(90);
+    expect(Number(res.body.total)).toBe(690);
+    expect(Array.isArray(res.body.lines)).toBe(true);
+    expect(res.body.lines.length).toBe(1);
+    expect(res.body.lines[0].productId).toBe(productSvcId);
+    expect(res.body.lines[0].warehouseId).toBeNull();
+  });
+
+  it('4) POST /sales/invoices (PRODUCT line + warehouse) => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'e2e product draft',
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '5.0000',
+            unitPrice: '100.0000',
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('DRAFT');
+    // 5 * 100 = 500; vat = 75; total = 575.
+    expect(Number(res.body.subtotal)).toBe(500);
+    expect(Number(res.body.vatTotal)).toBe(75);
+    expect(Number(res.body.total)).toBe(575);
+    expect(res.body.lines[0].warehouseId).toBe(warehouseId);
+    lastIssuedInvoiceId = res.body.id;
+  });
+
+  it('5) PATCH draft invoice => 200', async () => {
+    const res = await request(http)
+      .patch(`${API_PREFIX}/sales/invoices/${lastIssuedInvoiceId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'e2e update notes' });
+    expect(res.status).toBe(200);
+    expect(res.body.notes).toContain('e2e update notes');
+  });
+
+  it('6) POST /sales/invoices/:id/issue on draft with stock => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/sales/invoices/${lastIssuedInvoiceId}/issue`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'issuing from e2e' });
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('ISSUED');
+    expect(res.body.issuedAt).toBeDefined();
+    expect(res.body.issuedById).toBeDefined();
+    expect(Number(res.body.issueDate.slice(0, 4))).toBeGreaterThanOrEqual(2026);
+  });
+
+  it('7) Verify stock level decreased after issue', async () => {
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/levels?productId=${productProdId}&warehouseId=${warehouseId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const level = res.body.items.find(
+      (l: any) => l.productId === productProdId && l.warehouseId === warehouseId,
+    );
+    expect(level).toBeDefined();
+    // 100 initial - 5 sold = 95.
+    expect(Number(level.quantity)).toBe(firstIssueAvailableStock - 5);
+  });
+
+  it('8) Verify SALE_OUT movement created with sales_invoice reference', async () => {
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/movements?productId=${productProdId}&warehouseId=${warehouseId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const sale = res.body.items.find(
+      (m: any) =>
+        m.movementType === 'SALE_OUT' &&
+        m.referenceType === 'sales_invoice' &&
+        m.referenceId === lastIssuedInvoiceId,
+    );
+    expect(sale).toBeDefined();
+    expect(sale.direction).toBe('OUT');
+    expect(Number(sale.quantity)).toBe(5);
+  });
+
+  it('9) POST /sales/invoices/:id/issue on insufficient stock => 400', async () => {
+    // Top up inventory by 0 then create new draft asking for 9999 units.
+    const create = await request(http)
+      .post(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '9999.0000',
+            unitPrice: '1.0000',
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    secondDraftId = create.body.id;
+
+    const res = await request(http)
+      .post(`${API_PREFIX}/sales/invoices/${secondDraftId}/issue`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect(res.status).toBe(400);
+    expect(String(res.body.message ?? '')).toMatch(/insufficient stock/i);
+  });
+
+  it('10) PATCH issued invoice => 4xx rejection (cannot edit ISSUED)', async () => {
+    const res = await request(http)
+      .patch(`${API_PREFIX}/sales/invoices/${lastIssuedInvoiceId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'should be rejected' });
+    // Either 400 (BadRequestException) or 409 (ConflictException) is acceptable;
+    // the service currently uses ConflictException → 409 to signal state-conflict.
+    expect([400, 409]).toContain(res.status);
+  });
+
+  it('11) DELETE draft invoice => 200', async () => {
+    const create = await request(http)
+      .post(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        lines: [
+          {
+            productId: productSvcId,
+            quantity: '1.0000',
+            unitPrice: '50.0000',
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    const draftId = create.body.id;
+
+    const res = await request(http)
+      .delete(`${API_PREFIX}/sales/invoices/${draftId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.isActive).toBe(false);
+  });
+
+  it('12) POST /sales/invoices/:id/cancel on draft => 200 + status=CANCELLED', async () => {
+    const create = await request(http)
+      .post(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'will be cancelled',
+        lines: [
+          {
+            productId: productSvcId,
+            quantity: '2.0000',
+            unitPrice: '75.0000',
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    const draftId = create.body.id;
+
+    const res = await request(http)
+      .post(`${API_PREFIX}/sales/invoices/${draftId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'customer changed mind' });
+    // Nest default for POST without explicit @HttpCode is 201; accept either 200 or 201.
+    expect([200, 201]).toContain(res.status);
+    expect(res.body.status).toBe('CANCELLED');
+    expect(res.body.cancelledAt).toBeDefined();
+    expect(res.body.cancelledById).toBeDefined();
+    expect(res.body.notes).toContain('customer changed mind');
+  });
+
+  it('13) POST /sales/invoices/:id/cancel on ISSUED => 400 + credit-note message', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/sales/invoices/${lastIssuedInvoiceId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'should be refused' });
+    expect(res.status).toBe(400);
+    expect(String(res.body.message ?? '')).toMatch(/credit note/i);
+  });
+});
