@@ -313,8 +313,9 @@ model Warehouse {
   createdBy User?   @relation("WarehouseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
   updatedBy User?   @relation("WarehouseUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
 
-  stockLevels    StockLevel[]
-  stockMovements StockMovement[]
+  stockLevels      StockLevel[]
+  stockMovements   StockMovement[]
+  SalesInvoiceLine SalesInvoiceLine[]
 
   @@unique([companyId, code])
   @@index([companyId, isActive])
@@ -447,6 +448,7 @@ model SalesInvoiceLine {
   companyId      String
   invoiceId      String
   productId      String
+  warehouseId    String? // null for SERVICE lines; required for PRODUCT lines on issue
   description    String?
   quantity       Decimal  @db.Decimal(18, 4)
   unitPrice      Decimal  @db.Decimal(18, 4)
@@ -458,11 +460,13 @@ model SalesInvoiceLine {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  company Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  invoice SalesInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
-  product Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+  company   Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice   SalesInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product   Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse Warehouse?   @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
 
   @@index([companyId, invoiceId])
   @@index([companyId, productId])
+  @@index([companyId, warehouseId])
   @@map("sales_invoice_lines")
 }

@@ -4,6 +4,9 @@
 // Phase 2: Products + Partners (master data)
 // Phase 3: Inventory core (Warehouses + Stock Levels +
 //          Stock Movements + Adjustments + Transfers)
+// Phase 4B-1: Sales backend skeleton (read-only list/get +
+//             DTOs/build-only; full create/issue/cancel/POS
+//             land in Phase 4B-2 and 4B-3).
 // =====================================================
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
@@ -19,6 +22,7 @@ import { ProductsModule } from './products/products.module';
 import { PartnersModule } from './partners/partners.module';
 import { WarehousesModule } from './warehouses/warehouses.module';
 import { InventoryModule } from './inventory/inventory.module';
+import { SalesModule } from './sales/sales.module';
 
 @Module({
   imports: [
@@ -42,6 +46,8 @@ import { InventoryModule } from './inventory/inventory.module';
     // Phase 3 — inventory core
     WarehousesModule,
     InventoryModule,
+    // Phase 4B-1 — sales backend skeleton only (list/get live, full CRUD later)
+    SalesModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.
