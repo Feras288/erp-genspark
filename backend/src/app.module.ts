@@ -23,6 +23,7 @@ import { PartnersModule } from './partners/partners.module';
 import { WarehousesModule } from './warehouses/warehouses.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { SalesModule } from './sales/sales.module';
+import { PosModule } from './pos/pos.module';
 
 @Module({
   imports: [
@@ -48,6 +49,8 @@ import { SalesModule } from './sales/sales.module';
     InventoryModule,
     // Phase 4B-1 — sales backend skeleton only (list/get live, full CRUD later)
     SalesModule,
+    // Phase 4B-4 — POS backend (reuses SalesService for DRAFT-create + issue).
+    PosModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.

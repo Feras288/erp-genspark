@@ -1249,3 +1249,218 @@ describe('Phase 4: Sales (e2e)', () => {
     expect(String(res.body.message ?? '')).toMatch(/credit note/i);
   });
 });
+
+// =====================================================
+// Phase 4B-4 — POS (e2e).
+// POS sale = invoice type=POS created AND issued in one POST /api/pos/sales.
+// Reuses SalesService for DRAFT-create + issue so PRODUCT lines deduct
+// stock and append SALE_OUT StockMovement with referenceType='sales_invoice';
+// SERVICE lines are pass-through (no stock impact).
+// =====================================================
+describe('Phase 4B-4: POS (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+
+  // Per-run unique codes/skus so re-running the suite never collides.
+  const unique = Date.now().toString(36);
+  const SKU_PROD = `S44-POS-PROD-${unique}`;
+  const SKU_SVC = `S44-POS-SVC-${unique}`;
+  const WH_CODE = `S44-POS-WH-${unique}`;
+
+  let productProdId = '';
+  let productSvcId = '';
+  let warehouseId = '';
+  // Seed via ADJUSTMENT_IN with quantity 100.
+  const seededStock = 100;
+  // Filled by issue tests; used to verify the SALE_OUT movement references it.
+  let firstPosInvoiceId = '';
+  const firstIssueQty = 4;
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+
+    // Seed: 1 PRODUCT + 1 SERVICE + 1 warehouse + initial stock 100 in WH.
+    const pProd = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_PROD, name: 'Phase 4B-4 POS Product', type: 'PRODUCT' });
+    expect(pProd.status).toBe(201);
+    productProdId = pProd.body.id;
+
+    const pSvc = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_SVC, name: 'Phase 4B-4 POS Service', type: 'SERVICE' });
+    expect(pSvc.status).toBe(201);
+    productSvcId = pSvc.body.id;
+
+    const w = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: WH_CODE, name: 'POS test warehouse' });
+    expect(w.status).toBe(201);
+    warehouseId = w.body.id;
+
+    const adj = await request(http)
+      .post(`${API_PREFIX}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        productId: productProdId,
+        warehouseId,
+        adjustmentType: 'ADJUSTMENT_IN',
+        quantity: '100.0000',
+        reason: 'Phase 4B-4 e2e seed',
+      });
+    expect(adj.status).toBe(201);
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('1) GET /pos/sales without token => 401', async () => {
+    const res = await request(http).get(`${API_PREFIX}/pos/sales`);
+    expect(res.status).toBe(401);
+  });
+
+  it('2) GET /pos/sales as admin => 200 + paginated shape', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/pos/sales`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  it('3) POST /pos/sales (SERVICE only) => 201 ISSUED invoice type=POS', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/pos/sales`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        paymentMethod: 'CASH',
+        paidAmount: '115.0000',
+        notes: 'e2e pos service-only sale',
+        lines: [
+          {
+            productId: productSvcId,
+            quantity: '1.0000',
+            unitPrice: '100.0000',
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBeDefined();
+    expect(res.body.status).toBe('ISSUED');
+    expect(res.body.type).toBe('POS');
+    expect(res.body.paymentMethod).toBe('CASH');
+    expect(res.body.issuedAt).toBeDefined();
+    // 1 * 100 = 100; vat (15%) = 15; total = 115.
+    expect(Number(res.body.subtotal)).toBe(100);
+    expect(Number(res.body.vatTotal)).toBe(15);
+    expect(Number(res.body.total)).toBe(115);
+    expect(res.body.lines.length).toBe(1);
+    expect(res.body.lines[0].productId).toBe(productSvcId);
+  });
+
+  it('4) POST /pos/sales (PRODUCT line with stock) => 201 ISSUED', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/pos/sales`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        paymentMethod: 'CARD',
+        paidAmount: '460.0000',
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '4.0000',
+            unitPrice: '100.0000',
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('ISSUED');
+    expect(res.body.type).toBe('POS');
+    expect(res.body.paymentMethod).toBe('CARD');
+    expect(Array.isArray(res.body.lines)).toBe(true);
+    expect(res.body.lines.length).toBe(1);
+    expect(res.body.lines[0].warehouseId).toBe(warehouseId);
+    firstPosInvoiceId = res.body.id;
+  });
+
+  it('5) Verify stock level decreased after POS sale', async () => {
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/levels?productId=${productProdId}&warehouseId=${warehouseId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const level = res.body.items.find(
+      (l: any) => l.productId === productProdId && l.warehouseId === warehouseId,
+    );
+    expect(level).toBeDefined();
+    // 100 seeded - 4 sold = 96.
+    expect(Number(level.quantity)).toBe(seededStock - firstIssueQty);
+  });
+
+  it('6) Verify SALE_OUT movement created with sales_invoice reference', async () => {
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/movements?productId=${productProdId}&warehouseId=${warehouseId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const sale = res.body.items.find(
+      (m: any) =>
+        m.movementType === 'SALE_OUT' &&
+        m.referenceType === 'sales_invoice' &&
+        m.referenceId === firstPosInvoiceId,
+    );
+    expect(sale).toBeDefined();
+    expect(sale.direction).toBe('OUT');
+    expect(Number(sale.quantity)).toBe(firstIssueQty);
+  });
+
+  it('7) POST /pos/sales insufficient stock => 4xx with insufficient-stock message', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/pos/sales`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        paymentMethod: 'CASH',
+        paidAmount: '9999.0000',
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '9999.0000',
+            unitPrice: '1.0000',
+          },
+        ],
+      });
+    // SalesService.issue() throws BadRequestException → 400; accept 400 or 409 for robustness.
+    expect([400, 409]).toContain(res.status);
+    expect(String(res.body.message ?? '')).toMatch(/insufficient stock/i);
+  });
+});

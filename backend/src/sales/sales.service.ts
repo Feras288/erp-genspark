@@ -375,10 +375,20 @@ export class SalesService {
 
   // -------------------- create draft --------------------
 
-  async create(
+  /**
+   * Internal: create a DRAFT sales invoice with optional type / paymentMethod / paidAmount.
+   * Public `create()` delegates here with type=STANDARD and no payment fields.
+   * POS service (Phase 4B-4) reuses this entry-point with type=POS + payment.
+   */
+  async createDraft(
     companyId: string,
     actorUserId: string,
     dto: CreateSalesInvoiceDto,
+    opts: {
+      type?: SalesInvoiceType;
+      paymentMethod?: Prisma.SalesInvoiceCreateInput['paymentMethod'];
+      paidAmount?: string | null;
+    } = {},
   ) {
     const created = await this.prisma.$transaction(async (tx) => {
       await this.assertCustomerValid(tx, companyId, dto.customerId);
@@ -391,7 +401,7 @@ export class SalesService {
           companyId,
           invoiceNumber,
           status: SalesInvoiceStatus.DRAFT,
-          type: SalesInvoiceType.STANDARD,
+          type: opts.type ?? SalesInvoiceType.STANDARD,
           customerId: dto.customerId ?? null,
           issueDate: dto.issueDate ? new Date(dto.issueDate) : null,
           dueDate: dto.dueDate ? new Date(dto.dueDate) : null,
@@ -399,6 +409,8 @@ export class SalesService {
           vatTotal: totals.vatTotal,
           discountTotal: totals.discountTotal,
           total: totals.total,
+          paymentMethod: opts.paymentMethod ?? null,
+          paidAmount: opts.paidAmount ?? null,
           notes: dto.notes ?? null,
           createdById: actorUserId,
           updatedById: actorUserId,
@@ -430,10 +442,25 @@ export class SalesService {
       action: 'sales.invoice.created',
       entity: 'SalesInvoice',
       entityId: created.id,
-      metadata: { invoiceNumber: created.invoiceNumber, status: created.status },
+      metadata: {
+        invoiceNumber: created.invoiceNumber,
+        status: created.status,
+        type: created.type,
+        source: opts.type === SalesInvoiceType.POS ? 'pos' : 'sales',
+      },
     });
 
     return created;
+  }
+
+  async create(
+    companyId: string,
+    actorUserId: string,
+    dto: CreateSalesInvoiceDto,
+  ) {
+    return this.createDraft(companyId, actorUserId, dto, {
+      type: SalesInvoiceType.STANDARD,
+    });
   }
 
   // -------------------- update draft --------------------
