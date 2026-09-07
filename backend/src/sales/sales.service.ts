@@ -1,27 +1,40 @@
-// Phase 4B-1 skeleton: build-safe SalesService.
+// Phase 4B-2: SalesService with DRAFT-create/update/soft-delete logic.
 //
 // What works today:
-//   * list / getone — paginated Prisma read scoped by companyId.
+//   * list / getone — paginated Prisma read scoped by companyId (Phase 4B-1).
+//   * createDraft   — DRAFT header + recalculated lines, server-side Decimal
+//                     arithmetic, customer (CUSTOMER|BOTH) + product validation,
+//                     server-side invoiceNumber SI-<YYYYMMDD>-<seq> with retry.
+//   * updateDraft   — only DRAFT; replaces lines; recalculates totals.
+//   * removeDraft   — DRAFT soft-delete (deletedAt).
+//   * audit logs    — sales.invoice.created / .updated / .deleted.
 //
-// What is intentionally NOT implemented yet (will land in Phase 4B-2+):
-//   * create draft  — raises NotImplementedException at runtime; DTOs only.
-//   * update draft  — raises NotImplementedException at runtime.
-//   * delete draft  — raises NotImplementedException at runtime.
-//   * issue flow    — must run as one $transaction with SALE_OUT movements.
-//   * cancel flow   — DRAFT→CANCELLED allowed; ISSUED→blocked-by-credit-note.
+// What is intentionally NOT yet implemented in Phase 4B-2:
+//   * issue flow    — single $transaction with stock deduction + SALE_OUT
+//                     lands in Phase 4B-3.
+//   * cancel flow   — DRAFT→CANCELLED + ISSUED guarded-by-credit-note in Phase 4B-3.
+//   * POS reuse     — Phase 4B-4.
 //
-// Stock deduction at issue time, SALE_OUT runtime, and POS reuse are all
-// deferred to Phase 4B-2. Build must remain green and e2e must remain 41/41.
+// All arithmetic uses Prisma.Decimal (which wraps decimal.js) end-to-end; no
+// `Number` is used as money. Strings (already validated by DTOs) are converted
+// through `new Prisma.Decimal(value)` then re-serialised with `.toFixed(4)`
+// or `.toFixed(2)` per column scale to match Phase 1-3 conventions.
 import {
+  BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
   NotImplementedException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import {
+  Prisma,
+  SalesInvoiceStatus,
+  SalesInvoiceType,
+  PartnerType,
+} from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
-import type { AuthenticatedUser } from '../common/types/auth.types';
-import { CreateSalesInvoiceDto } from './dto/create-sales-invoice.dto';
+import { CreateSalesInvoiceLineDto, CreateSalesInvoiceDto } from './dto/create-sales-invoice.dto';
 import { UpdateSalesInvoiceDto } from './dto/update-sales-invoice.dto';
 import { SalesInvoiceQueryDto } from './dto/sales-invoice-query.dto';
 import { IssueSalesInvoiceDto } from './dto/issue-sales-invoice.dto';
@@ -71,6 +84,58 @@ const LINE_FIELDS = {
   updatedAt: true,
 } as const;
 
+const LINE_WITH_RELATIONS = {
+  ...LINE_FIELDS,
+  product: { select: { id: true, sku: true, name: true, type: true } },
+  warehouse: { select: { id: true, code: true, name: true } },
+} as const;
+
+const INVOICE_WITH_LINES = {
+  ...INVOICE_FIELDS,
+  customer: { select: { id: true, code: true, name: true, type: true } },
+  lines: { select: LINE_WITH_RELATIONS },
+} as const;
+
+const NUMERIC_SELECT = {
+  ...INVOICE_FIELDS,
+  _count: { select: { lines: true } },
+  customer: { select: { id: true, code: true, name: true } },
+};
+
+type D = Prisma.Decimal;
+
+function dec(value: string | number | D): D {
+  return new Prisma.Decimal(value as Prisma.Decimal.Value);
+}
+
+function fmt4(d: D): string {
+  return d.toFixed(4);
+}
+function fmt2(d: D): string {
+  return d.toFixed(2);
+}
+
+interface ComputedLine {
+  productId: string;
+  warehouseId: string | null;
+  description: string | null;
+  quantity: string;
+  unitPrice: string;
+  discountAmount: string;
+  vatRate: string;
+  vatAmount: string;
+  lineSubtotal: string;
+  lineTotal: string;
+}
+
+interface ComputedTotals {
+  lines: ComputedLine[];
+  subtotal: string;
+  discountTotal: string;
+  vatTotal: string;
+  total: string;
+}
+
 @Injectable()
 export class SalesService {
   constructor(
@@ -105,7 +170,7 @@ export class SalesService {
         skip: (page - 1) * pageSize,
         take: pageSize,
         orderBy: { createdAt: 'desc' },
-        select: INVOICE_FIELDS,
+        select: NUMERIC_SELECT,
       }),
     ]);
     return { total, page, pageSize, items };
@@ -114,48 +179,396 @@ export class SalesService {
   async get(companyId: string, id: string) {
     const invoice = await this.prisma.salesInvoice.findFirst({
       where: { id, companyId, deletedAt: null },
-      select: { ...INVOICE_FIELDS, lines: { select: LINE_FIELDS } },
+      select: INVOICE_WITH_LINES,
     });
     if (!invoice) throw new NotFoundException('Sales invoice not found');
     return invoice;
   }
 
-  // -------------------- unimplemented skeleton methods --------------------
+  // -------------------- invoice number generation --------------------
+
+  /**
+   * Generate a unique server-side invoice number: `SI-YYYYMMDD-NNNN`.
+   *
+   * Daily serial logic:
+   *   - Counts existing DRAFT/ISSUED/CANCELLED invoices for the company
+   *     whose invoiceNumber starts with `SI-<today>-`.
+   *   - Increments by 1 to derive the next serial.
+   *   - Retries on `@@unique([companyId, invoiceNumber])` race up to 3 times.
+   *
+   * Audit-grade: never trusts the client.
+   */
+  private async generateInvoiceNumber(
+    tx: Prisma.TransactionClient,
+    companyId: string,
+  ): Promise<string> {
+    const now = new Date();
+    const yyyy = now.getUTCFullYear().toString().padStart(4, '0');
+    const mm = (now.getUTCMonth() + 1).toString().padStart(2, '0');
+    const dd = now.getUTCDate().toString().padStart(2, '0');
+    const todayPrefix = `SI-${yyyy}${mm}${dd}-`;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const count = await tx.salesInvoice.count({
+        where: { companyId, invoiceNumber: { startsWith: todayPrefix } },
+      });
+      const serial = (count + 1).toString().padStart(4, '0');
+      const candidate = `${todayPrefix}${serial}`;
+
+      // Confirm id-safety before attempting create (cheap pre-check).
+      const existing = await tx.salesInvoice.findFirst({
+        where: { companyId, invoiceNumber: candidate },
+        select: { id: true },
+      });
+      if (!existing) {
+        return candidate;
+      }
+      // Otherwise fall through to retry (race with another concurrent creator).
+    }
+    throw new ConflictException(
+      'Failed to allocate a unique invoice number after 3 attempts',
+    );
+  }
+
+  // -------------------- shared validation --------------------
+
+  private async assertCustomerValid(
+    tx: Prisma.TransactionClient,
+    companyId: string,
+    customerId: string | null | undefined,
+  ): Promise<void> {
+    if (!customerId) return;
+    const partner = await tx.partner.findFirst({
+      where: { id: customerId, companyId, deletedAt: null },
+      select: { id: true, type: true },
+    });
+    if (!partner) {
+      throw new NotFoundException('Customer not found');
+    }
+    if (
+      partner.type !== PartnerType.CUSTOMER &&
+      partner.type !== PartnerType.BOTH
+    ) {
+      throw new BadRequestException(
+        'Selected partner is not a customer (must be CUSTOMER or BOTH)',
+      );
+    }
+  }
+
+  private async assertProductsValid(
+    tx: Prisma.TransactionClient,
+    companyId: string,
+    lines: CreateSalesInvoiceLineDto[],
+  ): Promise<Map<string, { id: string; type: string; isActive: boolean }>> {
+    const productIds = Array.from(new Set(lines.map((l) => l.productId)));
+    const products = await tx.product.findMany({
+      where: {
+        companyId,
+        id: { in: productIds },
+        deletedAt: null,
+      },
+      select: { id: true, type: true, isActive: true, name: true },
+    });
+    const found = new Map(products.map((p) => [p.id, p]));
+    for (const l of lines) {
+      const p = found.get(l.productId);
+      if (!p) {
+        throw new NotFoundException(`Product not found: ${l.productId}`);
+      }
+      if (!p.isActive) {
+        throw new BadRequestException(
+          `Product is inactive: ${p.name} (${p.id})`,
+        );
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Server-side Decimal arithmetic for invoice lines and header.
+   *
+   * Per line, given `quantity > 0`, `unitPrice >= 0`, `discountAmount >= 0`,
+   * `vatRate >= 0`:
+   *
+   *   lineSubtotal   = quantity * unitPrice
+   *   taxableAmount  = max(lineSubtotal - discountAmount, 0)
+   *   vatAmount      = round(taxableAmount * vatRate / 100, 4)
+   *   lineTotal      = taxableAmount + vatAmount
+   *
+   * Header:
+   *   subtotal      = sum(lineSubtotal)
+   *   discountTotal = sum(discountAmount)
+   *   vatTotal      = sum(vatAmount)
+   *   total         = sum(lineTotal)
+   *
+   * Note: `vatAmount` is rounded to 4 dp to match the column scale
+   * (`Decimal @db.Decimal(18, 4)`). This is a tax-safe approximation
+   * consistent with POSTGRES NUMERIC rounding.
+   */
+  private computeTotals(
+    lines: CreateSalesInvoiceLineDto[],
+  ): ComputedTotals {
+    const computed: ComputedLine[] = [];
+    let sub = new Prisma.Decimal(0);
+    let disc = new Prisma.Decimal(0);
+    let vat = new Prisma.Decimal(0);
+    let total = new Prisma.Decimal(0);
+
+    for (const l of lines) {
+      const qty = dec(l.quantity);
+      if (qty.lte(0)) {
+        throw new BadRequestException(
+          `Line quantity must be > 0 (productId=${l.productId})`,
+        );
+      }
+      const unitPrice = dec(l.unitPrice);
+      if (unitPrice.lt(0)) {
+        throw new BadRequestException(
+          `Line unitPrice must be >= 0 (productId=${l.productId})`,
+        );
+      }
+      const discount = dec(l.discountAmount ?? '0');
+      if (discount.lt(0)) {
+        throw new BadRequestException(
+          `Line discountAmount must be >= 0 (productId=${l.productId})`,
+        );
+      }
+      const vatRate = dec(l.vatRate ?? '15.00');
+      if (vatRate.lt(0)) {
+        throw new BadRequestException(
+          `Line vatRate must be >= 0 (productId=${l.productId})`,
+        );
+      }
+
+      const lineSub = qty.mul(unitPrice);
+      const taxable = Prisma.Decimal.max(lineSub.minus(discount), new Prisma.Decimal(0));
+      const vatAmt = taxable.mul(vatRate).div(100).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP);
+      const lineT = taxable.plus(vatAmt);
+
+      sub = sub.plus(lineSub);
+      disc = disc.plus(discount);
+      vat = vat.plus(vatAmt);
+      total = total.plus(lineT);
+
+      computed.push({
+        productId: l.productId,
+        warehouseId: l.warehouseId ?? null,
+        description: l.description ?? null,
+        quantity: fmt4(qty),
+        unitPrice: fmt4(unitPrice),
+        discountAmount: fmt4(discount),
+        vatRate: fmt2(vatRate),
+        vatAmount: fmt4(vatAmt),
+        lineSubtotal: fmt4(lineSub),
+        lineTotal: fmt4(lineT),
+      });
+    }
+
+    return {
+      lines: computed,
+      subtotal: fmt4(sub),
+      discountTotal: fmt4(disc),
+      vatTotal: fmt4(vat),
+      total: fmt4(total),
+    };
+  }
+
+  // -------------------- create draft --------------------
 
   async create(
     companyId: string,
-    _actorUserId: string,
-    _dto: CreateSalesInvoiceDto,
-  ): Promise<never> {
-    // Real implementation will:
-    //   * validate PRODUCTS, resolve warehouses per line,
-    //   * persist the DRAFT header (status=DRAFT, type=STANDARD, invoice auto-number),
-    //   * run server-side Decimal arithmetic and persist line totals.
-    throw new NotImplementedException(
-      'SalesService.create is not implemented in Phase 4B-1 skeleton',
-    );
+    actorUserId: string,
+    dto: CreateSalesInvoiceDto,
+  ) {
+    const created = await this.prisma.$transaction(async (tx) => {
+      await this.assertCustomerValid(tx, companyId, dto.customerId);
+      await this.assertProductsValid(tx, companyId, dto.lines);
+      const totals = this.computeTotals(dto.lines);
+      const invoiceNumber = await this.generateInvoiceNumber(tx, companyId);
+
+      const header = await tx.salesInvoice.create({
+        data: {
+          companyId,
+          invoiceNumber,
+          status: SalesInvoiceStatus.DRAFT,
+          type: SalesInvoiceType.STANDARD,
+          customerId: dto.customerId ?? null,
+          issueDate: dto.issueDate ? new Date(dto.issueDate) : null,
+          dueDate: dto.dueDate ? new Date(dto.dueDate) : null,
+          subtotal: totals.subtotal,
+          vatTotal: totals.vatTotal,
+          discountTotal: totals.discountTotal,
+          total: totals.total,
+          notes: dto.notes ?? null,
+          createdById: actorUserId,
+          updatedById: actorUserId,
+          lines: {
+            create: totals.lines.map((l) => ({
+              companyId,
+              productId: l.productId,
+              warehouseId: l.warehouseId,
+              description: l.description,
+              quantity: l.quantity,
+              unitPrice: l.unitPrice,
+              discountAmount: l.discountAmount,
+              vatRate: l.vatRate,
+              vatAmount: l.vatAmount,
+              lineSubtotal: l.lineSubtotal,
+              lineTotal: l.lineTotal,
+            })),
+          },
+        } as Prisma.SalesInvoiceUncheckedCreateInput,
+        select: INVOICE_WITH_LINES,
+      });
+
+      return header;
+    });
+
+    await this.audit.record({
+      companyId,
+      userId: actorUserId,
+      action: 'sales.invoice.created',
+      entity: 'SalesInvoice',
+      entityId: created.id,
+      metadata: { invoiceNumber: created.invoiceNumber, status: created.status },
+    });
+
+    return created;
   }
+
+  // -------------------- update draft --------------------
 
   async update(
     companyId: string,
-    _id: string,
-    _actorUserId: string,
-    _dto: UpdateSalesInvoiceDto,
-  ): Promise<never> {
-    throw new NotImplementedException(
-      'SalesService.update is not implemented in Phase 4B-1 skeleton',
-    );
+    id: string,
+    actorUserId: string,
+    dto: UpdateSalesInvoiceDto,
+  ) {
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.salesInvoice.findFirst({
+        where: { id, companyId, deletedAt: null },
+        select: { id: true, status: true },
+      });
+      if (!existing) throw new NotFoundException('Sales invoice not found');
+      if (existing.status !== SalesInvoiceStatus.DRAFT) {
+        throw new ConflictException(
+          `Only DRAFT invoices can be updated (current status=${existing.status})`,
+        );
+      }
+
+      // If customerId is provided (even if undefined explicitly passed), validate.
+      // We treat `undefined` vs `null` carefully: the DTO uses @IsOptional, so
+      // any value !== undefined means the client is asserting this field.
+      if (dto.customerId !== undefined) {
+        await this.assertCustomerValid(tx, companyId, dto.customerId ?? null);
+      }
+
+      let totals: ComputedTotals | null = null;
+      if (dto.lines !== undefined) {
+        await this.assertProductsValid(tx, companyId, dto.lines);
+        totals = this.computeTotals(dto.lines);
+      }
+
+      // Replace lines eagerly if provided (simple, transactional, and matches
+      // DRAFT edit semantics in Phase 4B-2; we are not partial-patching lines).
+      if (totals !== null) {
+        await tx.salesInvoiceLine.deleteMany({
+          where: { companyId, invoiceId: id },
+        });
+        await tx.salesInvoiceLine.createMany({
+          data: totals.lines.map((l) => ({
+            companyId,
+            invoiceId: id,
+            productId: l.productId,
+            warehouseId: l.warehouseId,
+            description: l.description,
+            quantity: l.quantity,
+            unitPrice: l.unitPrice,
+            discountAmount: l.discountAmount,
+            vatRate: l.vatRate,
+            vatAmount: l.vatAmount,
+            lineSubtotal: l.lineSubtotal,
+            lineTotal: l.lineTotal,
+          })),
+        });
+      }
+
+      const data: Prisma.SalesInvoiceUncheckedUpdateInput = {
+        updatedById: actorUserId,
+      };
+      if (dto.customerId !== undefined) {
+        data.customerId = dto.customerId ?? null;
+      }
+      if (dto.issueDate !== undefined) {
+        data.issueDate = dto.issueDate ? new Date(dto.issueDate) : null;
+      }
+      if (dto.dueDate !== undefined) {
+        data.dueDate = dto.dueDate ? new Date(dto.dueDate) : null;
+      }
+      if (dto.notes !== undefined) {
+        data.notes = dto.notes ?? null;
+      }
+      if (totals !== null) {
+        data.subtotal = totals.subtotal;
+        data.vatTotal = totals.vatTotal;
+        data.discountTotal = totals.discountTotal;
+        data.total = totals.total;
+      }
+
+      return tx.salesInvoice.update({
+        where: { id },
+        data,
+        select: INVOICE_WITH_LINES,
+      });
+    });
+
+    await this.audit.record({
+      companyId,
+      userId: actorUserId,
+      action: 'sales.invoice.updated',
+      entity: 'SalesInvoice',
+      entityId: updated.id,
+      metadata: { invoiceNumber: updated.invoiceNumber, status: updated.status },
+    });
+
+    return updated;
   }
 
-  async remove(
-    companyId: string,
-    _id: string,
-    _actorUserId: string,
-  ): Promise<never> {
-    throw new NotImplementedException(
-      'SalesService.remove is not implemented in Phase 4B-1 skeleton',
-    );
+  // -------------------- soft delete draft --------------------
+
+  async remove(companyId: string, id: string, actorUserId: string) {
+    const current = await this.prisma.salesInvoice.findFirst({
+      where: { id, companyId, deletedAt: null },
+      select: { id: true, status: true, invoiceNumber: true },
+    });
+    if (!current) throw new NotFoundException('Sales invoice not found');
+    if (current.status !== SalesInvoiceStatus.DRAFT) {
+      throw new ConflictException(
+        `Only DRAFT invoices can be deleted (current status=${current.status})`,
+      );
+    }
+
+    await this.prisma.salesInvoice.update({
+      where: { id },
+      data: {
+        deletedAt: new Date(),
+        updatedBy: { connect: { id: actorUserId } },
+      },
+    });
+
+    await this.audit.record({
+      companyId,
+      userId: actorUserId,
+      action: 'sales.invoice.deleted',
+      entity: 'SalesInvoice',
+      entityId: id,
+      metadata: { invoiceNumber: current.invoiceNumber },
+    });
+
+    return { id, isActive: false, deletedAt: new Date() };
   }
+
+  // -------------------- issue / cancel — Phase 4B-3 --------------------
 
   async issue(
     companyId: string,
@@ -164,7 +577,7 @@ export class SalesService {
     _dto: IssueSalesInvoiceDto,
   ): Promise<never> {
     throw new NotImplementedException(
-      'SalesService.issue is not implemented in Phase 4B-1 skeleton',
+      'SalesService.issue will be implemented in Phase 4B-3',
     );
   }
 
@@ -175,11 +588,7 @@ export class SalesService {
     _dto: CancelSalesInvoiceDto,
   ): Promise<never> {
     throw new NotImplementedException(
-      'SalesService.cancel is not implemented in Phase 4B-1 skeleton',
+      'SalesService.cancel will be implemented in Phase 4B-3',
     );
   }
 }
-
-// Re-export the AuthenticatedUser type for callers that want to type-check
-// currentUser plumbing without importing the path module.
-export type { AuthenticatedUser };
