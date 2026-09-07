@@ -65,10 +65,17 @@ const PERMISSIONS = [
   { key: 'sales.invoice.issue', module: 'sales', action: 'issue', description: 'Issue (post) sales invoice' },
   { key: 'sales.invoice.cancel', module: 'sales', action: 'cancel', description: 'Cancel sales invoice' },
   { key: 'pos.use', module: 'pos', action: 'use', description: 'Use the POS terminal' },
-  // purchases
+  // purchases (Phase 5 — full lifecycle: drafts, receive, cancel)
   { key: 'purchases.invoice.read', module: 'purchases', action: 'read', description: 'List purchase invoices' },
   { key: 'purchases.invoice.create', module: 'purchases', action: 'create', description: 'Create purchase invoice' },
   { key: 'purchases.invoice.approve', module: 'purchases', action: 'approve', description: 'Approve/post purchase invoice' },
+  // purchases — Phase 5 lifecycle keys (mirror sales.* naming)
+  { key: 'purchases.read', module: 'purchases', action: 'read', description: 'List / get purchase invoices' },
+  { key: 'purchases.create', module: 'purchases', action: 'create', description: 'Create draft purchase invoice' },
+  { key: 'purchases.update', module: 'purchases', action: 'update', description: 'Edit draft purchase invoice' },
+  { key: 'purchases.delete', module: 'purchases', action: 'delete', description: 'Soft-delete draft purchase invoice' },
+  { key: 'purchases.receive', module: 'purchases', action: 'receive', description: 'Receive invoice and increment stock (PURCHASE_IN)' },
+  { key: 'purchases.cancel', module: 'purchases', action: 'cancel', description: 'Cancel eligible purchase invoice (DRAFT only)' },
   // accounting
   { key: 'accounting.accounts.read', module: 'accounting', action: 'read', description: 'View chart of accounts' },
   { key: 'accounting.accounts.manage', module: 'accounting', action: 'manage', description: 'Manage chart of accounts' },

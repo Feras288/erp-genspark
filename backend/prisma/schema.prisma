@@ -33,15 +33,17 @@ model Company {
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
-  users             User[]
-  roles             Role[]
-  products          Product[]
-  partners          Partner[]
-  warehouses        Warehouse[]
-  stockLevels       StockLevel[]
-  stockMovements    StockMovement[]
-  salesInvoices     SalesInvoice[]
-  salesInvoiceLines SalesInvoiceLine[]
+  users                User[]
+  roles                Role[]
+  products             Product[]
+  partners             Partner[]
+  warehouses           Warehouse[]
+  stockLevels          StockLevel[]
+  stockMovements       StockMovement[]
+  salesInvoices        SalesInvoice[]
+  salesInvoiceLines    SalesInvoiceLine[]
+  purchaseInvoices     PurchaseInvoice[]
+  purchaseInvoiceLines PurchaseInvoiceLine[]
 
   @@index([name])
   @@map("companies")
@@ -71,17 +73,21 @@ model User {
   userRoles     UserRole[]
   refreshTokens RefreshToken[]
 
-  productsCreated        Product[]       @relation("ProductCreatedBy")
-  productsUpdated        Product[]       @relation("ProductUpdatedBy")
-  partnersCreated        Partner[]       @relation("PartnerCreatedBy")
-  partnersUpdated        Partner[]       @relation("PartnerUpdatedBy")
-  warehousesCreated      Warehouse[]     @relation("WarehouseCreatedBy")
-  warehousesUpdated      Warehouse[]     @relation("WarehouseUpdatedBy")
-  stockMovementsCreated  StockMovement[] @relation("StockMovementCreatedBy")
-  salesInvoicesCreated   SalesInvoice[]  @relation("SalesInvoiceCreatedBy")
-  salesInvoicesUpdated   SalesInvoice[]  @relation("SalesInvoiceUpdatedBy")
-  salesInvoicesIssued    SalesInvoice[]  @relation("SalesInvoiceIssuedBy")
-  salesInvoicesCancelled SalesInvoice[]  @relation("SalesInvoiceCancelledBy")
+  productsCreated           Product[]         @relation("ProductCreatedBy")
+  productsUpdated           Product[]         @relation("ProductUpdatedBy")
+  partnersCreated           Partner[]         @relation("PartnerCreatedBy")
+  partnersUpdated           Partner[]         @relation("PartnerUpdatedBy")
+  warehousesCreated         Warehouse[]       @relation("WarehouseCreatedBy")
+  warehousesUpdated         Warehouse[]       @relation("WarehouseUpdatedBy")
+  stockMovementsCreated     StockMovement[]   @relation("StockMovementCreatedBy")
+  salesInvoicesCreated      SalesInvoice[]    @relation("SalesInvoiceCreatedBy")
+  salesInvoicesUpdated      SalesInvoice[]    @relation("SalesInvoiceUpdatedBy")
+  salesInvoicesIssued       SalesInvoice[]    @relation("SalesInvoiceIssuedBy")
+  salesInvoicesCancelled    SalesInvoice[]    @relation("SalesInvoiceCancelledBy")
+  purchaseInvoicesCreated   PurchaseInvoice[] @relation("PurchaseInvoiceCreatedBy")
+  purchaseInvoicesUpdated   PurchaseInvoice[] @relation("PurchaseInvoiceUpdatedBy")
+  purchaseInvoicesReceived  PurchaseInvoice[] @relation("PurchaseInvoiceReceivedBy")
+  purchaseInvoicesCancelled PurchaseInvoice[] @relation("PurchaseInvoiceCancelledBy")
 
   @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
@@ -215,9 +221,10 @@ model Product {
   createdBy User?   @relation("ProductCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
   updatedBy User?   @relation("ProductUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
 
-  stockLevels       StockLevel[]
-  stockMovements    StockMovement[]
-  salesInvoiceLines SalesInvoiceLine[]
+  stockLevels          StockLevel[]
+  stockMovements       StockMovement[]
+  salesInvoiceLines    SalesInvoiceLine[]
+  purchaseInvoiceLines PurchaseInvoiceLine[]
 
   // Unique sku per company (sku is always non-null).
   @@unique([companyId, sku])
@@ -262,10 +269,11 @@ model Partner {
   createdById String?
   updatedById String?
 
-  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  createdBy     User?          @relation("PartnerCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
-  updatedBy     User?          @relation("PartnerUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
-  salesInvoices SalesInvoice[]
+  company                    Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy                  User?             @relation("PartnerCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy                  User?             @relation("PartnerUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  salesInvoices              SalesInvoice[]
+  purchaseInvoicesAsSupplier PurchaseInvoice[] @relation("PurchaseInvoiceSupplier")
 
   // We use a partial unique index via raw SQL in the migration for `code`.
   @@index([companyId, isActive])
@@ -287,6 +295,7 @@ enum StockMovementType {
   TRANSFER_IN
   TRANSFER_OUT
   SALE_OUT
+  PURCHASE_IN
 }
 
 enum StockMovementDirection {
@@ -313,9 +322,10 @@ model Warehouse {
   createdBy User?   @relation("WarehouseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
   updatedBy User?   @relation("WarehouseUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
 
-  stockLevels      StockLevel[]
-  stockMovements   StockMovement[]
-  SalesInvoiceLine SalesInvoiceLine[]
+  stockLevels         StockLevel[]
+  stockMovements      StockMovement[]
+  SalesInvoiceLine    SalesInvoiceLine[]
+  PurchaseInvoiceLine PurchaseInvoiceLine[]
 
   @@unique([companyId, code])
   @@index([companyId, isActive])
@@ -469,4 +479,86 @@ model SalesInvoiceLine {
   @@index([companyId, productId])
   @@index([companyId, warehouseId])
   @@map("sales_invoice_lines")
+}
+
+// =====================================================
+// Phase 5: Purchases Core — Purchase invoices only.
+// NO accounting, NO GL, NO COGS, NO FIFO/LIFO/avg cost,
+// NO landed cost, NO supplier balance, NO payments,
+// NO purchase returns, NO debit notes, NO credit notes,
+// NO ZATCA, NO HR/Payroll, NO SaaS billing.
+// =====================================================
+
+enum PurchaseInvoiceStatus {
+  DRAFT
+  RECEIVED
+  CANCELLED
+}
+
+model PurchaseInvoice {
+  id            String                @id @default(cuid())
+  companyId     String
+  invoiceNumber String
+  status        PurchaseInvoiceStatus @default(DRAFT)
+  supplierId    String? // must be Partner of type SUPPLIER or BOTH
+  purchaseDate  DateTime?
+  dueDate       DateTime?
+  subtotal      Decimal               @default(0) @db.Decimal(18, 4)
+  vatTotal      Decimal               @default(0) @db.Decimal(18, 4)
+  discountTotal Decimal               @default(0) @db.Decimal(18, 4)
+  total         Decimal               @default(0) @db.Decimal(18, 4)
+  notes         String?
+  receivedAt    DateTime?
+  cancelledAt   DateTime?
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  createdById   String?
+  updatedById   String?
+  receivedById  String?
+  cancelledById String?
+  deletedAt     DateTime?
+
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  supplier    Partner? @relation("PurchaseInvoiceSupplier", fields: [supplierId], references: [id], onDelete: SetNull)
+  createdBy   User?    @relation("PurchaseInvoiceCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy   User?    @relation("PurchaseInvoiceUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  receivedBy  User?    @relation("PurchaseInvoiceReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
+  cancelledBy User?    @relation("PurchaseInvoiceCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  lines PurchaseInvoiceLine[]
+
+  @@unique([companyId, invoiceNumber])
+  @@index([companyId, status])
+  @@index([companyId, supplierId])
+  @@index([companyId, purchaseDate])
+  @@index([companyId, deletedAt])
+  @@map("purchase_invoices")
+}
+
+model PurchaseInvoiceLine {
+  id             String   @id @default(cuid())
+  companyId      String
+  invoiceId      String
+  productId      String
+  warehouseId    String? // null for SERVICE lines; required for PRODUCT lines on receive
+  description    String?
+  quantity       Decimal  @db.Decimal(18, 4)
+  unitCost       Decimal  @db.Decimal(18, 4) // server-side authoritative
+  discountAmount Decimal  @default(0) @db.Decimal(18, 4)
+  vatRate        Decimal  @default(15.00) @db.Decimal(5, 2)
+  vatAmount      Decimal  @default(0) @db.Decimal(18, 4)
+  lineSubtotal   Decimal  @default(0) @db.Decimal(18, 4)
+  lineTotal      Decimal  @default(0) @db.Decimal(18, 4)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  company   Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice   PurchaseInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse Warehouse?      @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, invoiceId])
+  @@index([companyId, productId])
+  @@index([companyId, warehouseId])
+  @@map("purchase_invoice_lines")
 }

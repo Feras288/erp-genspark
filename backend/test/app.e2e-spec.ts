@@ -1464,3 +1464,372 @@ describe('Phase 4B-4: POS (e2e)', () => {
     expect(String(res.body.message ?? '')).toMatch(/insufficient stock/i);
   });
 });
+
+describe('Phase 5: Purchases (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+
+  // Per-run unique codes so re-running the suite doesn't hit dedupe.
+  const unique = Date.now().toString(36);
+  const SKU_PROD = `S5-PROD-${unique}`;
+  const SKU_SVC = `S5-SVC-${unique}`;
+  const WH_CODE = `S5-WH-${unique}`;
+  const SUPP_CODE_BOTH = `S5-SUP-${unique}`;
+  const CUST_CODE_ONLY = `S5-CUST-${unique}`;
+
+  let productProdId = '';
+  let productSvcId = '';
+  let warehouseId = '';
+  let supplierBothId = '';
+  let supplierCustomerOnlyId = '';
+  // Filled in by tests so later tests can find its invoice id.
+  let mixedInvoiceId = '';
+  let draftCancelId = '';
+  // Captured at receive time; used by tests 8 and 9.
+  let productReceiveQty = 0;
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+
+    // Seed: 1 PRODUCT + 1 SERVICE + 1 warehouse + 1 BOTH-type supplier +
+    // 1 CUSTOMER-only partner. Crucially: NO ADJUSTMENT_IN seed for the new
+    // warehouse, so the Phase 5 receive flow is exercised as the very first
+    // IN-flow for that product/warehouse pair → upsert-creates StockLevel.
+    const pProd = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_PROD, name: 'Phase 5 Purchase Product', type: 'PRODUCT' });
+    expect(pProd.status).toBe(201);
+    productProdId = pProd.body.id;
+
+    const pSvc = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_SVC, name: 'Phase 5 Purchase Service', type: 'SERVICE' });
+    expect(pSvc.status).toBe(201);
+    productSvcId = pSvc.body.id;
+
+    const w = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: WH_CODE, name: 'Purchases test warehouse' });
+    expect(w.status).toBe(201);
+    warehouseId = w.body.id;
+
+    // BOTH-type partner — must be accepted as supplier.
+    const sup = await request(http)
+      .post(`${API_PREFIX}/partners`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: SUPP_CODE_BOTH, name: 'S5 Supplier BOTH', type: 'BOTH' });
+    expect(sup.status).toBe(201);
+    supplierBothId = sup.body.id;
+
+    // CUSTOMER-only — must be rejected as supplier at invoice creation.
+    const cust = await request(http)
+      .post(`${API_PREFIX}/partners`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: CUST_CODE_ONLY, name: 'S5 Customer-only', type: 'CUSTOMER' });
+    expect(cust.status).toBe(201);
+    supplierCustomerOnlyId = cust.body.id;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('1) GET /purchases/invoices without token => 401', async () => {
+    const res = await request(http).get(`${API_PREFIX}/purchases/invoices`);
+    expect(res.status).toBe(401);
+  });
+
+  it('2) GET /purchases/invoices as admin => 200 + paginated shape', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  it('3) POST /purchases/invoices (SERVICE only line) => 201 + server-side totals', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'e2e service-only draft',
+        supplierId: supplierBothId,
+        lines: [
+          {
+            productId: productSvcId,
+            quantity: '3.0000',
+            unitCost: '150.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBeDefined();
+    expect(res.body.status).toBe('DRAFT');
+    expect(res.body.invoiceNumber).toMatch(/^PI-\d{8}-\d{4}$/);
+    // 3 * 150 = 450; vat = 450 * 0.15 = 67.5; total = 517.5.
+    expect(Number(res.body.subtotal)).toBe(450);
+    expect(Number(res.body.vatTotal)).toBe(67.5);
+    expect(Number(res.body.discountTotal)).toBe(0);
+    expect(Number(res.body.total)).toBe(450 + 67.5);
+  });
+
+  it('4) POST /purchases/invoices (PRODUCT + warehouse + BOTH supplier) => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'e2e PRODUCT draft',
+        supplierId: supplierBothId,
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '4.0000',
+            unitCost: '100.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('DRAFT');
+    expect(res.body.supplier?.id).toBe(supplierBothId);
+    expect(Array.isArray(res.body.lines)).toBe(true);
+    expect(res.body.lines.length).toBe(1);
+    expect(res.body.lines[0].warehouseId).toBe(warehouseId);
+    // 4 * 100 = 400; vat = 60; total = 460.
+    expect(Number(res.body.subtotal)).toBe(400);
+    expect(Number(res.body.vatTotal)).toBe(60);
+    expect(Number(res.body.total)).toBe(460);
+  });
+
+  it('5) POST /purchases/invoices (CUSTOMER-only supplier) => 400 with supplier-validation', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'should reject CUSTOMER-only as supplier',
+        supplierId: supplierCustomerOnlyId,
+        lines: [
+          {
+            productId: productSvcId,
+            quantity: '1.0000',
+            unitCost: '10.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(res.status).toBe(400);
+    expect(String(res.body.message ?? '')).toMatch(/not a supplier/i);
+  });
+
+  it('6) PATCH draft invoice (line discount + notes) => 200 + totals recomputed', async () => {
+    // Create-then-patch in a single test: verifies PATCH path on a fresh
+    // DRAFT and recomputes totals on line-discount change.
+    const create = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'original',
+        supplierId: supplierBothId,
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '2.0000',
+            unitCost: '200.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    draftCancelId = create.body.id;
+
+    const res = await request(http)
+      .patch(`${API_PREFIX}/purchases/invoices/${draftCancelId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'updated-notes',
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '2.0000',
+            unitCost: '200.0000',
+            discountAmount: '50.0000', // gross 400; taxable 350; vat 52.5; total 402.5
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(draftCancelId);
+    expect(res.body.status).toBe('DRAFT');
+    expect(res.body.notes).toBe('updated-notes');
+    expect(Number(res.body.discountTotal)).toBe(50);
+    expect(Number(res.body.subtotal)).toBe(400);
+    expect(Number(res.body.vatTotal)).toBe(52.5);
+    expect(Number(res.body.total)).toBe(402.5);
+  });
+
+  it('7) POST /purchases/invoices/:id/receive on mixed SERVICE+PRODUCT draft => 201 RECEIVED', async () => {
+    productReceiveQty = 7;
+
+    const create = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'mixed invoice to receive',
+        supplierId: supplierBothId,
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: productReceiveQty.toFixed(4),
+            unitCost: '50.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+          {
+            // SERVICE line: must NOT trigger any stock movement on receive
+            // and may omit warehouseId.
+            productId: productSvcId,
+            quantity: '2.0000',
+            unitCost: '300.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    mixedInvoiceId = create.body.id;
+
+    const res = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices/${mixedInvoiceId}/receive`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe(mixedInvoiceId);
+    expect(res.body.status).toBe('RECEIVED');
+    expect(res.body.receivedAt).toBeDefined();
+  });
+
+  it('8) Verify stock level increased after receive (Phase 3 inventory)', async () => {
+    // Cross-load via Phase 3 endpoints. The new product was never seeded
+    // with an ADJUSTMENT_IN, so the Phase 5 receive flow is the very first
+    // IN-flow for that (product, warehouse) pair → UPSERT creates the row.
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/levels?productId=${productProdId}&warehouseId=${warehouseId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const items: any[] = res.body.items ?? [];
+    const lvl = items.find(
+      (l) => l.productId === productProdId && l.warehouseId === warehouseId,
+    );
+    expect(lvl).toBeDefined();
+    expect(Number(lvl.quantity)).toBe(productReceiveQty);
+  });
+
+  it('9) Verify PURCHASE_IN movement created with purchase_invoice reference (exactly 1)', async () => {
+    // Cross-load via Phase 3 movements endpoint. SERVICE line in the same
+    // invoice must not produce any StockMovement (pass-through invariant).
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/movements?productId=${productProdId}&warehouseId=${warehouseId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const items: any[] = res.body.items ?? [];
+    const ours = items.find(
+      (m) =>
+        m.movementType === 'PURCHASE_IN' &&
+        m.referenceType === 'purchase_invoice' &&
+        m.referenceId === mixedInvoiceId,
+    );
+    expect(ours).toBeDefined();
+    expect(ours.direction).toBe('IN');
+    expect(Number(ours.quantity)).toBe(productReceiveQty);
+    // And: exactly ONE motion — SERVICE line in the same invoice is pass-through.
+    const sameInvoice = items.filter((m) => m.referenceId === mixedInvoiceId);
+    expect(sameInvoice.length).toBe(1);
+  });
+
+  it('10) POST /receive again on RECEIVED invoice => 400 cannot-receive', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices/${mixedInvoiceId}/receive`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect(res.status).toBe(400);
+    expect(String(res.body.message ?? '')).toMatch(/DRAFT/i);
+  });
+
+  it('11) PATCH RECEIVED invoice => 409 cannot-edit-RECEIVED', async () => {
+    const res = await request(http)
+      .patch(`${API_PREFIX}/purchases/invoices/${mixedInvoiceId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'try-edit-received',
+        lines: [
+          {
+            productId: productProdId,
+            warehouseId,
+            quantity: '1.0000',
+            unitCost: '99.0000',
+          },
+        ],
+      });
+    expect([400, 409]).toContain(res.status);
+    expect(String(res.body.message ?? '')).toMatch(/DRAFT/i);
+  });
+
+  it('12) POST /cancel on a fresh DRAFT => 200 + status=CANCELLED', async () => {
+    // Use the PATCH-target draft from test 6.
+    const res = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices/${draftCancelId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'e2e cancel' });
+    expect([200, 201]).toContain(res.status);
+    expect(res.body.id).toBe(draftCancelId);
+    expect(res.body.status).toBe('CANCELLED');
+    expect(res.body.cancelledAt).toBeDefined();
+  });
+
+  it('13) POST /cancel on already-CANCELLED invoice => 400 with already-cancelled', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices/${draftCancelId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect(res.status).toBe(400);
+    expect(String(res.body.message ?? '')).toMatch(/already cancelled/i);
+  });
+});
