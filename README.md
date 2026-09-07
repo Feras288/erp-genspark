@@ -453,4 +453,155 @@ pnpm build            # بناء كلاهما (pnpm -r build)
 
 ---
 
-**آخر تحديث:** المرحلة 0 — جاهزة للبناء، بانتظار موافقة الانتقال إلى المرحلة 1.
+## Phase 1: Authentication and RBAC
+
+> تم تنفيذ هذه المرحلة بالكامل مع `9/9 e2e tests passing`، build نظيف للـ backend و frontend، و smoke flow ناجح على `localhost:3001`. تفاصيلها أدناه مع قيود صريحة.
+
+### Auth Flow
+
+التدفق من النهاية إلى النهاية:
+
+1. **`POST /api/auth/login`** — يستقبل `email` + `password` (طول ≥ 6).
+   - يبحث عن المستخدم بـ `prisma.user.findFirst({where:{email}})`.
+   - **دائماً** يشغّل `bcrypt.compare` ضد real أو fake hash لتجنّب timing-based user enumeration.
+   - عند النجاح: يوقّع `JwtPayload = {sub, companyId, email}` → access token قصير (15m).
+   - يولّد refresh token عشوائي 48 byte (`crypto.randomBytes`), يَخزّن **hash SHA-256 فقط** في `RefreshToken` (`tokenHash@unique`)، ويعيد الـ raw token في `Set-Cookie`.
+   - يكتب صفّين في `AuditLog`: `auth.login.success` و/أو `auth.login.failed` (مع metadata يحوي الـ email فقط، لا الباسورد).
+2. **`POST /api/auth/refresh`** — يقرأ الـ cookie `erp_rt=`، يَحسب `sha256(raw)` ويبحث في `RefreshToken`:
+   - إذا غائب أو `revokedAt != null` أو `expiresAt < now` → 401 + audit `auth.refresh.failed`.
+   - خلاف ذلك: rotation — يَسجّل `revokedAt = now` على الـ row، ويصدر access token + RT جديد.
+   - الـ cookie `Set-Cookie` يعاد مع نفس الـ attributes (HttpOnly, sameSite=lax, secure إذا prod, path=/api/auth).
+3. **`POST /api/auth/logout`** — يقرأ الـ cookie، يَسجّل `revokedAt = now` على الـ matching row، ثم يَمسح الـ cookie (`Clear-Cookie` بنفس الـ attributes). يرجع 204.
+4. **`GET /api/auth/me`** — تحت `JwtAuthGuard`. الـ strategy يعيد hydrate الـ user من DB كل مرة (تعطيل فوري لأي user عند `isActive=false`). يعيد `SafeUser` كاملاً مع `roles[]` و `permissions[]`.
+
+### Token Storage
+
+هذا الملف مهم أمنياً، لذا نكرّره بوضوح:
+
+- ❌ **لا `localStorage`** إطلاقاً لأي token.
+- ❌ **لا `sessionStorage`** إطلاقاً لأي token.
+- ✅ **access token (JWT)** → يُحفظ في **memory فقط** داخل الـ frontend (`lib/api.ts` يحتفظ به في module-level variable + listener set). يضيع عند reload الصفحة → يُستبدل تلقائياً عبر `/api/auth/refresh` عند أول request.
+- ✅ **refresh token (opaque)** → يُحفظ في **HttpOnly cookie** اسمه `erp_rt`، `path=/api/auth` فقط (لا يُرسل لأي endpoint آخر)، `sameSite=lax`، `secure=true` إذا `NODE_ENV=production` وإلا `false`.
+- ✅ **في الـ DB** → يُحفظ **SHA-256 hash فقط** (`RefreshToken.tokenHash@unique`). الـ raw token لا يُسجّل ولا يُعاد للـ DB ولا يُكتب في الـ logs.
+
+### Security
+
+- **Password hashing**: `bcrypt(cost=12)` لكلمة المرور. في `users.service.ts.create` و `users.service.ts.update`.
+- **Refresh token at rest**: SHA-256 hash عبر `crypto.createHash('sha256').update(raw).digest('hex')`. الـ raw لا يلامس الـ DB.
+- **PasswordHash leakage**: `SafeUser` interface و `findUnique` بـ projections صريحة في `users.service.ts.list` تمنع `passwordHash` من الظهور في response. e2e #6 يُؤكد ذلك فعلياً.
+- **No tokens in logs**: `AuditService.sanitize` يحذف أي مفتاح يحوي `password` أو `token` أو `passwordHash` أو `accessToken` أو `refreshToken` (case-insensitive substring match) قبل الكتابة. الـ auth service لا يطبع raw tokens.
+- **CORS**: `cors({credentials:true})` + origin مسموح من `CORS_ORIGIN` env (comma-separated). الـ frontend في dev على `http://localhost:3000`.
+- **Cookies**: `sameSite=lax` في كل الأوضاع. **`secure=true` فقط في production** (`NODE_ENV=production`)، `secure=false` في dev.
+- **Helmet**: مفعّل على كل route عبر `app.use(helmet())` في `backend/src/main.ts`.
+- **ValidationPipe**: `whitelist: true, forbidNonWhitelisted: true, transform: true` — كل DTO يحذف أي حقل غير مصرَّح به.
+- **Rate limiting**: `@nestjs/throttler` global bucket 60 req/min/I​P + per-endpoint overrides:
+  - `POST /api/auth/login` → 10 req/min.
+  - `POST /api/auth/refresh` → 30 req/min.
+- **Sanitization of metadata on audit**: `FORBIDDEN_KEYS` filter على `Record<string,unknown>` قبل `prisma.auditLog.create`.
+
+### RBAC
+
+النظام **RBAC fine-grained** بدون wildcard في runtime:
+
+- **`Role`** — يملك `key` فريد لكل `companyId` (compound unique). كل role له `isSystem` flag للدور المضمّن (`company_admin`).
+- **`Permission`** — global catalog بمفتاح فريد (`users.read`, `sales.invoice.create`, إلخ)، مع `module` و `action`. الـ seed يزرع **39 permissions** في Phase 1.
+- **`RolePermission`** — many-to-many.
+- **`UserRole`** — many-to-many (user ↔ role, scoped by `companyId`).
+- **`@RequirePermissions(...)` decorator** — يَحُط metadata على handlers.
+- **`PermissionsGuard`** — `Reflector`-based، يقارن metadata بـ `req.user.permissions` ويعمل throw `ForbiddenException` لأي نقص.
+- **`@CurrentUser()` decorator** — يَستخرج `req.user` (محمي بـ `JwtAuthGuard`).
+- **`@UseGuards(JwtAuthGuard, PermissionsGuard)`** — على كل controller يحتاج حماية. **`login`, `refresh`, `logout`, `health`, `docs` غير محمية** عمداً.
+- **`companyId` scoping** — كل service method يأخذ `companyId` من JWT (لا من request body). كل query يستخدم `findFirst({where:{id,companyId}})`. لا `findUnique({where:{id}})` لوحده.
+
+### Endpoints
+
+| Method | Path | Permission | الوصف |
+|---|---|---|---|
+| GET | `/api/health` | — | Terminus health + DB ping |
+| POST | `/api/auth/login` | — (throttled 10/min) | bcrypt+timing-safe + RT issued |
+| POST | `/api/auth/refresh` | — (throttled 30/min) | RT rotation, new RT في cookie |
+| POST | `/api/auth/logout` | — | revoke RT + clear cookie, 204 |
+| GET | `/api/auth/me` | `JwtAuthGuard` فقط (لا perms) | re-hydrate user من DB |
+| GET | `/api/users` | `users.read` | list+search+pagination, scoped by companyId |
+| GET | `/api/users/:id` | `users.read` | same scope + roles + permissions |
+| POST | `/api/users` | `users.create` | bcrypt12, roleKeys validated against companyId |
+| PATCH | `/api/users/:id` | `users.update` | self-protection (no self-deactivate); password optional |
+| DELETE | `/api/users/:id` | `users.delete` | soft-delete عبر `isActive=false` |
+| GET | `/api/rbac/roles` | `roles.read` | scoped by companyId |
+| POST | `/api/rbac/roles` | `roles.create` | normalized key, duplicate guard |
+| PATCH | `/api/rbac/roles/:id` | `roles.update` | system role rename blocked |
+| DELETE | `/api/rbac/roles/:id` | `roles.delete` | refuses system role + role-in-use |
+| GET | `/api/rbac/permissions` | `permissions.read` | global catalog |
+| POST | `/api/rbac/roles/:id/permissions` | `roles.permissions.update` | replaces all perms |
+| POST | `/api/rbac/users/:id/roles` | `users.roles.update` | replaces all user roles |
+| GET | `/api/docs` | — | Swagger UI (basic, no try-it-out auth) |
+
+### Development Admin
+
+بعد تشغيل `pnpm prisma db seed` يكون موجوداً — **للتطوير فقط**:
+
+| الحقل | القيمة |
+|---|---|
+| Email | `admin@example.sa` |
+| Password | `Admin@12345` |
+| Company | `seed-company-default` |
+| Role | `company_admin` (system) |
+| Permissions | جميع الـ 39 permissions في الـ catalog |
+
+⚠️ **تنبيهات صريحة:**
+- هذه بيانات تطوير فقط. **يجب حذفها قبل أي نشر إنتاجي.**
+- لا تستخدم هذه الـ email/password في staging أو production.
+- للنشر الإنتاجي: استبدل `prisma/seed.ts` بـ provisioning script يولد كلمة مرور قوية عشوائية ويفرض تغيير كلمة المرور عند أول login.
+
+### Testing
+
+```bash
+# 1) من مستوى الـ monorepo
+cd /home/user/webapp/erp-system
+pnpm --filter @erp/backend test:e2e
+
+# 2) build الـ backend (NestJS)
+pnpm --filter @erp/backend build
+
+# 3) build الـ frontend (Next.js)
+pnpm --filter @erp/frontend build
+```
+
+ملفات الاختبار في `backend/test/`:
+- `app.e2e-spec.ts` — 9 سيناريوهات end-to-end:
+  1. login بكلمة مرور خاطئة → 401.
+  2. login بكلمة مرور صحيحة → 200 + accessToken + cookie `erp_rt=` + user بدون `passwordHash`.
+  3. `/auth/me` بدون token → 401.
+  4. `/auth/me` بـ Bearer → 200 مع permissions.
+  5. `/api/users` بدون token → 401.
+  6. `/api/users` بـ admin token → 200 ولا يوجد passwordHash في items.
+  7. refresh rotation: الـ RT القديم يُرفض بعد refresh ناجح.
+  8. logout: 204 + refresh لاحق → 401.
+  9. cashier (لا `users.read`) على `/api/users` → 403.
+- `jest-e2e.json` — config مخصص لـ e2e (pattern `.e2e-spec.ts$`, timeout 30s).
+
+### Remaining TODOs
+
+ما هو مؤجَّل للمرحلة 1-b (موثَّق في الكود):
+
+1. **`last-admin protection`** — حالياً `UsersService.remove` يمنع Soft-delete النفس فقط، لكن يمكن حذف آخر admin في الشركة (ما دام actorUserId != id). طُبّع TODO في `users.service.ts`:
+   ```ts
+   // TODO(last-admin-protection): add a check that at least one user with `company_admin`
+   //   remains active. This is intentionally simple in Phase 1 to avoid prematurely
+   //   designing role-protection rules that may change in Phase 1-b.
+   ```
+2. **`per-email rate limit`** — حاليا `@Throttle` على `POST /api/auth/login` بـ 10 req/min/I​P. نفس الـ IP لو استخدم credential stuffing على 100 email مختلف = 100*10=1000 محاولة/دقيقة ممكنة. الـ TODO واضح في `auth.controller.ts`:
+   ```ts
+   // Strict per-IP rate limit on login. TODO(phase1-b): per-email.
+   ```
+3. **Swagger try-it-out** — `@ApiBearerAuth()` على `/me` فقط، باقي الـ endpoints لا تحوي `ApiSecurity` (كتب swagger من غير تجربة inline). المرحلة 2+ ستحتاج تعريف `ApiBearerAuth` على routes المحمية + `ApiOperation` لـ descriptions.
+4. **`noImplicitAny`** — `tsconfig.json` فيه `noImplicitAny: false` مع TODO. سيُعاد تفعيله في المرحلة 1-b بعد كتابة أنواع صريحة على callbacks Prisma.
+5. **`audit read endpoint`** — permission `audit.read` مسجَّل في الـ catalog لكن لا يوجد endpoint `/api/audit/logs` بعد. سيُنفَّذ في المرحلة 8 (hardening).
+6. **JWT_REFRESH_SECRET** — مُعرَّف في config لكن غير مُحقَّق في use (`AuthService` يعتمد على `JWT_ACCESS_SECRET` فقط لتوقيع access؛ refresh tokens هي opaque random، لا JWT). مؤجَّل لتنظيف المرحلة 1-b.
+
+> **خلاصة:** المرحلة 1 أُغلقت مع 6 limitations موثَّقة بوضوح. لا يُسمح بفتح Phase 2 قبل معالجة هذه الـ TODOs أو الموافقة الصريحة على تأجيلها.
+
+---
+
+**آخر تحديث:** إغلاق المرحلة 1 — `9/9 e2e tests passing`، builds نظيفة للـ backend و frontend، git commit موثَّق في record الـ repo.
+

@@ -10,11 +10,21 @@ import * as bcrypt from 'bcrypt';
 const prisma = new PrismaClient();
 
 const PERMISSIONS = [
+  // Phase 1 — auth & rbac
+  { key: 'auth.me', module: 'auth', action: 'read', description: 'Read own profile' },
+  { key: 'audit.read', module: 'audit', action: 'read', description: 'View audit logs' },
+  { key: 'permissions.read', module: 'rbac', action: 'read', description: 'List permissions catalog' },
   // users & roles
   { key: 'users.read', module: 'users', action: 'read', description: 'List users' },
   { key: 'users.create', module: 'users', action: 'create', description: 'Create a user' },
   { key: 'users.update', module: 'users', action: 'update', description: 'Edit a user' },
   { key: 'users.delete', module: 'users', action: 'delete', description: 'Soft-delete a user' },
+  { key: 'users.roles.update', module: 'users', action: 'roles.update', description: 'Assign roles to a user' },
+  { key: 'roles.read', module: 'rbac', action: 'read', description: 'List roles' },
+  { key: 'roles.create', module: 'rbac', action: 'create', description: 'Create a role' },
+  { key: 'roles.update', module: 'rbac', action: 'update', description: 'Edit a role' },
+  { key: 'roles.delete', module: 'rbac', action: 'delete', description: 'Delete a role' },
+  { key: 'roles.permissions.update', module: 'rbac', action: 'permissions.update', description: 'Assign permissions to a role' },
   // settings
   { key: 'settings.read', module: 'settings', action: 'read', description: 'View company settings' },
   { key: 'settings.update', module: 'settings', action: 'update', description: 'Edit company settings' },
