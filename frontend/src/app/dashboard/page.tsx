@@ -66,7 +66,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-3xl font-bold text-slate-800">لوحة المعلومات</h1>
           <p className="text-sm text-slate-500">
-            نظام إدارة الموارد (ERP) — المرحلة 3: المخزون (Warehouses + Stock + Movements)
+            نظام إدارة الموارد (ERP) — المرحلة 4: المبيعات ونقطة البيع (Sales + POS)
           </p>
         </div>
         <div className="flex gap-2 flex-wrap">
@@ -92,6 +92,22 @@ export default function DashboardPage() {
               className="rounded-md bg-amber-600 hover:bg-amber-700 text-white text-sm px-4 py-2"
             >
               المخزون
+            </Link>
+          )}
+          {user.permissions.includes('sales.read') && (
+            <Link
+              href="/sales"
+              className="rounded-md bg-teal-600 hover:bg-teal-700 text-white text-sm px-4 py-2"
+            >
+              المبيعات
+            </Link>
+          )}
+          {user.permissions.includes('pos.read') && (
+            <Link
+              href="/pos"
+              className="rounded-md bg-rose-600 hover:bg-rose-700 text-white text-sm px-4 py-2"
+            >
+              نقطة البيع
             </Link>
           )}
           <button

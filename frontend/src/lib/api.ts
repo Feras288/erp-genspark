@@ -254,6 +254,84 @@ export const api = {
   // Convenience: list active products (type=PRODUCT) for Inventory forms.
   listProductsLiteForInventory: () =>
     api.listProducts({ page: 1, pageSize: 200, type: 'PRODUCT', isActive: true }),
+
+  // Convenience: list active customers (Partner type CUSTOMER | BOTH) for Sales/POS forms.
+  listActiveCustomers: () =>
+    api.listPartners({
+      page: 1,
+      pageSize: 200,
+      isActive: true,
+    }),
+
+  // Convenience: list active warehouses (used by sales issue / pos checkout).
+  listActiveWarehouses: () =>
+    api.listWarehouses({ page: 1, pageSize: 200, isActive: true }),
+
+  // Convenience: list all active products (PRODUCT + SERVICE) for sales lines / POS checkout.
+  listActiveProducts: () =>
+    api.listProducts({ page: 1, pageSize: 200, isActive: true }),
+
+  // ===== Phase 4: Sales invoices =====
+
+  listSalesInvoices: (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    status?: 'DRAFT' | 'ISSUED' | 'CANCELLED';
+    type?: 'STANDARD' | 'POS';
+    customerId?: string;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.status) q.set('status', params.status);
+    if (params.type) q.set('type', params.type);
+    if (params.customerId) q.set('customerId', params.customerId);
+    return apiRequest<Paginated<SalesInvoice>>(`/sales/invoices?${q.toString()}`);
+  },
+  getSalesInvoice: (id: string) =>
+    apiRequest<SalesInvoice>(`/sales/invoices/${id}`),
+  createSalesInvoice: (data: CreateSalesInvoiceInput) =>
+    apiRequest<SalesInvoice>('/sales/invoices', { method: 'POST', body: data }),
+  updateSalesInvoice: (id: string, data: UpdateSalesInvoiceInput) =>
+    apiRequest<SalesInvoice>(`/sales/invoices/${id}`, {
+      method: 'PATCH',
+      body: data,
+    }),
+  deleteSalesInvoice: (id: string) =>
+    apiRequest<{ id: string; isActive: boolean; deletedAt: string }>(
+      `/sales/invoices/${id}`,
+      { method: 'DELETE' },
+    ),
+  issueSalesInvoice: (id: string, data: IssueSalesInvoiceInput = {}) =>
+    apiRequest<SalesInvoice>(`/sales/invoices/${id}/issue`, {
+      method: 'POST',
+      body: data,
+    }),
+  cancelSalesInvoice: (id: string, data: CancelSalesInvoiceInput = {}) =>
+    apiRequest<SalesInvoice>(`/sales/invoices/${id}/cancel`, {
+      method: 'POST',
+      body: data,
+    }),
+
+  // ===== Phase 4B-4: POS sales =====
+
+  listPosSales: (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    customerId?: string;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.customerId) q.set('customerId', params.customerId);
+    return apiRequest<Paginated<SalesInvoice>>(`/pos/sales?${q.toString()}`);
+  },
+  createPosSale: (data: CreatePosSaleInput) =>
+    apiRequest<SalesInvoice>('/pos/sales', { method: 'POST', body: data }),
 };
 
 // =====================================================
@@ -387,4 +465,114 @@ export type StockTransferInput = {
   productId: string;
   quantity: string;
   notes?: string;
+};
+
+// =====================================================
+// Phase 4 types — Sales invoices + POS sales.
+// All Decimal columns serialize to strings (matches backend).
+// `companyId` is returned as a hint but authorization is
+// always from the JWT in currentUser. Money is never `Number`.
+// =====================================================
+
+export type SalesInvoiceStatus = 'DRAFT' | 'ISSUED' | 'CANCELLED';
+export type SalesInvoiceType = 'STANDARD' | 'POS';
+export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'OTHER';
+
+export type SalesInvoiceLine = {
+  id: string;
+  companyId: string;
+  invoiceId: string;
+  productId: string;
+  warehouseId: string | null;
+  description: string | null;
+  quantity: string;       // Decimal
+  unitPrice: string;      // Decimal
+  discountAmount: string; // Decimal
+  vatRate: string;        // Decimal @db.Decimal(5, 2)
+  vatAmount: string;      // Decimal
+  lineSubtotal: string;   // Decimal
+  lineTotal: string;      // Decimal
+  createdAt: string;
+  updatedAt: string;
+  product?: { id: string; sku: string; name: string; type: 'PRODUCT' | 'SERVICE' };
+  warehouse?: { id: string; code: string; name: string } | null;
+};
+
+export type SalesInvoice = {
+  id: string;
+  companyId: string;
+  invoiceNumber: string;
+  status: SalesInvoiceStatus;
+  type: SalesInvoiceType;
+  customerId: string | null;
+  issueDate: string | null;
+  dueDate: string | null;
+  subtotal: string;        // Decimal
+  vatTotal: string;        // Decimal
+  discountTotal: string;   // Decimal
+  total: string;           // Decimal
+  paymentMethod: PaymentMethod | null;
+  paidAmount: string | null;
+  notes: string | null;
+  cancelledAt: string | null;
+  issuedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdById: string | null;
+  updatedById: string | null;
+  issuedById: string | null;
+  cancelledById: string | null;
+  customer?: { id: string; code: string | null; name: string; type: string } | null;
+  lines?: SalesInvoiceLine[];
+  _count?: { lines: number };
+};
+
+export type CreateSalesInvoiceLineInput = {
+  productId: string;
+  warehouseId?: string;
+  description?: string;
+  quantity: string;
+  unitPrice: string;
+  discountAmount?: string;
+  vatRate?: string;
+};
+
+export type CreateSalesInvoiceInput = {
+  customerId?: string;
+  issueDate?: string;
+  dueDate?: string;
+  notes?: string;
+  lines: CreateSalesInvoiceLineInput[];
+};
+
+export type UpdateSalesInvoiceInput = Partial<Omit<CreateSalesInvoiceInput, 'lines'>> & {
+  lines?: CreateSalesInvoiceLineInput[];
+};
+
+export type IssueSalesInvoiceInput = {
+  issueDate?: string;
+  notes?: string;
+};
+
+export type CancelSalesInvoiceInput = {
+  reason?: string;
+  notes?: string;
+};
+
+export type CreatePosSaleLineInput = {
+  productId: string;
+  warehouseId?: string;
+  description?: string;
+  quantity: string;
+  unitPrice: string;
+  discountAmount?: string;
+  vatRate?: string;
+};
+
+export type CreatePosSaleInput = {
+  customerId?: string;
+  paymentMethod?: PaymentMethod;
+  paidAmount?: string;
+  notes?: string;
+  lines: CreatePosSaleLineInput[];
 };

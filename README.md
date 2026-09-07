@@ -1041,3 +1041,175 @@ It creates:
 
 Phase 3 (Inventory Core) is ready to close. **Phase 4 must NOT be started without explicit user approval.** When approved, Phase 4 should be Sales + POS only and follow the same scope discipline (RBAC permissions, append-only audit, `companyId` coupling, no mock business data).
 
+---
+
+## Phase 4: Sales + POS
+
+> **هذه المرحلة هي Sales + POS فقط** — لا Purchases/Accounting/Reports/ZATCA/HR/Payroll. تمت كتابتها فوق Phase 1 (Auth + RBAC) و Phase 2 (Products/Partners) و Phase 3 (Inventory Core) بالكامل، ولا تغيّر أي معمارية قائمة. لا تستخدم أي خدمات Cloudflare (لا Workers، لا D1، لا KV، لا R2، لا Pages) ولا Wrangler ولا النشر المُستضاف.
+
+### Scope
+
+Phase 4 introduces the **sales + point-of-sale** layer:
+
+- **Sales Invoices** — `STANDARD` (مشتريات تقليدية عبر /sales/invoices) و `POS` (نقطة بيع فورية).
+- **Sales Status Machine** — `DRAFT → ISSUED → CANCELLED`.
+- **POS Backend** — إصدار فوري عبر `/pos/sales` (SalesInvoice of type `POS`, يُصدر فورًا بنفس الـ transaction).
+- **SALE_OUT Stock Movement** — خصم المخزون يتم في `SalesService.issue` في نفس transaction الذي يخصم `StockLevel` ويُلحق `SALE_OUT movement` بـ `referenceType='sales_invoice'` و `referenceId = invoice.id`.
+- **Frontend** — صفحتان جديدتان تحت RTL مع بوابات RBAC.
+
+### What is included
+
+#### Phase 4B-1: Sales drafts (Phase 4B-1 commit `edb8456`)
+
+- إنشاء مسودة فاتورة بيع عبر `POST /api/sales/invoices` مع رأس (customer, issueDate, dueDate, notes) و خطوط (product, warehouseId?, quantity, unitPrice, discountAmount, vatRate, description).
+- القراءة `GET /api/sales/invoices/:id` لاسترجاع المسودة.
+- التحديل `PATCH /api/sales/invoices/:id` للمسودات فقط (الحالة `DRAFT`).
+- الحذف الناعم `DELETE /api/sales/invoices/:id` (soft-delete بـ `deletedAt`/`isActive`).
+- توليد `invoiceNumber = si-YYYYMMDD-NNNN` مع إعادة محاولة 3-مرات ضد تصادم race.
+
+#### Phase 4B-2: Sales issue/cancel (Phase 4B-2 commit `d8bd54d`)
+
+- `POST /api/sales/invoices/:id/issue` — DRAFT → ISSUED، يخصم المخزون + يُصدر `SALE_OUT movement`.
+- `POST /api/sales/invoices/:id/cancel` — DRAFT → CANCELLED (مرفوض لـ ISSUED برسالة "credit note introduction in a future phase"، ومرفوض لـ CANCELLED كـ already-cancelled).
+- `SERVICE` lines تعبر بدون خصم مخزون.
+- `PRODUCT` lines تتطلب `warehouseId` وتُرفض في `issue` لو `quantity > balance` (`BadRequestException` 400).
+
+#### Phase 4B-3: POS backend (Phase 4B-3 commit `3738151`)
+
+- `PosModule` بجانب `SalesModule` في `app.module.ts`. AuditModule هو `@Global()`.
+- `POST /api/pos/sales` — ينشئ مسودة POS ثم يُصدرها فورًا بنفس transaction (يكتب `paymentMethod`، `paidAmount`، `notes` ويحط `type=POS`).
+- `GET /api/pos/sales` — paginated، محصور بـ `type=POS, deletedAt=null`.
+- `sales.createDraft(..., { type, paymentMethod, paidAmount })` هو internal helper، الـ facade العمومي بقيّ `create()` لـ `type: STANDARD` بنفس signature.
+
+#### Phase 4C: Frontend (this commit, planned message `feat(phase-4): add sales+pos frontend`)
+
+- `frontend/src/lib/api.ts` (578 سطرًا) — أضفنا `listSalesInvoices`/`getSalesInvoice`/`createSalesInvoice`/`updateSalesInvoice`/`deleteSalesInvoice`/`issueSalesInvoice`/`cancelSalesInvoice` + `listPosSales`/`createPosSale` + helpers `listActiveCustomers`/`listActiveWarehouses`/`listActiveProducts`. 12 نوعًا جديدًا في الفئة `Sales + POS` (Decimals end-to-end كسلاسل نصية).
+- `frontend/src/app/sales/page.tsx` (Single Page App) — جدول فواتير مع فلاتر (search/status/type/customer)، نموذج مسودة برأس + خطوط ديناميكية، per-row actions (edit/issue/cancel/delete) each gated by `sales.{read,create,update,delete,issue,cancel}`.
+- `frontend/src/app/pos/page.tsx` — سلة POS + نموذج دفع + جدول آخر 20 فاتورة POS. بوابة RBAC: `pos.read` للقراءة، `pos.create` للإصدار.
+- `frontend/src/app/dashboard/page.tsx` — أضفنا زرين جديدين بألوان مميزة: `المبيعات` (teal) gated بـ `sales.read` و `نقطة البيع` (rose) gated بـ `pos.read`.
+- جميع الصفحات RTL `<html dir="rtl" lang="ar">`, لا `Number` حسابي في الـ UI (الـ Display-only conversions فقط).
+
+### What is intentionally excluded
+
+ما يلي **ليس** في Phase 4 ولا يجب أن يظهر في الـ codebase أو الـ migrations أو الـ seed:
+
+- **Purchases** (المشتريات، أوامر الشراء، استلام البضاعة).
+- **Accounting** (دفاتر يومية، GL، COGS، cost layers).
+- **Reports / analytics / dashboards** (تقارير مالية، تقارير مخزون، تقارير مبيعات، valuation).
+- **ZATCA** (الفوترة الإلكترونية، TLV/SHA256، CSID، XML).
+- **HR / Payroll / WPS / Qiwa / GOSI**.
+- **SaaS billing** (اشتراكات، tenant portal، Stripe).
+- **Costing / COGS / FIFO / LIFO / average cost** حتى داخل الـ sales.
+- **Serial numbers / batch / expiry** للمواد المباعة.
+- **POS hardware integration** (Barcode scanner, cash drawer, receipt printer).
+- **Payment gateway integration** (Stripe, Tap, HyperPay, mada, ApplePay).
+- **Refunds, returns, credit notes, partial payments, split payments, shift management**.
+- **No mock business data** — لا عملاء تجريبيين، لا منتجات تجريبية، لا فواتير demo.
+
+### Permissions (Phase 4 — extended from Phase 1's 52-permission matrix)
+
+| Permission | الغرض | المرحلة |
+|---|---|---|
+| `sales.read` | قراءة/قائمة الفواتير | Phase 4B-1 |
+| `sales.create` | إنشاء مسودة فاتورة | Phase 4B-1 |
+| `sales.update` | تعديل مسودة | Phase 4B-1 |
+| `sales.delete` | حذف ناعم لمسودة | Phase 4B-1 |
+| `sales.issue` | إصدار (issue) مسودة → خصم المخزون + SALE_OUT | Phase 4B-2 |
+| `sales.cancel` | إلغاء فاتورة (DRAFT→CANCELLED) | Phase 4B-2 |
+| `pos.read` | قراءة / قائمة POS sales | Phase 4B-3 |
+| `pos.create` | إصدار فاتورة POS فورًا | Phase 4B-3 |
+
+جميع 8 الصلاحيات تُضاف لِدور `company_admin` وقت `pnpm db:seed` (الـ seed idempotent: الصلاحيات الجديدة تُضاف دون تأثير على الشركة/المستخدم الحالي). الإجمالي الآن: **52 permission × admin grants**.
+
+### Endpoints (الـ 11 مسار الجديد لـ Phase 4)
+
+| Method | Path | Permission | Phase |
+|---|---|---|---|
+| GET | /api/sales/invoices | sales.read | 4B-1 |
+| GET | /api/sales/invoices/:id | sales.read | 4B-1 |
+| POST | /api/sales/invoices | sales.create | 4B-1 |
+| PATCH | /api/sales/invoices/:id | sales.update | 4B-1 |
+| DELETE | /api/sales/invoices/:id | sales.delete | 4B-1 |
+| POST | /api/sales/invoices/:id/issue | sales.issue | 4B-2 |
+| POST | /api/sales/invoices/:id/cancel | sales.cancel | 4B-2 |
+| GET | /api/pos/sales | pos.read | 4B-3 |
+| POST | /api/pos/sales | pos.create | 4B-3 |
+
+### Sales rules (enforced in `backend/src/sales/sales.service.ts`)
+
+| القاعدة | الإنفاذ |
+|---|---|
+| الحقول النقدية `@db.Decimal(18, 4)` | Prisma Decimal، لا `Number` رياضيات في الـ service |
+| `companyId` من JWT فقط | لا يُقبل من body/query/path |
+| DRAFT→ISSUED حصرًا عبر `POST /issue` | خصم المخزون + `SALE_OUT movement` نفس الـ `$transaction` |
+| ISSUED→CANCELLED مرفوض حاليًا | خدمة تُرجع `400` بالرسالة "Issued invoices require credit note/reversal flow in a future phase." |
+| CANCELLED→CANCELLED مرفوض | `400 BadRequestException('Invoice is already CANCELLED.')` |
+| PATCH مسودة مرفوض إذا الحالة ليست DRAFT | `ConflictException` 409 |
+| `POS sales` يُصدر تلقائيًا من POST | يستخدم `sales.createDraft({ type:POS, paymentMethod, paidAmount })` ثم `sales.issue(...)` |
+| `SERVICE` خطوط تتجاوز المخزون | لا خصم، لا `movement` |
+| `PRODUCT` خطوط تتطلب `warehouseId` | `BadRequestException('PRODUCT lines require warehouseId.')` |
+| `quantity > balance` في الـ issue مرفوض | `BadRequestException` 400 مع `Balance: X, Requested: Y` |
+| رقم فاتورة فريد على مستوى الشركة | `si-YYYYMMDD-NNNN`, 3-attempt race retry |
+| `AuditService.record` best-effort | `FORBIDDEN_KEYS` sanitization, لا يُكسر الـ flow |
+
+### Stock coupling (Sales ↔ Inventory)
+
+- `SALE_OUT movement` يُلحق فقط في `POST /issue` (STANDARD) أو في `POST /pos/sales` (POS, يُصدر فورًا).
+- `referenceType='sales_invoice'` و `referenceId=invoice.id` على الـ movement.
+- كل حركة تتنزل من `StockLevel.quantity` في نفس الـ transaction.
+- لا يُنشأ أي `SaleInvoice` بدون أن تتحرك الـ movements الإلكترونيات الخاصة به لو الـ lines his `PRODUCT`.
+- لا `PURPOSE_IN/STOCK_IN` مرتبط — طريق خصم المخزون الوحيد في هذا الـ codebase هو عبر sales issue أو adjustments/transfer.
+
+### Frontend routes (Phase 4C)
+
+| المسار | RBAC gate | الغرض |
+|---|---|---|
+| `/sales` | `sales.read` | كل الفواتير (status/type filter، draft form) |
+| `/pos` | `pos.read` (يقرأ) + `pos.create` (يصدر) | POS point-of-sale canvas + recent list |
+| `/dashboard` | (existing) | زرين إضافيين: `المبيعات` (teal) + `نقطة البيع` (rose) |
+
+عدد routes بعد Phase 4: **12 routes** (`/login`, `/dashboard`, `/users`, `/products`, `/partners`, `/warehouses`, `/inventory`, **`/sales`**, **`/pos`**, `/_not-found`، +2 chiral chunks).
+
+### Testing commands
+
+```bash
+# من جذر الـ monorepo
+pnpm --filter @erp/backend test:e2e   # 61/61
+pnpm --filter @erp/backend build       # nest build exit 0
+pnpm --filter @erp/frontend build      # next build exit 0
+```
+
+النتائج المتوقعة بعد Phase 4:
+
+- Backend `test:e2e`: **61 / 61 passing** (9 Phase 1 + 7 Phase 2 Products + 7 Phase 2 Partners + 7 Phase 3 Warehouses + 11 Phase 3 Inventory + **13 Phase 4 Sales (4B-1 + 4B-2 + 4B-3)** + **7 Phase 4B-3 POS**).
+- Backend `build`: `nest build` exits 0.
+- Frontend `build`: **12 routes** compile، يشمل `/sales` و `/pos` الجديدتين.
+
+### Migration note (Phase 4 SQL migration)
+
+```
+20260907014059_phase4_sales_pos
+```
+
+تنشئ:
+
+- Enum types `SalesInvoiceStatus { DRAFT, ISSUED, CANCELLED }`, `SalesInvoiceType { STANDARD, POS }`, `PaymentMethod { CASH, CARD, TRANSFER, OTHER }`.
+- جداول `sales_invoices`, `sales_invoice_lines` بـ `@@unique([companyId, invoiceNumber])`, `@@index([companyId, status, deletedAt])`, `@@index([companyId, type, deletedAt])`.
+- `Decimal @db.Decimal(18, 4)` على كل الـ money columns: `subtotal, vatTotal, discountTotal, total, paidAmount, quantity, unitPrice, discountAmount, vatRate, vatAmount, lineSubtotal, lineTotal`.
+- `@@index([invoiceId])` على `sales_invoice_lines`, `@@index([companyId, productId])`.
+- FK references على `companies`/`users`/`partners`/`products`/`warehouses`.
+
+### Security / tenancy (unchanged from Phase 1 + 2 + 3)
+
+- `companyId` **دائمًا** من `currentUser.companyId` (JWT)؛ لا يُقبل من body/query/path.
+- كل `prisma.salesInvoice / prisma.salesInvoiceLine` query مفلتر بـ `companyId`.
+- الفاتورة لا تعبر tenure الـ owning company (لا cross-company joins).
+- لا `localStorage` / `sessionStorage`؛ access token في-memory داخل `frontend/lib/api.ts`.
+- لا بيانات تجربة/وهمية — الـ seed يضيف فقط الصلاحيات ومستخدم admin. الـ e2e suite يبني ويترك الـ sales الخاصة به.
+- **`AuditService.record`** is best-effort (لا تُكسر operations لو الـ audit fail). تستخدم `FORBIDDEN_KEYS` لاكتشاف أي dataset حساس تلقائيًا.
+- Decimal end-to-end (`Prisma.Decimal` في الـ service، `string` في الـ JSON)، لا `Number` حسابي في الـ UI.
+
+### Recommendation
+
+**Phase 4 (Sales + POS) انتهت. Phase 5 يجب ألّا تبدأ بدون موافقة صريحة من المستخدم.** الـ scope inclusion pattern المتبع هنا (RBAC + append-only audit + `companyId` coupling + no mock data + لا خدمات مُستضافة) يجب أن يستمر في المرحلة القادمة، وأي مرحلة لاحقة يجب أن تكون **single-domain** فقط: إمّا Purchases, أو Accounting, أو Reports, أو ZATCA, أو HR — كل واحدة بمعماريتها الخاصة، ولا جمع في مرحلة واحدة دون مبرر صريح.
+
