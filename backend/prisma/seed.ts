@@ -49,6 +49,16 @@ const PERMISSIONS = [
   { key: 'warehouses.delete', module: 'warehouses', action: 'delete', description: 'Soft-delete warehouse' },
   // stock movements (Phase 3)
   { key: 'stockMovements.read', module: 'inventory', action: 'movements.read', description: 'View stock movement history' },
+  // sales (Phase 4A seed-only; modules land in a later phase)
+  { key: 'sales.read', module: 'sales', action: 'read', description: 'List / get sales invoices' },
+  { key: 'sales.create', module: 'sales', action: 'create', description: 'Create draft sales invoice' },
+  { key: 'sales.update', module: 'sales', action: 'update', description: 'Edit draft sales invoice' },
+  { key: 'sales.delete', module: 'sales', action: 'delete', description: 'Delete draft sales invoice' },
+  { key: 'sales.issue', module: 'sales', action: 'issue', description: 'Issue invoice and deduct stock' },
+  { key: 'sales.cancel', module: 'sales', action: 'cancel', description: 'Cancel eligible sales invoice' },
+  // pos (Phase 4A seed-only; modules land in a later phase)
+  { key: 'pos.read', module: 'pos', action: 'read', description: 'Read POS sales' },
+  { key: 'pos.create', module: 'pos', action: 'create', description: 'Create POS quick-sale (issue immediately)' },
   // sales
   { key: 'sales.invoice.read', module: 'sales', action: 'read', description: 'List sales invoices' },
   { key: 'sales.invoice.create', module: 'sales', action: 'create', description: 'Create sales invoice' },

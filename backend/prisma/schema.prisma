@@ -33,13 +33,15 @@ model Company {
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
-  users          User[]
-  roles          Role[]
-  products       Product[]
-  partners       Partner[]
-  warehouses     Warehouse[]
-  stockLevels    StockLevel[]
-  stockMovements StockMovement[]
+  users             User[]
+  roles             Role[]
+  products          Product[]
+  partners          Partner[]
+  warehouses        Warehouse[]
+  stockLevels       StockLevel[]
+  stockMovements    StockMovement[]
+  salesInvoices     SalesInvoice[]
+  salesInvoiceLines SalesInvoiceLine[]
 
   @@index([name])
   @@map("companies")
@@ -69,13 +71,17 @@ model User {
   userRoles     UserRole[]
   refreshTokens RefreshToken[]
 
-  productsCreated       Product[]       @relation("ProductCreatedBy")
-  productsUpdated       Product[]       @relation("ProductUpdatedBy")
-  partnersCreated       Partner[]       @relation("PartnerCreatedBy")
-  partnersUpdated       Partner[]       @relation("PartnerUpdatedBy")
-  warehousesCreated     Warehouse[]     @relation("WarehouseCreatedBy")
-  warehousesUpdated     Warehouse[]     @relation("WarehouseUpdatedBy")
-  stockMovementsCreated StockMovement[] @relation("StockMovementCreatedBy")
+  productsCreated        Product[]       @relation("ProductCreatedBy")
+  productsUpdated        Product[]       @relation("ProductUpdatedBy")
+  partnersCreated        Partner[]       @relation("PartnerCreatedBy")
+  partnersUpdated        Partner[]       @relation("PartnerUpdatedBy")
+  warehousesCreated      Warehouse[]     @relation("WarehouseCreatedBy")
+  warehousesUpdated      Warehouse[]     @relation("WarehouseUpdatedBy")
+  stockMovementsCreated  StockMovement[] @relation("StockMovementCreatedBy")
+  salesInvoicesCreated   SalesInvoice[]  @relation("SalesInvoiceCreatedBy")
+  salesInvoicesUpdated   SalesInvoice[]  @relation("SalesInvoiceUpdatedBy")
+  salesInvoicesIssued    SalesInvoice[]  @relation("SalesInvoiceIssuedBy")
+  salesInvoicesCancelled SalesInvoice[]  @relation("SalesInvoiceCancelledBy")
 
   @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
@@ -209,8 +215,9 @@ model Product {
   createdBy User?   @relation("ProductCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
   updatedBy User?   @relation("ProductUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
 
-  stockLevels    StockLevel[]
-  stockMovements StockMovement[]
+  stockLevels       StockLevel[]
+  stockMovements    StockMovement[]
+  salesInvoiceLines SalesInvoiceLine[]
 
   // Unique sku per company (sku is always non-null).
   @@unique([companyId, sku])
@@ -255,9 +262,10 @@ model Partner {
   createdById String?
   updatedById String?
 
-  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  createdBy User?   @relation("PartnerCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
-  updatedBy User?   @relation("PartnerUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy     User?          @relation("PartnerCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy     User?          @relation("PartnerUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  salesInvoices SalesInvoice[]
 
   // We use a partial unique index via raw SQL in the migration for `code`.
   @@index([companyId, isActive])
@@ -278,6 +286,7 @@ enum StockMovementType {
   ADJUSTMENT_OUT
   TRANSFER_IN
   TRANSFER_OUT
+  SALE_OUT
 }
 
 enum StockMovementDirection {
@@ -363,4 +372,97 @@ model StockMovement {
   @@index([companyId, warehouseId, movementDate])
   @@index([companyId, movementType])
   @@map("stock_movements")
+}
+
+// =====================================================
+// Phase 4: Sales + POS — schema only in Phase 4A.
+// NO business logic, NO endpoints, NO tests, NO UI yet.
+// NO accounting, NO purchases, NO reports, NO ZATCA.
+// =====================================================
+
+enum SalesInvoiceStatus {
+  DRAFT
+  ISSUED
+  CANCELLED
+}
+
+enum SalesInvoiceType {
+  STANDARD
+  POS
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  TRANSFER
+  OTHER
+}
+
+model SalesInvoice {
+  id            String             @id @default(cuid())
+  companyId     String
+  invoiceNumber String
+  status        SalesInvoiceStatus @default(DRAFT)
+  type          SalesInvoiceType   @default(STANDARD)
+  customerId    String?
+  issueDate     DateTime?
+  dueDate       DateTime?
+  subtotal      Decimal            @default(0) @db.Decimal(18, 4)
+  vatTotal      Decimal            @default(0) @db.Decimal(18, 4)
+  discountTotal Decimal            @default(0) @db.Decimal(18, 4)
+  total         Decimal            @default(0) @db.Decimal(18, 4)
+  paymentMethod PaymentMethod?
+  paidAmount    Decimal?           @db.Decimal(18, 4)
+  notes         String?
+  cancelledAt   DateTime?
+  issuedAt      DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  createdById   String?
+  updatedById   String?
+  issuedById    String?
+  cancelledById String?
+  deletedAt     DateTime?
+
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  customer    Partner? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  createdBy   User?    @relation("SalesInvoiceCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy   User?    @relation("SalesInvoiceUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  issuedBy    User?    @relation("SalesInvoiceIssuedBy", fields: [issuedById], references: [id], onDelete: SetNull)
+  cancelledBy User?    @relation("SalesInvoiceCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  lines SalesInvoiceLine[]
+
+  @@unique([companyId, invoiceNumber])
+  @@index([companyId, status])
+  @@index([companyId, type])
+  @@index([companyId, customerId])
+  @@index([companyId, issueDate])
+  @@index([companyId, deletedAt])
+  @@map("sales_invoices")
+}
+
+model SalesInvoiceLine {
+  id             String   @id @default(cuid())
+  companyId      String
+  invoiceId      String
+  productId      String
+  description    String?
+  quantity       Decimal  @db.Decimal(18, 4)
+  unitPrice      Decimal  @db.Decimal(18, 4)
+  discountAmount Decimal  @default(0) @db.Decimal(18, 4)
+  vatRate        Decimal  @default(15.00) @db.Decimal(5, 2)
+  vatAmount      Decimal  @default(0) @db.Decimal(18, 4)
+  lineSubtotal   Decimal  @default(0) @db.Decimal(18, 4)
+  lineTotal      Decimal  @default(0) @db.Decimal(18, 4)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  company Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice SalesInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([companyId, invoiceId])
+  @@index([companyId, productId])
+  @@map("sales_invoice_lines")
 }
