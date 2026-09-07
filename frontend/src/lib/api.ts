@@ -332,6 +332,65 @@ export const api = {
   },
   createPosSale: (data: CreatePosSaleInput) =>
     apiRequest<SalesInvoice>('/pos/sales', { method: 'POST', body: data }),
+
+  // ===== Phase 5: Purchases Core =====
+  // No Accounting / GL / AP / COGS / landed cost / supplier balance / payment
+  // gateway / returns / debit-credit notes on the client either — these routes
+  // are DRAFT/RECEIVED/CANCELLED lifecycle only.
+
+  listPurchaseInvoices: (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    status?: PurchaseInvoiceStatus;
+    supplierId?: string;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.status) q.set('status', params.status);
+    if (params.supplierId) q.set('supplierId', params.supplierId);
+    return apiRequest<Paginated<PurchaseInvoice>>(`/purchases/invoices?${q.toString()}`);
+  },
+  getPurchaseInvoice: (id: string) =>
+    apiRequest<PurchaseInvoice>(`/purchases/invoices/${id}`),
+  createPurchaseInvoice: (data: CreatePurchaseInvoiceInput) =>
+    apiRequest<PurchaseInvoice>('/purchases/invoices', { method: 'POST', body: data }),
+  updatePurchaseInvoice: (id: string, data: UpdatePurchaseInvoiceInput) =>
+    apiRequest<PurchaseInvoice>(`/purchases/invoices/${id}`, {
+      method: 'PATCH',
+      body: data,
+    }),
+  deletePurchaseInvoice: (id: string) =>
+    apiRequest<{ id: string; deletedAt: string }>(`/purchases/invoices/${id}`, {
+      method: 'DELETE',
+    }),
+  receivePurchaseInvoice: (
+    id: string,
+    data: ReceivePurchaseInvoiceInput = {},
+  ) =>
+    apiRequest<PurchaseInvoice>(`/purchases/invoices/${id}/receive`, {
+      method: 'POST',
+      body: data,
+    }),
+  cancelPurchaseInvoice: (id: string, data: CancelPurchaseInvoiceInput = {}) =>
+    apiRequest<PurchaseInvoice>(`/purchases/invoices/${id}/cancel`, {
+      method: 'POST',
+      body: data,
+    }),
+
+  // Convenience: list active suppliers only (Partner type SUPPLIER | BOTH) — server
+  // enforces the rule regardless, but the UI filters to avoid 400s.
+  listActiveSuppliers: () =>
+    api
+      .listPartners({ page: 1, pageSize: 200, isActive: true })
+      .then((res) => ({
+        ...res,
+        items: res.items.filter(
+          (p) => p.type === 'SUPPLIER' || p.type === 'BOTH',
+        ),
+      })),
 };
 
 // =====================================================
@@ -427,7 +486,8 @@ export type StockMovementTypeKey =
   | 'ADJUSTMENT_IN'
   | 'ADJUSTMENT_OUT'
   | 'TRANSFER_IN'
-  | 'TRANSFER_OUT';
+  | 'TRANSFER_OUT'
+  | 'PURCHASE_IN'; // Phase 5: appended for purchase receives.
 
 export type StockMovementDirectionKey = 'IN' | 'OUT';
 
@@ -575,4 +635,103 @@ export type CreatePosSaleInput = {
   paidAmount?: string;
   notes?: string;
   lines: CreatePosSaleLineInput[];
+};
+
+// =====================================================
+// Phase 5 types — Purchase invoices.
+// Server side enforces:
+//   - supplier.type ∈ {SUPPLIER, BOTH} (CUSTOMER-only rejected).
+//   - Same-company, active, non-deleted Product on every line.
+//   - PRODUCT lines must carry warehouseId at receive.
+//   - All money fields are server-computed Decimal; the client never
+//     sends subtotal/vatTotal/discountTotal/total in the request body.
+// =====================================================
+// Note: StockMovementTypeKey already declared above (with PURCHASE_IN
+// appended in Phase 5). Reusing it here keeps the union single-source.
+
+export type PurchaseInvoiceStatus = 'DRAFT' | 'RECEIVED' | 'CANCELLED';
+
+export type PurchaseInvoiceLine = {
+  id: string;
+  companyId: string;
+  invoiceId: string;
+  productId: string;
+  warehouseId: string | null; // nullable only for SERVICE lines; PRODUCT requires it at receive
+  description: string | null;
+  quantity: string;           // Decimal
+  unitCost: string;           // Decimal
+  discountAmount: string;     // Decimal
+  vatRate: string;            // Decimal @db.Decimal(5, 2)
+  vatAmount: string;          // Decimal
+  lineSubtotal: string;       // Decimal
+  lineTaxable: string;        // Decimal (lineSubtotal - lineDiscount)
+  lineTotal: string;          // Decimal
+  createdAt: string;
+  updatedAt: string;
+  product?: {
+    id: string;
+    sku: string;
+    name: string;
+    type: 'PRODUCT' | 'SERVICE';
+  };
+  warehouse?: { id: string; code: string; name: string } | null;
+};
+
+export type PurchaseInvoice = {
+  id: string;
+  companyId: string;
+  invoiceNumber: string;   // pi-YYYYMMDD-NNNN
+  status: PurchaseInvoiceStatus;
+  supplierId: string | null;
+  purchaseDate: string | null;
+  dueDate: string | null;
+  subtotal: string;        // Decimal
+  vatTotal: string;        // Decimal
+  discountTotal: string;   // Decimal
+  total: string;           // Decimal
+  notes: string | null;
+  receivedAt: string | null;
+  cancelledAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdById: string | null;
+  updatedById: string | null;
+  receivedById: string | null;
+  cancelledById: string | null;
+  supplier?: { id: string; code: string | null; name: string; type: string } | null;
+  lines?: PurchaseInvoiceLine[];
+  _count?: { lines: number };
+};
+
+export type CreatePurchaseInvoiceLineInput = {
+  productId: string;
+  warehouseId?: string; // optional on create; required at receive if product.type === 'PRODUCT'
+  description?: string;
+  quantity: string;
+  unitCost: string;
+  discountAmount?: string;
+  vatRate?: string;
+};
+
+export type CreatePurchaseInvoiceInput = {
+  supplierId?: string;
+  purchaseDate?: string;
+  dueDate?: string;
+  notes?: string;
+  lines: CreatePurchaseInvoiceLineInput[];
+};
+
+export type UpdatePurchaseInvoiceInput =
+  Partial<Omit<CreatePurchaseInvoiceInput, 'lines'>> & {
+    lines?: CreatePurchaseInvoiceLineInput[];
+  };
+
+export type ReceivePurchaseInvoiceInput = {
+  purchaseDate?: string;
+  notes?: string;
+};
+
+export type CancelPurchaseInvoiceInput = {
+  reason?: string;
+  notes?: string;
 };

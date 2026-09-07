@@ -102,6 +102,14 @@ export default function DashboardPage() {
               المبيعات
             </Link>
           )}
+          {user.permissions.includes('purchases.read') && (
+            <Link
+              href="/purchases"
+              className="rounded-md bg-indigo-700 hover:bg-indigo-800 text-white text-sm px-4 py-2"
+            >
+              المشتريات
+            </Link>
+          )}
           {user.permissions.includes('pos.read') && (
             <Link
               href="/pos"

@@ -1213,3 +1213,175 @@ pnpm --filter @erp/frontend build      # next build exit 0
 
 **Phase 4 (Sales + POS) انتهت. Phase 5 يجب ألّا تبدأ بدون موافقة صريحة من المستخدم.** الـ scope inclusion pattern المتبع هنا (RBAC + append-only audit + `companyId` coupling + no mock data + لا خدمات مُستضافة) يجب أن يستمر في المرحلة القادمة، وأي مرحلة لاحقة يجب أن تكون **single-domain** فقط: إمّا Purchases, أو Accounting, أو Reports, أو ZATCA, أو HR — كل واحدة بمعماريتها الخاصة، ولا جمع في مرحلة واحدة دون مبرر صريح.
 
+---
+
+## Phase 5: Purchases Core
+
+يقدّم Phase 5 الـ **core purchase‑invoice lifecycle** بدون أي Accounting / GL / AP / COGS / landed cost / supplier balance / payments / debit-credit notes / returns. كل شيء على نفس معمارية Phase 1–4: RBAC من JWT، Company scoping، append-only audit، server-side Decimal، لا mock business data، لا خدمات مُستضافة.
+
+### Commit map (Phase 5)
+
+| Sub‑phase | الوصف | Commit |
+|-----------|-------|--------|
+| 5A | Prisma: `PurchaseInvoiceStatus` enum، `StockMovementType += PURCHASE_IN`، جدولا `purchase_invoices` / `purchase_invoice_lines`، migration `20260907225332_phase5_purchases_core`، seed 6 permissions جديدة (`purchases.{read,create,update,delete,receive,cancel}` ← 52+6 = **58** total) | مدمج في commit الـ Phase 5 الـbackend |
+| 5B | `PurchasesModule` + `PurchasesController` (7 endpoints RBAC‑gated) + `PurchasesService` (DRAFT/RECEIVED/CANCELLED + Supplier/Product validation + PurchaseInvoice number generator `pi‑YYYYMMDD‑NNNN` + receive flow: PRODUCT → StockLevel Upsert + PURCHASE_IN movement, SERVICE → pass‑through) + 6 DTOs + ربط `PurchasesModule` في `app.module.ts` | `ee5a705 feat(phase-5): implement purchases core` |
+| 5C | 13 e2e جديدة في `backend/test/app.e2e-spec.ts`. **`74/74 passing`** (61 baseline + 13 Phase 5) | مدمج في الـ commit نفسه |
+| 5D | هذا الـ commit: frontend purchases client + RTL page `/purchases` + dashboard nav المشتريات + تحديث README | `feat(phase-5): add purchases frontend + README final` |
+
+### Status machine
+
+| From → To | مسموح؟ | شرط |
+|-----------|--------|------|
+| DRAFT → RECEIVED | نعم | `POST /purchases/invoices/:id/receive`. PRODUCT lines → StockLevel Upsert + PURCHASE_IN movement؛ SERVICE → pass‑through |
+| DRAFT → CANCELLED | نعم | `POST /purchases/invoices/:id/cancel`. سبب اختياري |
+| DRAFT → DRAFT (update) | نعم | `PATCH /purchases/invoices/:id` يستبدل الـ lines ويعيد حساب totals |
+| DRAFT → soft‑deleted | نعم | `DELETE /purchases/invoices/:id`، soft‑delete فقط |
+| RECEIVED → * | ❌ | "Received purchase invoices require returns/debit‑note flow in a future phase." |
+| CANCELLED → * | ❌ | "Invoice is already cancelled." |
+
+### Supplier & Product rules (server‑enforced)
+
+- `supplierId` يجب أن يكون `Partner` داخل نفس الـ company، `active=isActive=true`، `deletedAt=null`، و `type ∈ {SUPPLIER, BOTH}`. الـ `CUSTOMER`‑only مرفوض بـ **HTTP 400** ورسالة "not a supplier".
+- كل line يستخدم `Product` داخل نفس الـ company، `active`، `not deleted`.
+- PRODUCT line في create يقبل `warehouseId` (يُحفظ على الـ line). في **receive**، الـ PRODUCT line **يجب** أن يحمل `warehouseId` نشط وإلا يرفض.
+- SERVICE line في create يقبل `warehouseId` كاختياري (يُهمل). في **receive**، SERVICE line **pass‑through كاملاً**: لا StockLevel update، لا StockMovement append.
+
+### Calculations (server‑side Decimal only)
+
+لكل line:
+
+- `lineSubtotal = qty * unitCost`
+- `lineDiscount` = بند الـ discount (موجب أو 0)
+- `lineTaxable = max(lineSubtotal - lineDiscount, 0)`
+- `vatAmount = (lineTaxable * vatRate / 100).toDecimalPlaces(4, ROUND_HALF_UP)`
+- `lineTotal = lineTaxable + vatAmount`
+
+على مستوى الـ header: `subtotal`, `vatTotal`, `discountTotal`, `total` كلها `@db.Decimal(18, 4)`، تُجمع server‑side فقط. الـ frontend لا يرسل totals في الـ body.
+
+### Permissions (Phase 5 — extends Phase 1's 52‑permission matrix by 6)
+
+| Key | الوصف | Phase |
+|-----|-------|-------|
+| `purchases.read`   | قائمة/قراءة فواتير الشراء | 5B |
+| `purchases.create` | إنشاء مسودة فاتورة شراء | 5B |
+| `purchases.update` | تعديل مسودة شراء | 5B |
+| `purchases.delete` | حذف ناعم لمسودة شراء | 5B |
+| `purchases.receive`| استلام فاتورة شراء (PRODUCT → StockLevel + PURCHASE_IN) | 5B |
+| `purchases.cancel` | إلغاء DRAFT → CANCELLED | 5B |
+
+> legacy `purchases.invoice.{read,create,approve}` لا تزال في الـ seed (idempotency)، لكن الـ RBAC الفعّال يستخدم الـ 6 keys الجديدة فقط (نفس النمط الـ Phase 4 sales.read/.../sales.issue/.../sales.cancel vs. sales.invoice.*). المجموع الكلي للـ permissions بعد seed الـ Phase 5: **58**.
+
+### Endpoints (الـ 7 مسارات الجديدة لـ Phase 5)
+
+كلها تحت `JwtAuthGuard + PermissionsGuard` وتستخدم `@CurrentUser` لاستخراج `companyId`:
+
+| Method | Path | Permission | Body |
+|--------|------|-----------|------|
+| GET    | `/api/purchases/invoices` | `purchases.read` | query: `page, pageSize, search, status, supplierId` |
+| GET    | `/api/purchases/invoices/:id` | `purchases.read` | — |
+| POST   | `/api/purchases/invoices` | `purchases.create` | `{ supplierId?, purchaseDate?, dueDate?, notes?, lines: [...] }` (HttpCode 201) |
+| PATCH  | `/api/purchases/invoices/:id` | `purchases.update` | DRAFT only؛ يستبدل الـ lines ويعيد حساب الـ totals في transaction واحد |
+| DELETE | `/api/purchases/invoices/:id` | `purchases.delete` | DRAFT only؛ soft‑delete |
+| POST   | `/api/purchases/invoices/:id/receive` | `purchases.receive`| DRAFT only؛ `{ purchaseDate?, notes? }`؛ PRODUCT → StockLevel upsert + PURCHASE_IN |
+| POST   | `/api/purchases/invoices/:id/cancel` | `purchases.cancel` | DRAFT only؛ `{ reason?, notes? }` |
+
+### Frontend routes (Phase 5D)
+
+| Route | الوصف | Permission gate |
+|-------|-------|----------------|
+| `/dashboard` | أضيف زر **المشتريات** (indigo‑700) | `purchases.read` |
+| `/purchases` | صفحة RTL: قائمة + فلتر (status/supplier/search) + form مسودة (إنشاء/تعديل) + actions لكل صف (edit / receive / cancel / delete) | `purchases.read`؛ الإجراءات مفصّلة على `purchases.{update,receive,cancel,delete}` |
+
+Frontend additions (commit هذا الـ commit):
+- `frontend/src/lib/api.ts`: types `PurchaseInvoiceStatus`, `PurchaseInvoiceLine`, `PurchaseInvoice`, `Create{Update,Receive,Cancel}*Input`، توسيع `StockMovementTypeKey += 'PURCHASE_IN'`, helpers `listPurchaseInvoices / getPurchaseInvoice / createPurchaseInvoice / updatePurchaseInvoice / deletePurchaseInvoice / receivePurchaseInvoice / cancelPurchaseInvoice` + convenience `listActiveSuppliers` (filter على `SUPPLIER|BOTH` على الـ client لتفادي 400s).
+- `frontend/src/app/purchases/page.tsx`: صفحة RTL `dir="rtl" lang="ar"` بنفس نمط `sales/page.tsx`، مع تأمين:
+  - الـ receive يعرض confirm قبل الـ API call، ويعرض backend error verbatim (مثل "Received purchase invoices require returns/debit-note flow in a future phase.").
+  - الـ SERVICE line: لا warehouse select (مُعطّل)، لا Stock preview (الـ backend لا ينشئ StockLevel/StockMovement عليها).
+  - لا `localStorage` / `sessionStorage`. Access token في-memory داخل `frontend/lib/api.ts`.
+- `frontend/src/app/dashboard/page.tsx`: زر **المشتريات** (indigo‑700) قبل زر نقطة البيع، gated على `purchases.read`.
+
+عدد routes بعد Phase 5: **13 routes** (`/login`, `/dashboard`, `/users`, `/products`, `/partners`, `/warehouses`, `/inventory`, `/sales`, `/pos`, **`/purchases`**, `/_not-found`، +2 chiral chunks).
+
+### Migration note (Phase 5 SQL migration)
+
+```
+20260907225332_phase5_purchases_core
+```
+
+تنشئ:
+
+- Enum type `PurchaseInvoiceStatus { DRAFT, RECEIVED, CANCELLED }`.
+- `ALTER TYPE StockMovementType ADD VALUE 'PURCHASE_IN'` (PostgreSQL لا يدعم الـ remove؛ forward‑only).
+- جدول `purchase_invoices`: `invoiceNumber` بحقل `pi-YYYYMMDD-NNNN` مولّد server‑side، `subtotal / vatTotal / discountTotal / total` كلها `Decimal @db.Decimal(18, 4)`، `@@unique([companyId, invoiceNumber])`, `@@index([companyId, status, deletedAt])`, `@@index([companyId, supplierId])`, `@@index([companyId, purchaseDate])`، FK references على `companies` (Cascade)، `users × 4` (audit fields createdById/updatedById/receivedById/cancelledById — `SetNull`)، `partners` (Restrict على supplierId).
+- جدول `purchase_invoice_lines`: كل بند يحمل `quantity / unitCost / discountAmount / vatRate / vatAmount / lineSubtotal / lineTaxable / lineTotal` كـ `Decimal @db.Decimal(18, 4)` أو `@db.Decimal(5, 2)` (`vatRate`)، `@@index([invoiceId])`, `@@index([companyId, productId])`, FK على `purchase_invoices` (Cascade)، `products` (Restrict)، `warehouses` (`SetNull` — الـ SERVICE line قد لا يحتاج warehouse).
+- 11 `AddForeignKey` بـ Cascade/SetNull/Restrict حسب الـ semantics.
+
+### StockMovement extension (Phase 5)
+
+`StockMovementType += PURCHASE_IN`. الـ receive flow يكتب حركة:
+
+```text
+{
+  movementType: 'PURCHASE_IN',
+  direction:    'IN',
+  quantity:     lineQty,
+  referenceType:'purchase_invoice',
+  referenceId:  invoice.id,
+  reason:       null,
+  notes:        invoice.notes,
+  movementDate: invoice.purchaseDate ?? now,
+}
+```
+
+**SERVICE lines → لا StockLevel update، لا StockMovement**. الـ e2e test #7 يفرض `sameInvoice.length === 1` على الـ StockMovement للتحقق من الـ pass‑through.
+
+### الـ e2e Suite بعد Phase 5
+
+- Backend `test:e2e`: **74 / 74 passing** (9 Phase 1 + 7 Phase 2 Products + 7 Phase 2 Partners + 7 Phase 3 Warehouses + 11 Phase 3 Inventory + 13 Phase 4 Sales + 7 Phase 4B‑3 POS + **13 Phase 5 Purchases**).
+  - 13 tests Phase 5 مغطّية:
+    1. `/api/purchases/invoices without token => 401`.
+    2. list مع admin token => 200 + page/pageSize shape.
+    3. SERVICE‑only line => totals 400/60/460 (subtotal/discount/vat/total).
+    4. PRODUCT + BOTH supplier => 400/60/460.
+    5. CUSTOMER‑only supplier => 400 "not a supplier".
+    6. PATCH مع discount recompute => 350/52.5/402.5.
+    7. receive mixed SERVICE+PRODUCT draft => RECEIVED + receivedAt + **StockLevel productReceiveQty=7** + **exactly 1 PURCHASE_IN movement** بـ `referenceId=invoice.id` (SERVICE pass‑through).
+    8. re‑receive على RECEIVED => 400 "cannot‑receive".
+    9. PATCH على RECEIVED => 409 "cannot‑edit‑RECEIVED".
+    10. cancel DRAFT => 200 + CANCELLED.
+    11. re‑cancel على CANCELLED => 400 "already‑cancelled".
+    12. RBAC list works on admin token.
+    13. Random unique codes via `${Date.now().toString(36)}` لتجنّب الـ collisions بين runs.
+
+- Backend `build`: `nest build` exits 0.
+- Frontend `build`: `next build` exits 0 مع 13 routes static (+ `/purchases`).
+
+### Hard prohibitions honored (Phase 5)
+
+ما هو **ليس** في Phase 5 ولا في الـ codebase ولا في الـ migrations ولا في الـ seed:
+
+- Accounting / General Ledger / Journal entries.
+- Accounts Payable / supplier balances / Payments / payment gateway.
+- Reports / ZATCA e‑invoicing / HR / Payroll / SaaS billing.
+- Sales returns / Purchase returns / Debit notes / Credit notes.
+- Cost layers / FIFO / LIFO / Weighted average costing / Landed cost.
+- Barcode hardware / Receipt printer / Cash drawer / Shift management.
+- أي mock / fake / demo business data — الـ seed يضيف فقط الـ admin user + الـ 58 permissions. كل الـ suppliers/products/warehouses/invoices في الـ e2e تُبنى داخل نفس الـ test.
+- **لا Cloudflare / Workers / D1 / KV / R2 / Wrangler / OAuth / Skills** — المشروع Docker Compose محلي.
+
+### Security / tenancy (unchanged from Phase 1 + 2 + 3 + 4)
+
+- `companyId` **دائمًا** من `currentUser.companyId` (JWT)؛ لا يُقبل من body/query/path.
+- كل `prisma.purchaseInvoice / prisma.purchaseInvoiceLine` query مفلتر بـ `companyId`. لا cross‑company joins.
+- لا `localStorage` / `sessionStorage`؛ access token في-memory داخل `frontend/lib/api.ts`.
+- لا بيانات تجربة/وهمية — الـ seed يضيف فقط الصلاحيات ومستخدم admin. الـ e2e يبني ويترك الـ fixtures الخاصة به.
+- **`AuditService.record`** is best‑effort (لا يُكسر الـ operations لو الـ audit fail). يستخدم `FORBIDDEN_KEYS` لاكتشاف أي dataset حساس تلقائيًا. Phase 5 events: `purchases.invoice.{created,updated,deleted,received,cancelled}`.
+- Decimal end‑to‑end (`Prisma.Decimal` في الـ service، `string` في الـ JSON)، لا `Number` حسابي في الـ UI.
+
+### Recommendation
+
+**Phase 5 (Purchases Core) انتهت.** Phase 6 يجب ألّا تبدأ بدون موافقة صريحة من المستخدم. الـ scope inclusion pattern يجب أن يستمر (RBAC + append-only audit + `companyId` coupling + no mock data + no hosted services)، وأي مرحلة لاحقة يجب أن تكون **single-domain** فقط: إمّا **Accounting/GL/AP**، أو **Reports/ZATCA**، أو **HR/Payroll**، أو **Sales/Purchase Returns + Debit/Credit notes**، إلخ — كل واحدة بمعماريتها الخاصة، ولا جمع في مرحلة واحدة دون مبرر صريح.
+
+> **لا تبدأ Phase 6 تلقائياً.** انتظر تعليمات صريحة من المستخدم.
+
+
