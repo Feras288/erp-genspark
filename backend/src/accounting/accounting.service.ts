@@ -167,7 +167,7 @@ export class AccountingService {
 
   async getAccount(companyId: string, id: string) {
     const acc = await this.prisma.account.findFirst({
-      where: { id, companyId },
+      where: { id, companyId, deletedAt: null },
       select: { ...ACCOUNT_SELECT, parent: true, children: true },
     });
     if (!acc) throw new NotFoundException('Account not found');

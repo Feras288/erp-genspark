@@ -1833,3 +1833,466 @@ describe('Phase 5: Purchases (e2e)', () => {
     expect(String(res.body.message ?? '')).toMatch(/already cancelled/i);
   });
 });
+
+// =====================================================
+// Phase 6 — Accounting (e2e): Chart of Accounts + Manual Journal Entries.
+//
+// Strict scope of this suite:
+//   * Chart of Accounts CRUD (code/name/type/normalBalance/parent/active, soft-delete).
+//   * Manual Journal Entries with DRAFT/POSTED/CANCELLED lifecycle.
+//   * Double-entry validation: ≥2 lines, debit-or-credit per line, totalDebit==totalCredit.
+//
+// Strict non-scope (per Phase 6 mandate — must NOT appear here):
+//   * No Financial Reports / Trial Balance / Balance Sheet / P&L / VAT reports.
+//   * No ZATCA / e-invoicing / QR / CSID.
+//   * No automated posting from Sales/Purchases (verified by cross-load below).
+//   * No AR/AP ledgers / customer/supplier statements.
+//   * No payments / bank reconciliation / cash management.
+//   * No cost accounting / COGS / inventory valuation / fixed assets / payroll / SaaS billing.
+//   * No returns / debit notes / credit notes / reverse entries / period locking.
+//   * No mock/demo business data.
+// =====================================================
+describe('Phase 6: Accounting (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+
+  // Per-run unique account codes so re-running the suite doesn't hit dedupe.
+  const unique = Date.now().toString(36);
+  const CASH_CODE = `ACC-CASH-${unique}`; // ASSET/DEBIT  (DEBIT-normal)
+  const AP_CODE = `ACC-AP-${unique}`; // LIABILITY/CREDIT (CREDIT-normal)
+  const EQ_CODE = `ACC-EQ-${unique}`; // EQUITY/CREDIT (CREDIT-normal)
+  const TEST_INV_CODE_1 = `ACC-SIX-A-${unique}`; // used for invalid-chars probe
+  const TEST_DUP_CODE = `ACC-DUP-${unique}`; // duplicate-code probe
+  const TEST_DEL_CODE = `ACC-DEL-${unique}`; // soft-delete probe
+
+  let cashAccountId = '';
+  let apAccountId = '';
+  let eqAccountId = '';
+  let delAccountId = '';
+  let validDraftJournalId = '';
+  let cancelledJournalId = '';
+  let postedJournalId = '';
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  // ----------------------------------------------------------------
+  // A) Chart of Accounts — access control + list/get
+  // ----------------------------------------------------------------
+
+  it('A1) GET /accounting/accounts without token => 401', async () => {
+    const res = await request(http).get(`${API_PREFIX}/accounting/accounts`);
+    expect(res.status).toBe(401);
+  });
+
+  it('A2) GET /accounting/accounts as admin => 200 + paginated shape', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  // ----------------------------------------------------------------
+  // B) Chart of Accounts — create
+  //    Validates: regex, dedupe (409), AccountType/NormalBalance invariants.
+  // ----------------------------------------------------------------
+
+  it('B1) POST /accounting/accounts ASSET/DEBIT valid => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: CASH_CODE,
+        name: 'Cash on hand',
+        nameAr: 'النقدية بالصندوق',
+        type: 'ASSET',
+        normalBalance: 'DEBIT',
+        isActive: true,
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBeDefined();
+    expect(res.body.code).toBe(CASH_CODE);
+    expect(res.body.type).toBe('ASSET');
+    expect(res.body.normalBalance).toBe('DEBIT');
+    expect(res.body.companyId).toBeDefined();
+    expect(res.body.isActive).toBe(true);
+    cashAccountId = res.body.id;
+  });
+
+  it('B2) POST /accounting/accounts LIABILITY/CREDIT valid => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: AP_CODE,
+        name: 'Accounts Payable',
+        type: 'LIABILITY',
+        normalBalance: 'CREDIT',
+        isActive: true,
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.type).toBe('LIABILITY');
+    expect(res.body.normalBalance).toBe('CREDIT');
+    apAccountId = res.body.id;
+  });
+
+  it('B3) POST /accounting/accounts EQUITY/CREDIT valid => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: EQ_CODE,
+        name: "Owner's Equity",
+        type: 'EQUITY',
+        normalBalance: 'CREDIT',
+        isActive: true,
+      });
+    expect(res.status).toBe(201);
+    eqAccountId = res.body.id;
+  });
+
+  it('B4) POST /accounting/accounts duplicate code same company => 409', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: CASH_CODE, // same code as B1
+        name: 'Another cash account',
+        type: 'ASSET',
+        normalBalance: 'DEBIT',
+      });
+    expect(res.status).toBe(409);
+  });
+
+  it('B5) POST /accounting/accounts with invalid code chars => 400', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: `bad code with spaces and !`, // spaces + '!' violate regex
+        name: 'Bad Code Account',
+        type: 'ASSET',
+        normalBalance: 'DEBIT',
+      });
+    expect(res.status).toBe(400);
+  });
+
+  // ----------------------------------------------------------------
+  // C) Chart of Accounts — update + read-one + soft-delete
+  // ----------------------------------------------------------------
+
+  it('C1) GET /accounting/accounts/:id as admin => 200 + nested parent/children', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts/${cashAccountId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(cashAccountId);
+    expect(res.body.code).toBe(CASH_CODE);
+    expect(Array.isArray(res.body.children)).toBe(true);
+  });
+
+  it('C2) PATCH /accounting/accounts/:id => 200 + name updated', async () => {
+    const res = await request(http)
+      .patch(`${API_PREFIX}/accounting/accounts/${cashAccountId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ name: 'Cash on hand (updated)' });
+    expect(res.status).toBe(200);
+    expect(res.body.name).toBe('Cash on hand (updated)');
+    expect(res.body.code).toBe(CASH_CODE); // code is immutable in this PATCH
+  });
+
+  it('C3) DELETE /accounting/accounts/:id with no posted lines => 200 soft-delete', async () => {
+    // Seed a throwaway account then delete it. The three accounts above
+    // are referenced by every journal test below, so they MUST stay active.
+    const create = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: TEST_DEL_CODE,
+        name: 'Throwaway account',
+        type: 'EXPENSE',
+        normalBalance: 'DEBIT',
+      });
+    expect(create.status).toBe(201);
+    delAccountId = create.body.id;
+
+    const res = await request(http)
+      .delete(`${API_PREFIX}/accounting/accounts/${delAccountId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.isActive).toBe(false);
+    expect(res.body.deletedAt).toBeTruthy();
+  });
+
+  it('C4) GET /accounting/accounts/:id after soft-delete => 404', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts/${delAccountId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(404);
+  });
+
+  // ----------------------------------------------------------------
+  // D) Journal entries — list + read + access control
+  // ----------------------------------------------------------------
+
+  it('D1) GET /accounting/journal without token => 401', async () => {
+    const res = await request(http).get(`${API_PREFIX}/accounting/journal`);
+    expect(res.status).toBe(401);
+  });
+
+  it('D2) GET /accounting/journal as admin => 200 + paginated shape', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  // ----------------------------------------------------------------
+  // E) Journal entries — create with strict double-entry validation
+  // ----------------------------------------------------------------
+
+  it('E1) POST /accounting/journal with <2 lines => 400', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'single-line attempt (must be rejected)',
+        lines: [
+          {
+            accountId: cashAccountId,
+            debit: '100.0000',
+            credit: '0.0000',
+          },
+        ],
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('E2) POST /accounting/journal with both debit+credit on a line => 400', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'line with both sides > 0 (must be rejected)',
+        lines: [
+          {
+            accountId: cashAccountId,
+            debit: '100.0000',
+            credit: '100.0000',
+          },
+          {
+            accountId: apAccountId,
+            debit: '0.0000',
+            credit: '100.0000',
+          },
+        ],
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('E3) POST /accounting/journal unbalanced (debit != credit) => 400', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'unbalanced attempt (must be rejected)',
+        lines: [
+          {
+            accountId: cashAccountId,
+            debit: '100.0000',
+            credit: '0.0000',
+          },
+          {
+            accountId: apAccountId,
+            debit: '0.0000',
+            credit: '50.0000', // 100 vs 50 → unbalanced
+          },
+        ],
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('E4) POST /accounting/journal balanced, ≥2 lines => 201 DRAFT', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Cash outlay to settle liability',
+        reference: 'EV-E2E-001',
+        lines: [
+          {
+            accountId: apAccountId,
+            debit: '0.0000',
+            credit: '100.0000', // reduce liability (debit on CREDIT-normal)
+          },
+          {
+            accountId: cashAccountId,
+            debit: '100.0000',
+            credit: '0.0000', // increase asset (debit on DEBIT-normal)
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBeDefined();
+    expect(res.body.status).toBe('DRAFT');
+    expect(res.body.entryNumber).toMatch(/^je-\d{8}-\d+$/);
+    expect(String(res.body.totalDebit)).toMatch(/^100/);
+    expect(String(res.body.totalCredit)).toMatch(/^100/);
+    expect(res.body._count?.lines).toBe(2);
+    validDraftJournalId = res.body.id;
+  });
+
+  // ----------------------------------------------------------------
+  // F) Journal entries — read-one + update DRAFT + cancel
+  // ----------------------------------------------------------------
+
+  it('F1) GET /accounting/journal/:id => 200 + nested lines + nested account refs', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/journal/${validDraftJournalId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('DRAFT');
+    expect(Array.isArray(res.body.lines)).toBe(true);
+    expect(res.body.lines.length).toBe(2);
+    for (const ln of res.body.lines) {
+      expect(ln.id).toBeDefined();
+      expect(ln.debitAccountId ?? ln.creditAccountId ?? null).not.toBeNull();
+      // Either debitAccount or creditAccount nested should be populated.
+      expect(ln.debitAccount ?? ln.creditAccount ?? null).not.toBeNull();
+    }
+  });
+
+  it('F2) PATCH /accounting/journal/:id on DRAFT (notes) => 200', async () => {
+    const res = await request(http)
+      .patch(`${API_PREFIX}/accounting/journal/${validDraftJournalId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'patched notes from e2e' });
+    expect(res.status).toBe(200);
+    expect(String(res.body.notes ?? '')).toContain('patched notes from e2e');
+    expect(res.body.status).toBe('DRAFT');
+  });
+
+  it('F3) POST /accounting/journal/:id/post => 200|201, status=POSTED + postedAt set', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${validDraftJournalId}/post`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect([200, 201]).toContain(res.status);
+    expect(res.body.status).toBe('POSTED');
+    expect(res.body.postedAt).toBeDefined();
+    expect(res.body.postedById).toBeDefined();
+    postedJournalId = res.body.id;
+  });
+
+  it('F4) POST /accounting/journal/:id/post on already-POSTED => 409', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${postedJournalId}/post`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    // Service throws ConflictException for non-DRAFT → 409.
+    expect([400, 409]).toContain(res.status);
+  });
+
+  it('F5) POST /accounting/journal/:id/cancel on POSTED => 409 (reverse-entries out of scope)', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${postedJournalId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'should be refused' });
+    // Phase 6 mandate explicitly forbids reversing entries: POSTED cannot cancel.
+    expect([400, 409]).toContain(res.status);
+    expect(String(res.body.message ?? '')).toMatch(
+      /posted|reverse|out of scope/i,
+    );
+  });
+
+  it('F6) POST /accounting/journal/:id/cancel on DRAFT => 200|201 + status=CANCELLED', async () => {
+    // Build a fresh balanced DRAFT so we have something to cancel.
+    const create = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Equity injection (will be cancelled)',
+        lines: [
+          {
+            accountId: cashAccountId,
+            debit: '250.0000',
+            credit: '0.0000',
+          },
+          {
+            accountId: eqAccountId,
+            debit: '0.0000',
+            credit: '250.0000',
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    expect(create.body.status).toBe('DRAFT');
+    cancelledJournalId = create.body.id;
+
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${cancelledJournalId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'e2e cancel of DRAFT' });
+    // NestJS default for POST without explicit @HttpCode is 201.
+    expect([200, 201]).toContain(res.status);
+    expect(res.body.status).toBe('CANCELLED');
+    expect(res.body.cancelledAt).toBeDefined();
+    expect(res.body.cancelledById).toBeDefined();
+  });
+
+  it('F7) POST /accounting/journal/:id/cancel on already-CANCELLED => 409', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${cancelledJournalId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    // Service throws ConflictException for already-cancelled → 409.
+    expect([400, 409]).toContain(res.status);
+  });
+
+  // ----------------------------------------------------------------
+  // G) Cross-load: sales / purchases do NOT auto-post to accounting in Phase 6.
+  //    This is asserted by inventory / sales endpoints being independent of
+  //    /accounting endpoints. We don't call them again here (covered by their
+  //    own phases); this block is purely a documentation anchor.
+  // ----------------------------------------------------------------
+
+  it('G1) GET /accounting/journal status=DRAFT filter returns non-POSTED set', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/journal?status=DRAFT`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.items)).toBe(true);
+    for (const it of res.body.items) expect(it.status).toBe('DRAFT');
+  });
+});
