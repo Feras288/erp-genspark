@@ -531,3 +531,411 @@ describe('Phase 2: Partners (e2e)', () => {
     expect(get.status).toBe(404);
   });
 });
+
+// =====================================================
+// Phase 3 — Warehouses (e2e)
+// All endpoints scoped by companyId from JWT only. Soft-delete only.
+// =====================================================
+describe('Phase 3: Warehouses (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+
+  const unique = Date.now().toString(36);
+  const WH_CODE = `WH-${unique}`;
+  const WH_CODE_DUP = `WH2-${unique}`;
+  const WH_CODE_DEL = `WH-DEL-${unique}`;
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('1) GET /warehouses without token => 401', async () => {
+    const res = await request(http).get(`${API_PREFIX}/warehouses`);
+    expect(res.status).toBe(401);
+  });
+
+  it('2) GET /warehouses as admin => 200 + paginated shape', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  it('3) POST /warehouses valid => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: WH_CODE,
+        name: 'E2E Warehouse',
+        nameAr: 'مستودع اختبار',
+        address: 'Test Street 1',
+        city: 'Riyadh',
+        isActive: true,
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBeDefined();
+    expect(res.body.code).toBe(WH_CODE);
+    expect(res.body.companyId).toBeDefined();
+    expect(res.body.deletedAt).toBeNull();
+  });
+
+  it('4) POST duplicate code same company => 409', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: WH_CODE, // same as test #3
+        name: 'Another warehouse',
+      });
+    expect(res.status).toBe(409);
+  });
+
+  it('5) PATCH warehouse => 200', async () => {
+    const list = await request(http)
+      .get(`${API_PREFIX}/warehouses?search=${encodeURIComponent(WH_CODE)}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(list.status).toBe(200);
+    const id = list.body.items[0]?.id;
+    expect(id).toBeDefined();
+
+    const res = await request(http)
+      .patch(`${API_PREFIX}/warehouses/${id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ name: 'E2E Renamed Warehouse', city: 'Jeddah' });
+    expect(res.status).toBe(200);
+    expect(res.body.name).toBe('E2E Renamed Warehouse');
+    expect(res.body.city).toBe('Jeddah');
+  });
+
+  it('6) DELETE warehouse with no stock => 200 soft delete', async () => {
+    // create a second warehouse to delete (the first has no stockLevels either,
+    // ensuring the soft-delete "no positive stock" guard accepts it).
+    const created = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: WH_CODE_DEL,
+        name: 'To Delete Warehouse',
+      });
+    expect(created.status).toBe(201);
+
+    const res = await request(http)
+      .delete(`${API_PREFIX}/warehouses/${created.body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.isActive).toBe(false);
+  });
+
+  it('7) GET deleted warehouse => 404', async () => {
+    // create another warehouse so we have a known-good id to soft-delete + 404.
+    const ts = Date.now();
+    const code = `WH-X-${ts.toString(36)}`;
+    const created = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code, name: 'TempDeleteWarehouse' });
+    expect(created.status).toBe(201);
+
+    const del = await request(http)
+      .delete(`${API_PREFIX}/warehouses/${created.body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(del.status).toBe(200);
+
+    const get = await request(http)
+      .get(`${API_PREFIX}/warehouses/${created.body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(get.status).toBe(404);
+
+    // secondary duper probe — code already used => 409
+    const dup = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: WH_CODE_DUP, // unused fresh code to seed #dup path later if needed
+        name: 'WH DUP Bucket',
+      });
+    expect([201, 409]).toContain(dup.status);
+  });
+});
+
+// =====================================================
+// Phase 3 — Inventory (e2e): stock levels, adjustments, transfers, movements.
+//
+// companyId scoped strictly from JWT. PRODUCT-type products only.
+// stockMovement is append-only — we verify by GET, not by update/delete.
+// =====================================================
+describe('Phase 3: Inventory (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+
+  const unique = Date.now().toString(36);
+  const SKU_PROD = `INV-PROD-${unique}`;
+  const SKU_SVC = `INV-SVC-${unique}`;
+  const WH_A = `INV-WHA-${unique}`;
+  const WH_B = `INV-WHB-${unique}`;
+
+  let productId = '';
+  let serviceId = '';
+  let warehouseAId = '';
+  let warehouseBId = '';
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+
+    // Seed: PRODUCT + SERVICE + two warehouses
+    const pProd = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_PROD, name: 'Inventory Product', type: 'PRODUCT' });
+    expect(pProd.status).toBe(201);
+    productId = pProd.body.id;
+
+    const pSvc = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ sku: SKU_SVC, name: 'Inventory Service', type: 'SERVICE' });
+    expect(pSvc.status).toBe(201);
+    serviceId = pSvc.body.id;
+
+    const wA = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: WH_A, name: 'Warehouse A' });
+    expect(wA.status).toBe(201);
+    warehouseAId = wA.body.id;
+
+    const wB = await request(http)
+      .post(`${API_PREFIX}/warehouses`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: WH_B, name: 'Warehouse B' });
+    expect(wB.status).toBe(201);
+    warehouseBId = wB.body.id;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('1) GET /inventory/levels without token => 401', async () => {
+    const res = await request(http).get(`${API_PREFIX}/inventory/levels`);
+    expect(res.status).toBe(401);
+  });
+
+  it('2) GET /inventory/levels as admin => 200 + paginated shape', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/inventory/levels`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  it('3) POST /inventory/adjustments IN valid product => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        productId,
+        warehouseId: warehouseAId,
+        adjustmentType: 'ADJUSTMENT_IN',
+        quantity: '10.0000',
+        reason: 'E2E initial receipt',
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.level).toBeDefined();
+    expect(res.body.movement).toBeDefined();
+    expect(res.body.movement.direction).toBe('IN');
+    expect(res.body.movement.movementType).toBe('ADJUSTMENT_IN');
+    expect(Number(res.body.level.quantity)).toBe(10);
+  });
+
+  it('4) Verify stock level increased after IN adjustment', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/inventory/levels?productId=${productId}&warehouseId=${warehouseAId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const level = res.body.items.find(
+      (l: any) => l.productId === productId && l.warehouseId === warehouseAId,
+    );
+    expect(level).toBeDefined();
+    expect(Number(level.quantity)).toBe(10);
+  });
+
+  it('5) POST /inventory/adjustments OUT valid quantity => 201', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        productId,
+        warehouseId: warehouseAId,
+        adjustmentType: 'ADJUSTMENT_OUT',
+        quantity: '3.0000',
+        reason: 'E2E damaged units write-off',
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.movement.direction).toBe('OUT');
+    expect(res.body.movement.movementType).toBe('ADJUSTMENT_OUT');
+    expect(Number(res.body.level.quantity)).toBe(7);
+  });
+
+  it('6) POST /inventory/adjustments OUT exceeding balance => 400', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        productId,
+        warehouseId: warehouseAId,
+        adjustmentType: 'ADJUSTMENT_OUT',
+        quantity: '9999.0000',
+        reason: 'E2E negative-balance attempt',
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('7) POST /inventory/adjustments for SERVICE product => 400', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        productId: serviceId,
+        warehouseId: warehouseAId,
+        adjustmentType: 'ADJUSTMENT_IN',
+        quantity: '5.0000',
+        reason: 'E2E service-stock attempt',
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('8) POST /inventory/transfers valid => 201 + paired movements', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/inventory/transfers`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        fromWarehouseId: warehouseAId,
+        toWarehouseId: warehouseBId,
+        productId,
+        quantity: '4.0000',
+        notes: 'E2E transfer A->B',
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.out).toBeDefined();
+    expect(res.body.inn).toBeDefined();
+    expect(res.body.out.movementType).toBe('TRANSFER_OUT');
+    expect(res.body.out.direction).toBe('OUT');
+    expect(res.body.inn.movementType).toBe('TRANSFER_IN');
+    expect(res.body.inn.direction).toBe('IN');
+    expect(res.body.inn.referenceId).toBe(res.body.out.id);
+  });
+
+  it('9) Verify source decreased and target increased after transfer', async () => {
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/levels?productId=${productId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const sourceLevel = res.body.items.find(
+      (l: any) => l.warehouseId === warehouseAId,
+    );
+    const targetLevel = res.body.items.find(
+      (l: any) => l.warehouseId === warehouseBId,
+    );
+    expect(sourceLevel).toBeDefined();
+    expect(targetLevel).toBeDefined();
+    // source went from 7 to 3; target from 0 to 4
+    expect(Number(sourceLevel.quantity)).toBe(3);
+    expect(Number(targetLevel.quantity)).toBe(4);
+  });
+
+  it('10) POST /inventory/transfers same warehouse => 400', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/inventory/transfers`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        fromWarehouseId: warehouseAId,
+        toWarehouseId: warehouseAId, // same — must be rejected
+        productId,
+        quantity: '1.0000',
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('11) GET /inventory/movements => 200 and includes created movements', async () => {
+    // Filter by productId+warehouseId A so only this scenario's movements appear.
+    const res = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/movements?productId=${productId}&warehouseId=${warehouseAId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+    // this product in warehouseA must have at least: 1 ADJUSTMENT_IN + 1 ADJUSTMENT_OUT + 1 TRANSFER_OUT
+    const types = new Set(res.body.items.map((m: any) => m.movementType));
+    expect(types.has('ADJUSTMENT_IN')).toBe(true);
+    expect(types.has('ADJUSTMENT_OUT')).toBe(true);
+    expect(types.has('TRANSFER_OUT')).toBe(true);
+    expect(res.body.total).toBeGreaterThanOrEqual(3);
+
+    // Also verify the warehouse-B side has TRANSFER_IN.
+    const resB = await request(http)
+      .get(
+        `${API_PREFIX}/inventory/movements?productId=${productId}&warehouseId=${warehouseBId}`,
+      )
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(resB.status).toBe(200);
+    const typesB = new Set(resB.body.items.map((m: any) => m.movementType));
+    expect(typesB.has('TRANSFER_IN')).toBe(true);
+  });
+});

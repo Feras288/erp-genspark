@@ -42,6 +42,13 @@ const PERMISSIONS = [
   { key: 'inventory.read', module: 'inventory', action: 'read', description: 'View stock balances and movements' },
   { key: 'inventory.adjust', module: 'inventory', action: 'adjust', description: 'Adjust stock' },
   { key: 'inventory.transfer', module: 'inventory', action: 'transfer', description: 'Transfer stock between warehouses' },
+  // warehouses (Phase 3)
+  { key: 'warehouses.read', module: 'warehouses', action: 'read', description: 'List warehouses' },
+  { key: 'warehouses.create', module: 'warehouses', action: 'create', description: 'Create warehouse' },
+  { key: 'warehouses.update', module: 'warehouses', action: 'update', description: 'Edit warehouse' },
+  { key: 'warehouses.delete', module: 'warehouses', action: 'delete', description: 'Soft-delete warehouse' },
+  // stock movements (Phase 3)
+  { key: 'stockMovements.read', module: 'inventory', action: 'movements.read', description: 'View stock movement history' },
   // sales
   { key: 'sales.invoice.read', module: 'sales', action: 'read', description: 'List sales invoices' },
   { key: 'sales.invoice.create', module: 'sales', action: 'create', description: 'Create sales invoice' },

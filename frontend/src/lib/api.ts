@@ -177,6 +177,83 @@ export const api = {
     apiRequest<Partner>(`/partners/${id}`, { method: 'PATCH', body: data }),
   deletePartner: (id: string) =>
     apiRequest<{ id: string; isActive: boolean }>(`/partners/${id}`, { method: 'DELETE' }),
+
+  // ===== Phase 3: Warehouses (master data) =====
+
+  listWarehouses: (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    isActive?: boolean;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.isActive !== undefined) q.set('isActive', String(params.isActive));
+    return apiRequest<Paginated<Warehouse>>(`/warehouses?${q.toString()}`);
+  },
+  getWarehouse: (id: string) => apiRequest<Warehouse>(`/warehouses/${id}`),
+  createWarehouse: (data: Partial<Warehouse>) =>
+    apiRequest<Warehouse>('/warehouses', { method: 'POST', body: data }),
+  updateWarehouse: (id: string, data: Partial<Warehouse>) =>
+    apiRequest<Warehouse>(`/warehouses/${id}`, { method: 'PATCH', body: data }),
+  deleteWarehouse: (id: string) =>
+    apiRequest<{ id: string; isActive: boolean }>(`/warehouses/${id}`, { method: 'DELETE' }),
+
+  // ===== Phase 3: Inventory (Stock levels, Movements, Adjustments, Transfers) =====
+
+  listStockLevels: (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    productId?: string;
+    warehouseId?: string;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.productId) q.set('productId', params.productId);
+    if (params.warehouseId) q.set('warehouseId', params.warehouseId);
+    return apiRequest<Paginated<StockLevel>>(`/inventory/levels?${q.toString()}`);
+  },
+
+  listStockMovements: (params: {
+    page?: number;
+    pageSize?: number;
+    productId?: string;
+    warehouseId?: string;
+    movementType?: StockMovementTypeKey;
+    dateFrom?: string;
+    dateTo?: string;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.productId) q.set('productId', params.productId);
+    if (params.warehouseId) q.set('warehouseId', params.warehouseId);
+    if (params.movementType) q.set('movementType', params.movementType);
+    if (params.dateFrom) q.set('dateFrom', params.dateFrom);
+    if (params.dateTo) q.set('dateTo', params.dateTo);
+    return apiRequest<Paginated<StockMovement>>(`/inventory/movements?${q.toString()}`);
+  },
+
+  adjustStock: (data: StockAdjustmentInput) =>
+    apiRequest<{ level: StockLevel; movement: StockMovement }>(
+      '/inventory/adjustments',
+      { method: 'POST', body: data },
+    ),
+
+  transferStock: (data: StockTransferInput) =>
+    apiRequest<{ out: StockMovement; inn: StockMovement }>(
+      '/inventory/transfers',
+      { method: 'POST', body: data },
+    ),
+
+  // Convenience: list active products (type=PRODUCT) for Inventory forms.
+  listProductsLiteForInventory: () =>
+    api.listProducts({ page: 1, pageSize: 200, type: 'PRODUCT', isActive: true }),
 };
 
 // =====================================================
@@ -231,4 +308,83 @@ export type Partner = {
   updatedAt: string;
   createdById: string | null;
   updatedById: string | null;
+};
+
+// =====================================================
+// Phase 3 types — must mirror backend Prisma selections.
+// companyId is also returned from the API (as a hint), but
+// authorization always comes from the JWT in currentUser.
+// =====================================================
+export type Warehouse = {
+  id: string;
+  companyId: string;
+  code: string;
+  name: string;
+  nameAr: string | null;
+  address: string | null;
+  city: string | null;
+  isActive: boolean;
+  deletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdById: string | null;
+  updatedById: string | null;
+};
+
+export type StockLevel = {
+  id: string;
+  companyId: string;
+  productId: string;
+  warehouseId: string;
+  quantity: string;            // Decimal serializes to string
+  reservedQuantity: string;
+  createdAt: string;
+  updatedAt: string;
+  product?: { id: string; sku: string; name: string };
+  warehouse?: { id: string; code: string; name: string };
+};
+
+export type StockMovementTypeKey =
+  | 'OPENING_BALANCE'
+  | 'ADJUSTMENT_IN'
+  | 'ADJUSTMENT_OUT'
+  | 'TRANSFER_IN'
+  | 'TRANSFER_OUT';
+
+export type StockMovementDirectionKey = 'IN' | 'OUT';
+
+export type StockMovement = {
+  id: string;
+  companyId: string;
+  productId: string;
+  warehouseId: string;
+  movementType: StockMovementTypeKey;
+  direction: StockMovementDirectionKey;
+  quantity: string;
+  referenceType: string | null;
+  referenceId: string | null;
+  reason: string | null;
+  notes: string | null;
+  movementDate: string;
+  createdAt: string;
+  createdById: string | null;
+  product?: { id: string; sku: string; name: string };
+  warehouse?: { id: string; code: string; name: string };
+};
+
+export type StockAdjustmentInput = {
+  productId: string;
+  warehouseId: string;
+  adjustmentType: 'ADJUSTMENT_IN' | 'ADJUSTMENT_OUT';
+  quantity: string;
+  reason: string;
+  notes?: string;
+};
+
+export type StockTransferInput = {
+  fromWarehouseId: string;
+  toWarehouseId: string;
+  productId: string;
+  quantity: string;
+  notes?: string;
 };

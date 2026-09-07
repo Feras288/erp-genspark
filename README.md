@@ -917,3 +917,127 @@ Phase 1 — 9 tests لا تزال passing دون تعديل يضمن عدم ان
 
 **آخر تحديث:** إغلاق المرحلة 2 — `23/23 e2e tests passing` (Phase 1: 9 + Phase 2 Products: 7 + Phase 2 Partners: 7)، builds نظيفة للـ backend (8 routes) و frontend. git commit موثَّق في تقرير الـ repo. لا انتقال إلى Phase 3 قبل موافقة صريحة.
 
+---
+
+## Phase 3: Inventory Core
+
+> **هذه المرحلة هي Inventory Core فقط** — لا Sales/POS/Purchases/Accounting/Reports/ZATCA. تمت كتابتها كطبقة فوق Phase 1 (Auth + RBAC) و Phase 2 (Products/Partners) بالكامل، ولا تغيّر أي معمارية قائمة.
+
+### Scope
+
+Phase 3 introduces the **inventory core** layer:
+
+- **Warehouses** — master data for physical locations.
+- **Stock Levels** — current quantity per `(companyId, productId, warehouseId)`.
+- **Stock Movements** — append-only audit log of every quantity change.
+- **Manual Adjustments** — `ADJUSTMENT_IN` / `ADJUSTMENT_OUT` with required reason.
+- **Warehouse Transfers** — paired `TRANSFER_OUT` + `TRANSFER_IN` in one transaction.
+
+### What is included
+
+- Warehouse CRUD (unique code per company, soft delete only).
+- Stock level listing filtered by product / warehouse / search by SKU/name.
+- Append-only stock movement log with `OPENING_BALANCE`, `ADJUSTMENT_IN`, `ADJUSTMENT_OUT`, `TRANSFER_IN`, `TRANSFER_OUT` types and `IN` / `OUT` direction.
+- Manual stock adjustment endpoint (`POST /api/inventory/adjustments`) — refuses SERVICE products, refuses OUT > current balance.
+- Warehouse transfer endpoint (`POST /api/inventory/transfers`) — refuses same-warehouse, refuses insufficient source stock; creates **paired** movements in a single transaction.
+- Refusal to soft-delete a warehouse that has any `quantity > 0` or `reservedQuantity > 0`.
+- 7 RBAC permissions wired through the existing `JwtAuthGuard` + `PermissionsGuard` + `@RequirePermissions` chain.
+- Frontend pages: `/warehouses` (CRUD) and `/inventory` (levels + movements + adjust + transfer).
+
+### What is intentionally excluded
+
+The following are **explicitly NOT** included in Phase 3 and will not appear in the codebase, seed data, or generated migrations:
+
+- Sales & POS (invoices, sales orders, point-of-sale)
+- Purchases & procurement flows
+- Accounting (journals, GL, COGS, cost layers)
+- Reports (financial, inventory valuation, sales)
+- ZATCA e-invoicing
+- HR / Payroll / WPS / Qiwa / GOSI
+- SaaS billing, subscriptions, tenant portal
+- Costing / COGS / FIFO / LIFO / average cost
+- Serial numbers / batch tracking / expiry dates
+- Barcode scanning / hardware integration
+- **Mock business data** (no demo warehouses, no demo products, no demo stock, no demo movements)
+
+### Inventory rules (enforced in `backend/src/inventory/inventory.service.ts`)
+
+| Rule | Enforcement |
+|---|---|
+| Only `PRODUCT` items can have stock | `SERVICE` returns `400 BadRequestException` |
+| No negative stock | `ADJUSTMENT_OUT > balance` → `400`; `TRANSFER > sourceBalance` → `400` |
+| `StockMovement` is append-only | No UPDATE/DELETE endpoint is exposed; consumers GET only |
+| Adjustments create one movement | Single `StockMovement` insert in same `$transaction` as `StockLevel` update |
+| Transfers create paired movements | One `TRANSFER_OUT` (source, OUT, `referenceId = out.id`) + one `TRANSFER_IN` (dest, IN) per transfer |
+| No sales/purchase integration | `referenceType` is `'manual_adjustment'` or `'transfer'` only; no foreign key to any sales/purchase table |
+
+### Permissions
+
+| Permission | Purpose |
+|---|---|
+| warehouses.read | List/get warehouses |
+| warehouses.create | Create warehouses (unique `code` per company) |
+| warehouses.update | Edit warehouses (re-checks `code` uniqueness, including when changing the code) |
+| warehouses.delete | Soft-delete warehouses (refused while stock > 0) |
+| inventory.read | Read stock levels per warehouse / product |
+| inventory.adjust | Create manual stock adjustments (IN / OUT) |
+| inventory.transfer | Transfer stock between warehouses (paired movements) |
+| stockMovements.read | Read append-only stock movement log |
+
+All 8 permissions are seeded into the `company_admin` role at `pnpm db:seed` time. `inventory.read` / `inventory.adjust` / `inventory.transfer` were inserted in Phase 2; `warehouses.*` and `stockMovements.read` were added for Phase 3 (`pnpm db:seed` now reports **44 permissions × 44 admin grants**).
+
+### Endpoints
+
+| Method | Path | Permission |
+|---|---|---|
+| GET | /api/warehouses | warehouses.read |
+| GET | /api/warehouses/:id | warehouses.read |
+| POST | /api/warehouses | warehouses.create |
+| PATCH | /api/warehouses/:id | warehouses.update |
+| DELETE | /api/warehouses/:id | warehouses.delete |
+| GET | /api/inventory/levels | inventory.read |
+| GET | /api/inventory/movements | stockMovements.read |
+| POST | /api/inventory/adjustments | inventory.adjust |
+| POST | /api/inventory/transfers | inventory.transfer |
+
+### Testing commands
+
+```bash
+pnpm --filter @erp/backend test:e2e
+pnpm --filter @erp/backend build
+pnpm --filter @erp/frontend build
+```
+
+Expected results after Phase 3:
+
+- Backend `test:e2e`: **41 / 41 passing** (9 Phase 1 + 7 Phase 2 Products + 7 Phase 2 Partners + **7 Phase 3 Warehouses + 11 Phase 3 Inventory**).
+- Backend `build`: `nest build` exits 0.
+- Frontend `build`: 10 routes (`/login`, `/dashboard`, `/users`, `/products`, `/partners`, **`/warehouses`**, **`/inventory`**, `/_not-found`, plus shared chunks).
+
+### Migration note
+
+The Phase 3 migration applied to the PostgreSQL dev database is:
+
+```
+20260907005059_phase3_inventory_core
+```
+
+It creates:
+
+- Enum types `StockMovementType` and `StockMovementDirection`.
+- Tables `warehouses`, `stock_levels`, `stock_movements`.
+- The required `@@unique([companyId, code])` partial uniqueness, a `[companyId,productId,warehouseId]` uniqueness on `stock_levels`, and the standard `ForeignKey` references to `companies`, `users`, `products`, `warehouses`.
+- Indexes: `[companyId, isActive]`, `[companyId, deletedAt]`, `[companyId, name]` on `warehouses`; `[companyId, movementDate]`, `[companyId, productId, movementDate]`, `[companyId, warehouseId, movementDate]`, `[companyId, movementType]` on `stock_movements`.
+
+### Security / tenancy (unchanged from Phase 1 + 2)
+
+- `companyId` is **always** sourced from `currentUser.companyId` (JWT). It is **never** accepted from request body / query / path.
+- Every `prisma.warehouse / prisma.stockLevel / prisma.stockMovement` query is filtered by `companyId`.
+- Stock never escapes the owning company's tenancy.
+- No `localStorage` / `sessionStorage`; access token lives in-memory in `frontend/lib/api.ts` (Phase 1 holds the contract).
+- No mock business data — only permissions and an admin user are seeded. The e2e suite creates and abandons its own test products/warehouses.
+
+### Recommendation
+
+Phase 3 (Inventory Core) is ready to close. **Phase 4 must NOT be started without explicit user approval.** When approved, Phase 4 should be Sales + POS only and follow the same scope discipline (RBAC permissions, append-only audit, `companyId` coupling, no mock business data).
+

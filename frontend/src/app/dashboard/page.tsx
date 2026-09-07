@@ -66,16 +66,32 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-3xl font-bold text-slate-800">لوحة المعلومات</h1>
           <p className="text-sm text-slate-500">
-            نظام إدارة الموارد (ERP) — المرحلة 1: المصادقة و RBAC
+            نظام إدارة الموارد (ERP) — المرحلة 3: المخزون (Warehouses + Stock + Movements)
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           {user.permissions.includes('users.read') && (
             <Link
               href="/users"
               className="rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2"
             >
               المستخدمون
+            </Link>
+          )}
+          {user.permissions.includes('warehouses.read') && (
+            <Link
+              href="/warehouses"
+              className="rounded-md bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2"
+            >
+              المستودعات
+            </Link>
+          )}
+          {user.permissions.includes('inventory.read') && (
+            <Link
+              href="/inventory"
+              className="rounded-md bg-amber-600 hover:bg-amber-700 text-white text-sm px-4 py-2"
+            >
+              المخزون
             </Link>
           )}
           <button

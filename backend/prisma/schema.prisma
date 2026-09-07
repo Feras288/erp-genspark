@@ -18,25 +18,28 @@ datasource db {
 // =====================================================
 
 model Company {
-  id        String   @id @default(cuid())
-  name      String
-  vatNumber String?  @unique
-  crNumber  String?  // Saudi Commercial Registration
-  address   String?
-  phone     String?
-  email     String?
-  logoUrl   String?
-  currency  String   @default("SAR")
-  vatRate   Decimal  @default(15.00) @db.Decimal(5, 2) // Saudi VAT default
-  fiscalYearStartMonth Int @default(1)
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                   String   @id @default(cuid())
+  name                 String
+  vatNumber            String?  @unique
+  crNumber             String? // Saudi Commercial Registration
+  address              String?
+  phone                String?
+  email                String?
+  logoUrl              String?
+  currency             String   @default("SAR")
+  vatRate              Decimal  @default(15.00) @db.Decimal(5, 2) // Saudi VAT default
+  fiscalYearStartMonth Int      @default(1)
+  active               Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 
-  users User[]
-  roles Role[]
-  products Product[]
-  partners Partner[]
+  users          User[]
+  roles          Role[]
+  products       Product[]
+  partners       Partner[]
+  warehouses     Warehouse[]
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
 
   @@index([name])
   @@map("companies")
@@ -49,29 +52,32 @@ model Company {
 // =====================================================
 
 model User {
-  id           String   @id @default(cuid())
+  id           String    @id @default(cuid())
   companyId    String
   email        String
   passwordHash String
   fullName     String
-  isActive     Boolean  @default(true)
+  isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
   // SaaS-ready paranoid fields
   deletedAt DateTime?
 
-  company     Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  userRoles   UserRole[]
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userRoles     UserRole[]
   refreshTokens RefreshToken[]
 
-  productsCreated Product[] @relation("ProductCreatedBy")
-  productsUpdated Product[] @relation("ProductUpdatedBy")
-  partnersCreated Partner[] @relation("PartnerCreatedBy")
-  partnersUpdated Partner[] @relation("PartnerUpdatedBy")
+  productsCreated       Product[]       @relation("ProductCreatedBy")
+  productsUpdated       Product[]       @relation("ProductUpdatedBy")
+  partnersCreated       Partner[]       @relation("PartnerCreatedBy")
+  partnersUpdated       Partner[]       @relation("PartnerUpdatedBy")
+  warehousesCreated     Warehouse[]     @relation("WarehouseCreatedBy")
+  warehousesUpdated     Warehouse[]     @relation("WarehouseUpdatedBy")
+  stockMovementsCreated StockMovement[] @relation("StockMovementCreatedBy")
 
-  @@unique([companyId, email])           // no duplicate emails inside one company
+  @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
   @@index([companyId])
   @@map("users")
@@ -79,17 +85,17 @@ model User {
 
 model Role {
   id          String   @id @default(cuid())
-  companyId   String?  // null => global / system role
-  name        String   // e.g. "Company Admin", "Accountant"
-  key         String   // machine key e.g. "company_admin"
+  companyId   String? // null => global / system role
+  name        String // e.g. "Company Admin", "Accountant"
+  key         String // machine key e.g. "company_admin"
   description String?
-  isSystem    Boolean  @default(false)   // built-in system role, cannot be deleted
+  isSystem    Boolean  @default(false) // built-in system role, cannot be deleted
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  company            Company?         @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  userRoles          UserRole[]
-  rolePermissions    RolePermission[]
+  company         Company?         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
 
   @@unique([companyId, key])
   @@index([companyId])
@@ -97,10 +103,10 @@ model Role {
 }
 
 model Permission {
-  id          String   @id @default(cuid())
-  key         String   @unique // e.g. "users.read", "sales.invoice.create"
-  module      String   // e.g. "users", "sales"
-  action      String   // e.g. "read", "create", "update", "delete"
+  id          String  @id @default(cuid())
+  key         String  @unique // e.g. "users.read", "sales.invoice.create"
+  module      String // e.g. "users", "sales"
+  action      String // e.g. "read", "create", "update", "delete"
   description String?
 
   rolePermissions RolePermission[]
@@ -135,12 +141,12 @@ model UserRole {
 
 // Refresh tokens for JWT rotation. Hashed at rest.
 model RefreshToken {
-  id         String   @id @default(cuid())
-  userId     String
-  tokenHash  String   @unique
-  expiresAt  DateTime
-  revokedAt  DateTime?
-  createdAt  DateTime @default(now())
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -151,16 +157,16 @@ model RefreshToken {
 
 // Append-only audit trail of sensitive operations.
 model AuditLog {
-  id         String   @id @default(cuid())
-  companyId  String
-  userId     String?
-  action     String   // e.g. "auth.login", "user.create", "invoice.issue"
-  entity     String?  // e.g. "User", "SalesInvoice"
-  entityId   String?
-  metadata   Json?
-  ip         String?
-  userAgent  String?
-  createdAt  DateTime @default(now())
+  id        String   @id @default(cuid())
+  companyId String
+  userId    String?
+  action    String // e.g. "auth.login", "user.create", "invoice.issue"
+  entity    String? // e.g. "User", "SalesInvoice"
+  entityId  String?
+  metadata  Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
 
   @@index([companyId, createdAt])
   @@index([userId])
@@ -187,7 +193,7 @@ model Product {
   description    String?
   type           ProductType @default(PRODUCT)
   barcode        String?
-  unit           String?     // e.g. "pcs", "kg", "hr"
+  unit           String? // e.g. "pcs", "kg", "hr"
   priceBeforeVat Decimal?    @db.Decimal(18, 4)
   vatRate        Decimal     @default(15.00) @db.Decimal(5, 2)
 
@@ -199,9 +205,12 @@ model Product {
   createdById String?
   updatedById String?
 
-  company      Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  createdBy    User?   @relation("ProductCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
-  updatedBy    User?   @relation("ProductUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation("ProductCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy User?   @relation("ProductUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
 
   // Unique sku per company (sku is always non-null).
   @@unique([companyId, sku])
@@ -221,15 +230,15 @@ enum PartnerType {
 }
 
 model Partner {
-  id       String      @id @default(cuid())
+  id        String      @id @default(cuid())
   companyId String
-  code     String?
-  name     String
-  nameAr   String?
-  type     PartnerType @default(CUSTOMER)
+  code      String?
+  name      String
+  nameAr    String?
+  type      PartnerType @default(CUSTOMER)
 
   // Saudi identity fields, all optional.
-  vatNumber            String? // 15-digit VAT number
+  vatNumber              String? // 15-digit VAT number
   commercialRegistration String? // CR number (سجل تجاري)
 
   email   String?
@@ -256,4 +265,102 @@ model Partner {
   @@index([companyId, type])
   @@index([companyId, name])
   @@map("partners")
+}
+
+// =====================================================
+// Phase 3: Inventory Core — Warehouses, StockLevels, StockMovements.
+// NO sales, NO purchases, NO accounting, NO costing/COGS, NO ZATCA.
+// =====================================================
+
+enum StockMovementType {
+  OPENING_BALANCE
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  TRANSFER_IN
+  TRANSFER_OUT
+}
+
+enum StockMovementDirection {
+  IN
+  OUT
+}
+
+model Warehouse {
+  id          String    @id @default(cuid())
+  companyId   String
+  code        String // unique per company
+  name        String
+  nameAr      String?
+  address     String?
+  city        String?
+  isActive    Boolean   @default(true)
+  deletedAt   DateTime? // soft delete only
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  createdById String?
+  updatedById String?
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation("WarehouseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy User?   @relation("WarehouseUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
+
+  @@unique([companyId, code])
+  @@index([companyId, isActive])
+  @@index([companyId, deletedAt])
+  @@index([companyId, name])
+  @@map("warehouses")
+}
+
+model StockLevel {
+  id               String   @id @default(cuid())
+  companyId        String
+  productId        String
+  warehouseId      String
+  quantity         Decimal  @default(0) @db.Decimal(18, 4) // current on-hand
+  reservedQuantity Decimal  @default(0) @db.Decimal(18, 4) // reserved / not yet decremented
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  // One StockLevel per (companyId, product, warehouse). No partial unique needed:
+  // both productId and warehouseId are FK NOT NULL.
+  @@unique([companyId, productId, warehouseId])
+  @@index([companyId, productId])
+  @@index([companyId, warehouseId])
+  @@map("stock_levels")
+}
+
+model StockMovement {
+  id            String                 @id @default(cuid())
+  companyId     String
+  productId     String
+  warehouseId   String
+  movementType  StockMovementType
+  direction     StockMovementDirection
+  quantity      Decimal                @db.Decimal(18, 4)
+  referenceType String? // optional, e.g. "manual_adjustment" / "transfer"
+  referenceId   String? // optional FK-as-string (no hard FK until later phases)
+  reason        String? // required for adjustments
+  notes         String?
+  movementDate  DateTime               @default(now())
+  createdAt     DateTime               @default(now())
+  createdById   String? // via User relation (SetNull)
+
+  company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  createdBy User?     @relation("StockMovementCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  // Append-only. No updatedAt. No soft delete on movements.
+  @@index([companyId, movementDate])
+  @@index([companyId, productId, movementDate])
+  @@index([companyId, warehouseId, movementDate])
+  @@index([companyId, movementType])
+  @@map("stock_movements")
 }

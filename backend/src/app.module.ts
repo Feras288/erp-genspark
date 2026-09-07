@@ -1,6 +1,9 @@
 // =====================================================
-// ERP Backend — root module (Phase 1 + Phase 2 wiring)
-// Phase 2: Products + Partners (master data only)
+// ERP Backend — root module
+// Phase 1: Auth + RBAC + Audit
+// Phase 2: Products + Partners (master data)
+// Phase 3: Inventory core (Warehouses + Stock Levels +
+//          Stock Movements + Adjustments + Transfers)
 // =====================================================
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
@@ -14,6 +17,8 @@ import { UsersModule } from './users/users.module';
 import { RbacModule } from './rbac/rbac.module';
 import { ProductsModule } from './products/products.module';
 import { PartnersModule } from './partners/partners.module';
+import { WarehousesModule } from './warehouses/warehouses.module';
+import { InventoryModule } from './inventory/inventory.module';
 
 @Module({
   imports: [
@@ -34,6 +39,9 @@ import { PartnersModule } from './partners/partners.module';
     RbacModule,
     ProductsModule,
     PartnersModule,
+    // Phase 3 — inventory core
+    WarehousesModule,
+    InventoryModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.
