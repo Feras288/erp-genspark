@@ -1,7 +1,7 @@
 // =====================================================
 // ERP System — Prisma schema
 // Saudi-market ERP, single-client today, SaaS-ready.
-// All commercial rows will carry companyId for multi-tenancy later.
+// All commercial rows carry companyId for multi-tenancy later.
 // =====================================================
 
 generator client {
@@ -33,8 +33,10 @@ model Company {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  users     User[]
-  roles     Role[]
+  users User[]
+  roles Role[]
+  products Product[]
+  partners Partner[]
 
   @@index([name])
   @@map("companies")
@@ -43,7 +45,7 @@ model Company {
 // =====================================================
 // RBAC: users, roles, permissions
 // Every user belongs to ONE company today.
-// In phase 1 we add: login, JWT, refresh tokens, audit log.
+// Phase 1: login, JWT, refresh tokens, audit log.
 // =====================================================
 
 model User {
@@ -63,6 +65,11 @@ model User {
   company     Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
   userRoles   UserRole[]
   refreshTokens RefreshToken[]
+
+  productsCreated Product[] @relation("ProductCreatedBy")
+  productsUpdated Product[] @relation("ProductUpdatedBy")
+  partnersCreated Partner[] @relation("PartnerCreatedBy")
+  partnersUpdated Partner[] @relation("PartnerUpdatedBy")
 
   @@unique([companyId, email])           // no duplicate emails inside one company
   @@index([email])
@@ -159,4 +166,94 @@ model AuditLog {
   @@index([userId])
   @@index([action])
   @@map("audit_logs")
+}
+
+// =====================================================
+// Phase 2: master data — Products and Partners only.
+// NO inventory, NO warehouses, NO stock movements, NO invoices.
+// =====================================================
+
+enum ProductType {
+  PRODUCT
+  SERVICE
+}
+
+model Product {
+  id             String      @id @default(cuid())
+  companyId      String
+  sku            String
+  name           String
+  nameAr         String?
+  description    String?
+  type           ProductType @default(PRODUCT)
+  barcode        String?
+  unit           String?     // e.g. "pcs", "kg", "hr"
+  priceBeforeVat Decimal?    @db.Decimal(18, 4)
+  vatRate        Decimal     @default(15.00) @db.Decimal(5, 2)
+
+  isActive  Boolean   @default(true)
+  deletedAt DateTime? // soft delete only
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  createdById String?
+  updatedById String?
+
+  company      Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy    User?   @relation("ProductCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy    User?   @relation("ProductUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  // Unique sku per company (sku is always non-null).
+  @@unique([companyId, sku])
+  // Unique barcode per company, but allow multiple nulls in Postgres.
+  // Prisma cannot express nullable-unique directly; we use a partial unique
+  // index via raw SQL in the migration (see phase2 migration).
+  @@index([companyId, isActive])
+  @@index([companyId, deletedAt])
+  @@index([companyId, name])
+  @@map("products")
+}
+
+enum PartnerType {
+  CUSTOMER
+  SUPPLIER
+  BOTH
+}
+
+model Partner {
+  id       String      @id @default(cuid())
+  companyId String
+  code     String?
+  name     String
+  nameAr   String?
+  type     PartnerType @default(CUSTOMER)
+
+  // Saudi identity fields, all optional.
+  vatNumber            String? // 15-digit VAT number
+  commercialRegistration String? // CR number (سجل تجاري)
+
+  email   String?
+  phone   String?
+  address String?
+  city    String?
+  country String? @default("SA")
+
+  isActive  Boolean   @default(true)
+  deletedAt DateTime? // soft delete only
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  createdById String?
+  updatedById String?
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation("PartnerCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy User?   @relation("PartnerUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  // We use a partial unique index via raw SQL in the migration for `code`.
+  @@index([companyId, isActive])
+  @@index([companyId, deletedAt])
+  @@index([companyId, type])
+  @@index([companyId, name])
+  @@map("partners")
 }

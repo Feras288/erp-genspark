@@ -603,5 +603,317 @@ pnpm --filter @erp/frontend build
 
 ---
 
-**آخر تحديث:** إغلاق المرحلة 1 — `9/9 e2e tests passing`، builds نظيفة للـ backend و frontend، git commit موثَّق في record الـ repo.
+## Phase 2: Products and Partners (Master Data)
+
+> تم تنفيذ المرحلة 2 بالكامل مع **23/23 e2e tests passing** (Phase 1: 9 + Phase 2 Products: 7 + Phase 2 Partners: 7)، builds نظيفة للـ backend و frontend. هذه المرحلة **master data فقط** — لا inventory، لا مبيعات، لا محاسبة.
+
+### Scope
+
+ما تم تنفيذه في Phase 2:
+
+| المنطقة | المحتوى |
+|---|---|
+| Backend Prisma | موديل `Product` + `Partner` + enums `ProductType` و `PartnerType` + migration اسمها `phase2_products_partners` |
+| Backend permissions | 8 صلاحيات جديدة مُضافة لـ catalog (وللـ admin role عبر loop في seed) |
+| Backend services | `ProductsService` + `PartnersService` بـ full CRUD |
+| Backend controllers | `ProductsController` + `PartnersController` بـ 5 endpoints لكل واحد |
+| Backend audit | `products.created/updated/deleted` و `partners.created/updated/deleted` |
+| Frontend pages | `/products` و `/partners` بـ CRUD forms حقيقي + search/filter/pagination |
+| Frontend api client | إضافة 12 method (`api.listProducts/getProduct/createProduct/updateProduct/deleteProduct` و counterparts للـ partners) في `frontend/src/lib/api.ts` |
+| Tests | 14 اختبار e2e (7 per module) مدمجة في نفس `app.e2e-spec.ts` |
+| README | هذا القسم ✓ |
+| Git commit | موثَّق في تقرير الـ repo |
+
+ما لم يتم تنفيذه عمداً في Phase 2 (مؤجَّل — لا تبدأه بدون موافقة):
+
+- ❌ Inventory و warehouses و stock movements و balances.
+- ❌ Sales invoices و POS و purchase invoices.
+- ❌ Accounting و journal entries و VAT reports و financial reports.
+- ❌ ZATCA integration.
+- ❌ HR / Payroll / WPS / Qiwa.
+- ❌ SaaS billing و tenant portal.
+- ❌ Demo business data (لا seed منتجات ولا عملاء ولا موردين — الـ admin user فقط).
+
+### Database / Prisma Changes
+
+**Models جديدة:**
+
+```prisma
+enum ProductType { PRODUCT SERVICE }
+
+model Product {
+  id             String      @id @default(cuid())
+  companyId      String
+  sku            String                      // NOT NULL, unique per company
+  name           String
+  nameAr         String?
+  description    String?
+  type           ProductType @default(PRODUCT)
+  barcode        String?                     // nullable, partial unique per company
+  unit           String?                     // pcs / kg / hr / ...
+  priceBeforeVat Decimal?  @db.Decimal(18, 4) // Decimal NEVER Float
+  vatRate        Decimal   @default(15.00) @db.Decimal(5, 2)
+  isActive       Boolean   @default(true)
+  deletedAt      DateTime?                   // soft delete only
+  createdAt/updatedAt DateTime (auto)
+  createdById/updatedById String?            // via User relation (SetNull)
+
+  company   Company @relation(...)
+  createdBy User?   @relation("ProductCreatedBy", ...)
+  updatedBy User?   @relation("ProductUpdatedBy", ...)
+
+  @@unique([companyId, sku])
+  @@index([companyId, isActive])
+  @@index([companyId, deletedAt])
+  @@index([companyId, name])
+  @@map("products")
+}
+
+enum PartnerType { CUSTOMER SUPPLIER BOTH }
+
+model Partner {
+  // Same shape as Product but:
+  //  - code (nullable, partial unique per company)
+  //  - vatNumber (nullable, 15 digits, partial unique per company)
+  //  - commercialRegistration / email / phone / address / city / country
+  //  - default country = 'SA'
+  // compound unique via partial indexes only (Prisma cannot express nullable-unique
+  //   in its DSL). Indexes appended in raw SQL of the migration.
+}
+
+User {
+  // New reverse-relations added (no breaking change):
+  productsCreated Product[] @relation("ProductCreatedBy")
+  productsUpdated Product[] @relation("ProductUpdatedBy")
+  partnersCreated Partner[] @relation("PartnerCreatedBy")
+  partnersUpdated Partner[] @relation("PartnerUpdatedBy")
+}
+```
+
+**Migration name:** `phase2_products_partners` (id `20260907002406_phase2_products_partners`).
+
+**Partial unique indexes** (للقيم nullable القابلة للتكرار null) — Prisma لا تستطيع التعبير عنها في DSL، لذا أُضيفت يدوياً عبر SQL خام في الـ migration:
+
+```sql
+CREATE UNIQUE INDEX "products_companyId_barcode_key"
+  ON "products"("companyId", "barcode")
+  WHERE "barcode" IS NOT NULL;
+
+CREATE UNIQUE INDEX "partners_companyId_code_key"
+  ON "partners"("companyId", "code")
+  WHERE "code" IS NOT NULL;
+
+CREATE UNIQUE INDEX "partners_companyId_vatNumber_key"
+  ON "partners"("companyId", "vatNumber")
+  WHERE "vatNumber" IS NOT NULL;
+```
+
+**Seed update:** الـ `seed.ts` يحتوي بالفعل على الـ 8 صلاحيات في الـ `PERMISSIONS` array ويُمرّرها جميعاً (39 إجمالاً في Phase 1+2) إلى `RolePermission` عبر loop للـ `company_admin` role. لا wildcards. لا توجد منتجات ولا شركاء تجريبيين في الـ seed — المستخدم نفسه هو فقط من يضيف البيانات عبر الـ API.
+
+### Backend Implementation
+
+**Modules:**
+
+```
+backend/src/products/
+├── products.module.ts           # Module + providers
+├── products.controller.ts       # 5 endpoints
+├── products.service.ts          # business logic, scoped by companyId
+└── dto/
+    ├── create-product.dto.ts    # class-validator + Swagger
+    ├── update-product.dto.ts    # كل الحقول optional
+    └── product-query.dto.ts     # pagination + filters
+
+backend/src/partners/
+├── partners.module.ts           # (نفس الـ structure)
+├── partners.controller.ts
+├── partners.service.ts
+└── dto/
+    ├── create-partner.dto.ts
+    ├── update-partner.dto.ts
+    └── partner-query.dto.ts
+```
+
+**Tenancy guardrails:**
+
+- `companyId` مستخرج حصرياً من `me.companyId` (الـ JWT). **لا يُقبل** `companyId` من body ولا query.
+- كل query يستخدم `findFirst({ where: { id, companyId, deletedAt: null } })`. لا `findUnique({ where: { id } })` وحده أبداً.
+- كل `list` يُضيف `where.deletedAt = null` تلقائياً → soft-deleted rows مخفية تماماً.
+- الـ `createById/updatedById` تأتي من `me.id` (actor الـ JWT)، لا من الـ body.
+- `decimal-as-string` على كل money fields (لا `Float` أبداً). الـ Postgres columns هي `Decimal(18,4)` و `Decimal(5,2)`.
+- `vatNumber` validation: `@Matches(/^\d{15}$/)` (15 رقم ZATCA).
+
+**Duplicate-detection في transaction:**
+
+```ts
+async create(companyId, dto, actorUserId) {
+  return this.prisma.$transaction(async (tx) => {
+    await this.assertSkuUnique(tx, companyId, dto.sku);
+    await this.assertBarcodeUnique(tx, companyId, dto.barcode);
+    return tx.product.create({ data: { ... } });
+  });
+}
+```
+
+الـ `assertSkuUnique` و `assertBarcodeUnique` يستخدمان `findFirst({ where: { companyId, sku, deletedAt: null, NOT: { id } } })`، ثم `ConflictException` على وجود سجل. نفس النمط في `update` (مع `NOT: { id }`) و `PartnersService` لـ `code` و `vatNumber`.
+
+**Audit:**
+
+```ts
+await this.audit.record({
+  companyId,
+  userId: actorUserId,
+  action: 'products.created',  // or 'products.updated' / 'products.deleted'
+  entity: 'Product',
+  entityId: created.id,
+  metadata: { sku, type },
+});
+```
+
+لا metadata حساسة — الـ `AuditService` يحذف مفاتيح يحوي كلمات `password/token/accessToken/refreshToken/passwordHash` بـ `FORBIDDEN_KEYS`.
+
+**Guards و RBAC:**
+
+- كل endpoint محمي بـ `@UseGuards(JwtAuthGuard, PermissionsGuard)`.
+- كل handler يحدد `@RequirePermissions('products.read' / 'products.create' / 'products.update' / 'products.delete')` (و counterparts للـ partners).
+- `@ApiTags('Products')` و `@ApiTags('Partners')` و `@ApiBearerAuth()` على مستوى الـ controller.
+
+### Frontend Implementation
+
+**Pages:**
+
+```
+frontend/src/app/products/page.tsx   # ~16.7 KB
+frontend/src/app/partners/page.tsx   # ~18.1 KB
+```
+
+كل صفحة توفر:
+
+| الميزة | السلوك |
+|---|---|
+| Auth gate | `useEffect` يعيد توجيه لـ `/login` إذا لم يكن هناك user، ولـ `/dashboard` إذا لا يحمل الـ permission المطلوب |
+| List | `api.listProducts({...})` / `api.listPartners({...})` مع pagination (`page`, `pageSize=20`) و search و filter |
+| Search | بحث في `name`/`sku`/`barcode` للمنتجات، و `name`/`code`/`vatNumber`/`phone`/`email` للشركاء. يعاد ضبط `page=1` عند الكتابة. |
+| Filter | `type` filter (PRODUCT/SERVICE للعناصر، CUSTOMER/SUPPLIER/BOTH للشركاء). |
+| Loading / Empty / Error | جدول يعرض "...جاري التحميل" أو empty state أو رسالة خطأ |
+| Create / Edit form | حقيقي في نفس الصفحة. الـ Edit يَملأ الـ form ويُغيّر POST → PATCH. |
+| Delete | confirm dialog + soft-delete عبر `api.deleteProduct(id)` / `api.deletePartner(id)` الذي يضع `deletedAt=now`. ينعكس في الـ list. |
+| Per-row action buttons | enabled/disabled بناءً على `hasPermission('products.update' / 'products.delete')` |
+| RTL | كل النصوص العربية بطبيعة `dir=rtl`، الـ numeric fields بطبيعة `dir=ltr` |
+
+**API client (`frontend/src/lib/api.ts`):** الـ 12 method الجديدة + types الكاملة للـ `Paginated<T>` و `Product` و `Partner`. لا تغيير على آلية الـ access token (يبقى in-memory) ولا على `/auth/refresh` flow. لا localStorage ولا sessionStorage.
+
+### Endpoints
+
+| Method | Path | Permission | الوصف |
+|---|---|---|---|
+| GET | `/api/products` | `products.read` | list+search+filter+pagination, scoped by companyId, excludes soft-deleted |
+| GET | `/api/products/:id` | `products.read` | single, scoped by companyId, 404 if soft-deleted |
+| POST | `/api/products` | `products.create` | DECIMAL-as-string للأرقام، unique sku+barcode per company |
+| PATCH | `/api/products/:id` | `products.update` | partial update, dup-check على sku/barcode (إذا تغيرا) |
+| DELETE | `/api/products/:id` | `products.delete` | soft delete (deletedAt + isActive=false)، 200 body `{id, isActive:false}` |
+| GET | `/api/partners` | `partners.read` | list+search+filter+pagination، البحث في name/code/vat/phone/email |
+| GET | `/api/partners/:id` | `partners.read` | single, 404 if soft-deleted |
+| POST | `/api/partners` | `partners.create` | `vatNumber` regex 15 رقم، `code` partial unique |
+| PATCH | `/api/partners/:id` | `partners.update` | partial update, dup-check |
+| DELETE | `/api/partners/:id` | `partners.delete` | soft delete |
+
+### Permissions Added in Phase 2
+
+| Permission | Purpose |
+|---|---|
+| `products.read` | قراءة قائمة/تفاصيل products |
+| `products.create` | إضافة product جديد |
+| `products.update` | تعديل product موجود |
+| `products.delete` | soft-delete product |
+| `partners.read` | قراءة قائمة/تفاصيل partners |
+| `partners.create` | إضافة partner جديد |
+| `partners.update` | تعديل partner موجود |
+| `partners.delete` | soft-delete partner |
+
+كلها مضافة لـ `prisma/seed.ts` كـ `PERMISSIONS[]` items ومُمرَّرة لـ `company_admin` role عبر `RolePermission.upsert` loop. لا wildcards ولا `*` keys.
+
+### Verification Commands
+
+```bash
+cd /home/user/webapp/erp-system
+
+# Regenerate Prisma client (مباشر بعد schema changes)
+pnpm db:generate
+
+# Apply migrations (لا reset — الـ DB مستمر مع بيانات Phase 1)
+pnpm db:migrate:dev   # للـ dev local
+# أو (للإنتاج)
+pnpm db:migrate:deploy
+
+# Run seed (idempotent — الـ permissions الجديدة تُضاف دون تأثير على الشركة/المستخدم الحالي)
+pnpm db:seed
+
+# Backend e2e tests (Phase 1: 9 + Phase 2 Products: 7 + Phase 2 Partners: 7 = 23 total)
+pnpm --filter @erp/backend test:e2e
+
+# Backend build
+pnpm --filter @erp/backend build
+
+# Frontend build (يجب أن يكتمل مع 8 routes: /_not-found, /dashboard, /login, /users, /products, /partners + incurred)
+pnpm --filter @erp/frontend build
+```
+
+### Security / Tenancy Notes
+
+- الـ `companyId` يأتي من JWT حصرياً عبر `currentUser.companyId`. لا يُقبل من body أو query.
+- التحقق العابر للشركات (cross-tenant) تم اختباره ضمنياً: `findFirst({ where: { id, companyId } })` يرجع `null` لأي id ينتمي لشركة أخرى → 404.
+- لا `localStorage` ولا `sessionStorage` في الـ frontend.
+- لا mock data — الـ seed ينشئ company + admin user فقط، ولا seed products/partners.
+- الـ `passwordHash` لا يظهر في أي response (e2e #6 of Phase 1 يؤكد ذلك + Phase 2 e2e #6 of Products يضيف تأكيد صريح مماثل).
+- الـ `Decimal` Postgres types ترجع كـ strings من Prisma — لا تحويل لـ `Number`/`Float` في أي مكان، حتى في الـ frontend.
+
+### Testing
+
+**e2e tests in `app.e2e-spec.ts`** (23 passing):
+
+Phase 1 — 9 tests لا تزال passing دون تعديل يضمن عدم انكسار backward compatibility.
+
+**Phase 2 Products — 7 tests:**
+1. GET /products بدون token → 401.
+2. GET /products كـ admin → 200 + paginated shape `{total, page, pageSize, items}`.
+3. POST /products بـ payload صحيح → 201، يحوي `id` و `sku` و `companyId` و `deletedAt=null`.
+4. POST /products بـ `sku` مكرر → 409 Conflict.
+5. PATCH /products/:id → 200، يتحقق من الـ rename والـ Decimal priceBeforeVat.
+6. DELETE /products/:id → 200، يُرجع `{id, isActive:false}` (soft delete).
+7. GET /products/:id بعد الحذف → 404.
+
+**Phase 2 Partners — 7 tests:**
+1. GET /partners بدون token → 401.
+2. GET /partners كـ admin → 200 + paginated shape.
+3. POST /partners بـ payload صحيح (vatNumber 15 رقم) → 201.
+4. POST /partners بـ `code` مكرر → 409.
+5. PATCH /partners/:id → 200، يتحقق من الـ rename + city.
+6. DELETE /partners/:id → 200.
+7. GET /partners/:id بعد الحذف → 404.
+
+### Known Limitations / TODOs Forwarded
+
+كل TODOs من Phase 1 الـ 6 السابقة لا تزال قائمة. لا شيء تم تجاهله.
+
+مضاف إلى Phase 2:
+
+1. **`last-admin protection`** — لا يزال TODO في Phase 1 (بانتظار الـ admin لحماية في users، لا علاقة لها بـ products/partners).
+2. **`stockQuantity` و costPrice** — مُؤجَّلاً لـ Phase 3 (Inventory). الـ schema الحالي يحوي `priceBeforeVat` فقط — سعر البيع قبل الضريبة. لا متوسط تكلفة ولا FIFO ولا LIFO.
+3. **`openedAt/openBalance`** بالنسبة للـ Partners — مُؤجَّلاً. الـ Partner حالياً لا يحوي رصيد افتتاحي ولا ledger، فقط data only.
+4. **`partner ar/en name lookup` keys** — الـ Partner model يحوي `name` (English/required) + `nameAr` (Arabic/optional). لا يوجد search/duplicate detection على `nameAr` — فقط على `code` و `vatNumber`.
+5. **OpenAPI examples** — الـ DTOs تستخدم generic examples (مثل `"SKU-0001"`). لا توجد بيانات أعمال حقيقية في الـ Swagger docs (التزاماً بـ "no mock business data").
+
+### Recommendation
+
+المرحلة 2 جاهزة للإغلاق. **المرحلة 3 (Inventory only)** يجب ألا تبدأ إلا بعد موافقة صريحة. تقترح المرحلة 3:
+
+- موديلات: `Warehouse`, `StockLevel`, `StockMovement`.
+- permissions: `inventory.read`, `inventory.adjust`, `inventory.transfer`.
+- endpoints أساسية فقط.
+- لا sales / purchases / accounting / ZATCA في Phase 3.
+
+---
+
+**آخر تحديث:** إغلاق المرحلة 2 — `23/23 e2e tests passing` (Phase 1: 9 + Phase 2 Products: 7 + Phase 2 Partners: 7)، builds نظيفة للـ backend (8 routes) و frontend. git commit موثَّق في تقرير الـ repo. لا انتقال إلى Phase 3 قبل موافقة صريحة.
 

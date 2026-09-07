@@ -129,4 +129,106 @@ export const api = {
       `/users?${q.toString()}`,
     );
   },
+
+  // ===== Phase 2: Products + Partners =====
+
+  listProducts: (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    type?: 'PRODUCT' | 'SERVICE';
+    isActive?: boolean;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.type) q.set('type', params.type);
+    if (params.isActive !== undefined) q.set('isActive', String(params.isActive));
+    return apiRequest<Paginated<Product>>(`/products?${q.toString()}`);
+  },
+  getProduct: (id: string) => apiRequest<Product>(`/products/${id}`),
+  createProduct: (data: Partial<Product>) =>
+    apiRequest<Product>('/products', { method: 'POST', body: data }),
+  updateProduct: (id: string, data: Partial<Product>) =>
+    apiRequest<Product>(`/products/${id}`, { method: 'PATCH', body: data }),
+  deleteProduct: (id: string) =>
+    apiRequest<{ id: string; isActive: boolean }>(`/products/${id}`, { method: 'DELETE' }),
+
+  listPartners: (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    type?: 'CUSTOMER' | 'SUPPLIER' | 'BOTH';
+    isActive?: boolean;
+  } = {}) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.type) q.set('type', params.type);
+    if (params.isActive !== undefined) q.set('isActive', String(params.isActive));
+    return apiRequest<Paginated<Partner>>(`/partners?${q.toString()}`);
+  },
+  getPartner: (id: string) => apiRequest<Partner>(`/partners/${id}`),
+  createPartner: (data: Partial<Partner>) =>
+    apiRequest<Partner>('/partners', { method: 'POST', body: data }),
+  updatePartner: (id: string, data: Partial<Partner>) =>
+    apiRequest<Partner>(`/partners/${id}`, { method: 'PATCH', body: data }),
+  deletePartner: (id: string) =>
+    apiRequest<{ id: string; isActive: boolean }>(`/partners/${id}`, { method: 'DELETE' }),
+};
+
+// =====================================================
+// Phase 2 types — must mirror backend Prisma selections.
+// `companyId` comes from JWT only, never from these objects
+// outside the SafeUser contract; the user can't forge it.
+// =====================================================
+export type Paginated<T> = {
+  total: number;
+  page: number;
+  pageSize: number;
+  items: T[];
+};
+
+export type Product = {
+  id: string;
+  companyId: string;
+  sku: string;
+  name: string;
+  nameAr: string | null;
+  description: string | null;
+  type: 'PRODUCT' | 'SERVICE';
+  barcode: string | null;
+  unit: string | null;
+  priceBeforeVat: string | null; // Decimal serializes to string
+  vatRate: string;              // Decimal default '15.00'
+  isActive: boolean;
+  deletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdById: string | null;
+  updatedById: string | null;
+};
+
+export type Partner = {
+  id: string;
+  companyId: string;
+  code: string | null;
+  name: string;
+  nameAr: string | null;
+  type: 'CUSTOMER' | 'SUPPLIER' | 'BOTH';
+  vatNumber: string | null;
+  commercialRegistration: string | null;
+  email: string | null;
+  phone: string | null;
+  address: string | null;
+  city: string | null;
+  country: string | null;
+  isActive: boolean;
+  deletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdById: string | null;
+  updatedById: string | null;
 };
