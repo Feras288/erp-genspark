@@ -44,6 +44,9 @@ model Company {
   salesInvoiceLines    SalesInvoiceLine[]
   purchaseInvoices     PurchaseInvoice[]
   purchaseInvoiceLines PurchaseInvoiceLine[]
+  accounts             Account[]
+  journalEntries       JournalEntry[]
+  journalEntryLines    JournalEntryLine[]
 
   @@index([name])
   @@map("companies")
@@ -88,6 +91,12 @@ model User {
   purchaseInvoicesUpdated   PurchaseInvoice[] @relation("PurchaseInvoiceUpdatedBy")
   purchaseInvoicesReceived  PurchaseInvoice[] @relation("PurchaseInvoiceReceivedBy")
   purchaseInvoicesCancelled PurchaseInvoice[] @relation("PurchaseInvoiceCancelledBy")
+  accountsCreated           Account[]         @relation("AccountCreatedBy")
+  accountsUpdated           Account[]         @relation("AccountUpdatedBy")
+  journalEntriesCreated     JournalEntry[]    @relation("JournalEntryCreatedBy")
+  journalEntriesUpdated     JournalEntry[]    @relation("JournalEntryUpdatedBy")
+  journalEntriesPosted      JournalEntry[]    @relation("JournalEntryPostedBy")
+  journalEntriesCancelled   JournalEntry[]    @relation("JournalEntryCancelledBy")
 
   @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
@@ -561,4 +570,139 @@ model PurchaseInvoiceLine {
   @@index([companyId, productId])
   @@index([companyId, warehouseId])
   @@map("purchase_invoice_lines")
+}
+
+// =====================================================
+// Phase 6: Accounting Core — Chart of Accounts + Manual
+// Journal Entries only.
+//
+// Backend scope (strict — anything below is FORBIDDEN in Phase 6):
+//   * No financial reports (Trial Balance / Balance Sheet / P&L / VAT).
+//   * No ZATCA / e-invoicing / QR / CSID / XML.
+//   * No automated posting from Sales or Purchases invoices.
+//   * No AR / AP ledgers, no customer/supplier statements.
+//   * No payments / bank reconciliation / cash management.
+//   * No cost accounting / COGS / inventory valuation / fixed assets.
+//   * No payroll accounting / HR.
+//   * No SaaS billing / payment gateway.
+//   * No returns / debit notes / credit notes.
+//   * No reverse entries / period locking.
+//   * No default / seed / demo chart of accounts.
+//
+// What IS in Phase 6:
+//   * Chart of Accounts (Account: code, name, nameAr, type, normalBalance,
+//     parentId optional, isActive, deletedAt).
+//   * Manual Journal Entries (DRAFT / POSTED / CANCELLED) + lines.
+//   * Double-entry validation (debit == credit, ≥2 lines, no both-debit-credit
+//     same line, no zero lines, server-side Decimal only).
+//   * RBAC, companyId scoping, append-only audit, no mock data.
+// =====================================================
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum NormalBalance {
+  DEBIT
+  CREDIT
+}
+
+enum JournalEntryStatus {
+  DRAFT
+  POSTED
+  CANCELLED
+}
+
+model Account {
+  id            String        @id @default(cuid())
+  companyId     String
+  code          String // unique per company (enforced by index)
+  name          String
+  nameAr        String?
+  type          AccountType
+  normalBalance NormalBalance
+  parentId      String? // optional parent for hierarchy (same company only)
+  isActive      Boolean       @default(true)
+  deletedAt     DateTime? // soft delete only
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  createdById   String?
+  updatedById   String?
+
+  company     Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  parent      Account?           @relation("AccountParent", fields: [parentId], references: [id], onDelete: SetNull)
+  children    Account[]          @relation("AccountParent")
+  createdBy   User?              @relation("AccountCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy   User?              @relation("AccountUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  debitLines  JournalEntryLine[] @relation("JELineDebitAccount")
+  creditLines JournalEntryLine[] @relation("JELineCreditAccount")
+
+  // Partial unique index for code-per-company is added via raw SQL in the
+  // migration (Prisma cannot express non-deleted uniques directly).
+  @@index([companyId, isActive])
+  @@index([companyId, deletedAt])
+  @@index([companyId, type])
+  @@index([companyId, parentId])
+  @@index([companyId, code])
+  @@map("accounts")
+}
+
+model JournalEntry {
+  id            String             @id @default(cuid())
+  companyId     String
+  entryNumber   String // je-YYYYMMDD-NNNN, unique per company
+  status        JournalEntryStatus @default(DRAFT)
+  entryDate     DateTime           @default(now())
+  description   String? // header-level memo / narration
+  reference     String? // optional external doc ref (invoice id, etc.)
+  totalDebit    Decimal            @default(0) @db.Decimal(18, 4) // server-computed sum of line debits
+  totalCredit   Decimal            @default(0) @db.Decimal(18, 4) // server-computed sum of line credits
+  notes         String?
+  postedAt      DateTime?
+  cancelledAt   DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  createdById   String?
+  updatedById   String?
+  postedById    String?
+  cancelledById String?
+
+  company     Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy   User?              @relation("JournalEntryCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy   User?              @relation("JournalEntryUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  postedBy    User?              @relation("JournalEntryPostedBy", fields: [postedById], references: [id], onDelete: SetNull)
+  cancelledBy User?              @relation("JournalEntryCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  lines       JournalEntryLine[]
+
+  @@unique([companyId, entryNumber])
+  @@index([companyId, status])
+  @@index([companyId, entryDate])
+  @@map("journal_entries")
+}
+
+model JournalEntryLine {
+  id              String   @id @default(cuid())
+  companyId       String
+  entryId         String
+  debitAccountId  String? // exactly one of debitAccountId / creditAccountId must be set per line
+  creditAccountId String?
+  description     String? // per-line memo
+  debit           Decimal  @default(0) @db.Decimal(18, 4) // server-side authoritative
+  credit          Decimal  @default(0) @db.Decimal(18, 4) // server-side authoritative
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  company       Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  entry         JournalEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  debitAccount  Account?     @relation("JELineDebitAccount", fields: [debitAccountId], references: [id], onDelete: Restrict)
+  creditAccount Account?     @relation("JELineCreditAccount", fields: [creditAccountId], references: [id], onDelete: Restrict)
+
+  @@index([companyId, entryId])
+  @@index([debitAccountId])
+  @@index([creditAccountId])
+  @@map("journal_entry_lines")
 }

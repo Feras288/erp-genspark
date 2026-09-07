@@ -81,6 +81,14 @@ const PERMISSIONS = [
   { key: 'accounting.accounts.manage', module: 'accounting', action: 'manage', description: 'Manage chart of accounts' },
   { key: 'accounting.journal.create', module: 'accounting', action: 'create', description: 'Create journal entry' },
   { key: 'accounting.journal.read', module: 'accounting', action: 'read', description: 'View journal entries' },
+  // accounting — Phase 6: lifecycle keys (mirror sales.* / purchases.* naming)
+  { key: 'accounting.read', module: 'accounting', action: 'read', description: 'List / get chart of accounts + journal entries' },
+  { key: 'accounting.accounts.create', module: 'accounting', action: 'create', description: 'Create account in chart of accounts' },
+  { key: 'accounting.accounts.update', module: 'accounting', action: 'update', description: 'Edit account in chart of accounts' },
+  { key: 'accounting.accounts.delete', module: 'accounting', action: 'delete', description: 'Soft-delete account (only if no posted journal lines use it)' },
+  { key: 'accounting.journal.update', module: 'accounting', action: 'update', description: 'Edit DRAFT journal entry (server-side Decimal totals recompute)' },
+  { key: 'accounting.journal.post', module: 'accounting', action: 'post', description: 'Post DRAFT journal entry (validates double-entry: debit == credit)' },
+  { key: 'accounting.journal.cancel', module: 'accounting', action: 'cancel', description: 'Cancel DRAFT journal entry' },
   // reports
   { key: 'reports.read', module: 'reports', action: 'read', description: 'View reports' },
 ];
