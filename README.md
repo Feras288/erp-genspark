@@ -1384,4 +1384,235 @@ Frontend additions (commit هذا الـ commit):
 
 > **لا تبدأ Phase 6 تلقائياً.** انتظر تعليمات صريحة من المستخدم.
 
+## Phase 6: Accounting Core
+
+**نطاق صارم:** Chart of Accounts + Manual Journal Entries فقط. لا تقارير مالية، لا قيود آلية من المبيعات/المشتريات، لا AR/AP، لا دفعات، لا ZATCA/VAT، لا COGS، لا أصول ثابتة، لا payroll، لا SaaS billing في هذه المرحلة.
+
+### Commit map (Phase 6)
+
+- **Phase 6A** — `d57b80e feat(phase-6): accounting core schema + migration + permissions`
+  Prisma schema additions (`Account`, `JournalEntry`, `JournalEntryLine`)،
+  partial unique index على `(companyId, code) WHERE deletedAt IS NULL`،
+  partial unique على `(companyId, entryNumber)`، FK Restrict من
+  `JournalEntryLine` إلى `Account` (debited/credited accounts),
+  Audit events جديدة، 7 صلاحيات RBAC إضافية مُلحقة بـ seed.
+
+- **Phase 6B** — `e1c7a5e feat(phase-6): implement accounting core`
+  `AccountingController` (11 endpoint تحت `/api/accounting/accounts` +
+  `/api/accounting/journal`) + `AccountingService` مع double-entry validation
+  (≥2 lines, debit XOR credit per line, totalDebit == totalCredit عبر
+  `Prisma.Decimal` server-side لا `Number`)، DRAFT-only mutations على
+  journal entries، 409 على duplicate code في نفس الشركة وعلى
+  accounts referenced by posted lines، soft-delete (`deletedAt`).
+
+- **Phase 6C** — `362a430 feat(phase-6): accounting backend e2e smoke tests`
+  19 e2e اختبارات (A1–G1) ملحقة بـ `backend/test/app.e2e-spec.ts`.
+  إجمالي suite الآن 99/99 passing. Real-bug fixes: `getAccount` filter
+  لـ `deletedAt`، و class-validator decorators على `UpdateJournalEntryDto`.
+
+- **Phase 6D** — `feat(phase-6): accounting frontend + README final` (هذا الـ commit)
+  صفحة `/accounting` في الـ frontend، تحديث الـ `api.ts`،
+  رابط `/accounting` من `/dashboard` (مُقيَّد بـ `accounting.read`).
+
+### Scope of Phase 6
+
+**مشمول:**
+
+1. **Chart of Accounts CRUD** (`/api/accounting/accounts`)
+   - List (paginated + search by code/name + filter by type + includeInactive flag + rootsOnly flag)
+   - Get (single account with `parent` + `children` relations)
+   - Create (code 1..32 chars من `[A-Za-z0-9._-]`، unique per company،
+     type×normalBalance invariant: ASSET/EXPENSE → DEBIT،
+     LIABILITY/EQUITY/REVENUE → CREDIT)
+   - Update (no code change بعد POSTED lines — FK Restrict في الـ DB)
+   - Delete (soft-delete: يَضبط `deletedAt` و `isActive=false`؛ يرجع 409 لو في posted lines مرتبطة)
+
+2. **Manual Journal Entries** (`/api/accounting/journal`)
+   - List (paginated + search by entryNumber/description/notes + status filter)
+   - Get (with nested `lines[]` و nested `debitAccount`/`creditAccount` refs)
+   - Create (DRAFT؛ entryNumber `je-YYYYMMDD-NNNN` مع 3-attempt race retry)
+   - Update DRAFT (notes/reference/description/entryDate؛ line replace إذا `lines` تم تمريرها)
+   - Post (DRAFT → POSTED؛ `postedAt` يُكتب؛ postedBy tracked)
+   - Cancel (DRAFT → CANCELLED؛ POSTED → 409 "reverse entries out of scope"؛
+     CANCELLED → 409 "already cancelled")
+
+**ممنوع عمداً في Phase 6:**
+
+- لا GET aggregations → **لا** Trial Balance / Balance Sheet / P&L / General Ledger reports.
+- لا قيود آلية من `Sales / Purchases` (لا AR من فواتير المبيعات، لا AP من فواتير المشتريات، لا COGS، لا inventory valuation posting، لا landed cost).
+- لا **VAT / ZATCA** integration.
+- لا **payments**, **bank reconciliation**, **cash management**.
+- لا **AR/AP ledgers** ولا customer/supplier statements.
+- لا **cost accounting**, **fixed assets**, **payroll**, **SaaS billing**.
+- لا **reverse entries / period locking** (يلزم manually delete DRAFT أو قبول الـ 409 على POSTED).
+- لا default seed/demo chart of accounts — كل شركة تبني دليلها عبر الـ UI.
+- لا **deployment** ولا **Cloudflare/Workers/Wrangler** ولا أي hosted services.
+
+### Database / Prisma Changes (Phase 6A SQL migration)
+
+Migration file: `backend/prisma/migrations/<timestamp>_phase6_accounting_core/migration.sql`
+
+- **Account** table — `id, companyId, code, name, nameAr, type (ASSET|LIABILITY|EQUITY|REVENUE|EXPENSE), normalBalance (DEBIT|CREDIT), parentId?, isActive, deletedAt?, createdById?, updatedById?, timestamps`.
+  - `@@unique([companyId, code]) WHERE deletedAt IS NULL` (partial unique — reactivation of deleted code ممكن).
+- **JournalEntry** — `id, companyId, entryNumber, status (DRAFT|POSTED|CANCELLED), entryDate, description?, reference?, totalDebit, totalCredit, notes?, postedAt?, cancelledAt?, createdById?, updatedById?, postedById?, cancelledById?, timestamps`.
+  - `@@unique([companyId, entryNumber])` (full unique؛ race retry في الـ service).
+- **JournalEntryLine** — `id, companyId, entryId, debitAccountId?, creditAccountId?, description?, debit, credit, timestamps`.
+  - FK Restrict من `debitAccountId`/`creditAccountId` إلى `Account.id`.
+  - Constraint: لا يمكن أن يكون الـ debit و الـ credit > 0 في نفس الـ line.
+
+كل حقول الـ Decimal بـ `@db.Decimal(18, 4)` (money-scale 4 fractional digits).
+`AuditLog` جدول موسَّع بـ events جديدة:
+`accounting.account.{created,updated,deleted}`، `accounting.journal.{created,updated,posted,cancelled}`.
+JWT-only `companyId`: `WHERE companyId = me.companyId` على كل query، ولا يقبل `companyId` في الـ body.
+
+### Permissions Added in Phase 6
+
+مُلحقة بـ Phase 1's 52-permission matrix (التي مُلحق بها 6 Phase 5 purchases → إجمالي 58 سابقاً).
+الآن 7 إضافية → **إجمالي 65 permission**:
+
+| Key | Endpoint |
+|---|---|
+| `accounting.read` | GET `/api/accounting/accounts` و `/journal` |
+| `accounting.accounts.create` | POST `/api/accounting/accounts` |
+| `accounting.accounts.update` | PATCH `/api/accounting/accounts/:id` |
+| `accounting.accounts.delete` | DELETE `/api/accounting/accounts/:id` |
+| `accounting.journal.update` | POST و PATCH `/api/accounting/journal` و PATCH `/journal/:id` |
+| `accounting.journal.post` | POST `/api/accounting/journal/:id/post` |
+| `accounting.journal.cancel` | POST `/api/accounting/journal/:id/cancel` |
+
+ملاحظة: لا يوجد `accounting.journal.create` منفصل — الـ controller يستخدم
+`accounting.journal.update` لكل من POST و PATCH على `/api/accounting/journal`
+(نفس الـ permission). `accounting.accounts.create` مش متطلب لكتابة journal
+lines منطقياً — السطور تستخدم accounts موجودة فقط وفي نفس الشركة.
+
+### Endpoints (الـ 11 مسار Phase 6)
+
+```
+GET    /api/accounting/accounts             — accounting.read
+GET    /api/accounting/accounts/:id         — accounting.read
+POST   /api/accounting/accounts             — accounting.accounts.create
+PATCH  /api/accounting/accounts/:id         — accounting.accounts.update
+DELETE /api/accounting/accounts/:id         — accounting.accounts.delete
+
+GET    /api/accounting/journal              — accounting.read
+GET    /api/accounting/journal/:id          — accounting.read
+POST   /api/accounting/journal              — accounting.journal.update
+PATCH  /api/accounting/journal/:id          — accounting.journal.update
+POST   /api/accounting/journal/:id/post     — accounting.journal.post
+POST   /api/accounting/journal/:id/cancel   — accounting.journal.cancel
+```
+
+كل request body و response shape مُعرَّف في `backend/src/accounting/**`؛ جميع الـ
+decimal fields تُسلسل كـ strings. `UpdateAccountDto.parentId?: null` يَعني
+"إزالة الـ parent" (top-level). `UpdateJournalEntryDto.lines` كامل الـ replace
+(الجانب يحذف السطور القديمة ويَكتب الجديدة في transaction).
+
+### Frontend routes (Phase 6D)
+
+- **`/accounting`** (`frontend/src/app/accounting/page.tsx`) — client component،
+  Arabic/RTL layouts، تقسيم ضمن two-column grid: يسار Chart of Accounts، يمين
+  Manual Journal Entries.
+  - Account form: code (مُعَطَّل في edit)، name، nameAr، type،
+    normalBalance (مُشتق تلقائياً من type ويُعرض read-only envelope)،
+    optional parent، isActive checkbox.
+  - Account list: paginated، filter by type، search by code/name، row actions
+    (Edit / Delete soft-delete، معطل لو الحساب محذوف).
+  - Journal form: entryDate, reference, description, notes،
+    خطوط ديناميكية (≥2 إلزامي)، per-line: account + description + debit XOR credit،
+    live total computed في الـ UI + balanced check (الـ server يُطبق نفس الـ invariant).
+  - Journal list: paginated، search by entryNumber/description/notes،
+    filter by status، row actions (Edit / Post / Cancel — معطلة بشكل صحيح
+    للحالة غير المسودة).
+  - محمي بـ `accounting.read`؛ بدونها redirect إلى `/dashboard`.
+  - كل أزرار الإجراءات معطلة (لا مخفية) إذا الـ permission غير موجود — الـ
+    المستخدم يرى الـ UX لكنه لا يستطيع التشغيل.
+
+- **`/dashboard`** — رابط جديد `/accounting` يظهر فقط لو
+  `user.permissions.includes('accounting.read')`.
+
+### Testing commands
+
+```bash
+# Backend build + e2e (تأكيد لا regression في 99/99 السابقة)
+cd /home/user/webapp/erp-system
+pnpm --filter @erp/backend build                       # exit 0
+pnpm --filter @erp/backend test:e2e                    # 99 passed / 99 total
+                                                         # 74 baseline + 19 Phase 6 = 93 + 6 Phase 4 = 99
+                                                         # (19 labelled A1..G1)
+
+# Frontend build (تأكيد /accounting route compiles + types pass)
+pnpm --filter @erp/frontend build                      # exit 0
+```
+
+اختبارات Phase 6 الـ 19 (`e2e`, `backend/test/app.e2e-spec.ts`):
+
+- **A1–A2** — List accounts: 401 without token؛ 200 + paginated shape كأدمن.
+- **B1–B5** — Create accounts: ASSET/DEBIT، LIABILITY/CREDIT، EQUITY/CREDIT،
+  duplicate code → 409، invalid code chars → 400.
+- **C1–C4** — Account lifecycle: GET with nested parent/children، PATCH، soft-delete،
+  GET after soft-delete → 404 (الـ `deletedAt: null` invariant).
+- **D1–D2** — List journal entries: 401 / 200 + paginated shape.
+- **E1–E4** — Create journal: <2 lines → 400، both debit+credit → 400،
+  unbalanced → 400، balanced ≥2 → 201 DRAFT.
+- **F1–F7** — Journal lifecycle: GET → PATCH DRAFT → POST /post → POST /post
+  على POSTED → 409 → POST /cancel على POSTED → 409 ("reverse out of scope")
+  → POST /cancel على DRAFT → CANCELLED → POST /cancel على CANCELLED → 409.
+- **G1** — `status=DRAFT` filter يُرجع الـ non-POSTED set (DRAFT + CANCELLED).
+
+### Real bugs fixed by Phase 6C e2e
+
+1. **`accounting.service.getAccount`** كان يَنْسى فلتر `deletedAt: null` —
+   soft-delete-then-GET كان يَرُدّ 200 بدل 404. الـ fix: إضافة
+   `deletedAt: null` للـ where clause. C4 اكتشفها.
+2. **`UpdateJournalEntryDto`** ما كان عنده `class-validator` decorators —
+   الـ global `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true,
+   transform: true })` كان يَرفض كل property كـ `"property X should not exist"`.
+   الـ fix: `IsOptional`/`IsString`/`MaxLength`/`IsISO8601`/`IsArray`/
+   `ArrayMinSize(2)`/`ValidateNested({ each: true })`/`@Type(() => …)` على
+   كل الحقول. F2 اكتشفها.
+
+### Hard prohibitions honored (Phase 6)
+
+- لا Frontend extra features (لا تقارير، لا charts، لا graph viz).
+- لا تعديل Auth/RBAC العام. كل الـ 7 permissions الجديدة مضافة فقط لـ
+  seed matrix، و `@RequirePermissions` decorator يَستخدم نفس الـ guard chain.
+- لا `localStorage` / `sessionStorage` — access token في-memory داخل `frontend/lib/api.ts` فقط،
+  refresh cookie HttpOnly بـ `credentials: 'include'`.
+- لا بيانات تجربة/وهمية — seed seed Phase 1/5 يضيف permissions + admin only.
+  الـ e2e يبني fixturesه الخاصة.
+- لا deployment. لا Cloudflare/Workers/Wrangler/OAuth/external auth.
+- لا `cf-byok-deploy`, `designer-handoff`, `gsk-hosted-deploy`, `gsk-hosted-identity`
+  skills مُشغَّلة أو مُستدعاة.
+- لا ZATCA / VAT reports / VAT auto-posting.
+- لا AR/AP ledgers / payments / reconciliation / cost accounting / fixed assets /
+  payroll / SaaS billing / reverse entries / period locking.
+
+### Security / tenancy (unchanged from Phase 1+2+3+4+5)
+
+- `companyId` من `JWT.currentUser.companyId` فقط — **لا** يقبل من الـ body.
+- `@RequirePermissions` + `JwtAuthGuard` + `PermissionsGuard` على كل controller.
+- `@UseGuards(JwtAuthGuard, PermissionsGuard)` global على `AccountingController`.
+- Soft-delete عبر `deletedAt`؛ لا hard-delete؛ unique constraint excludes deleted.
+- Audit events تكتب **outside** Prisma transactions (best-effort؛ fail-safe) لكل mutation.
+- `Prisma.Decimal` arithmetic فقط في الـ service؛ `Number` ممنوع في الـ math paths.
+- لا `companyId` من الـ form body ولا من الـ URL.
+- لا tokens في `localStorage` / `sessionStorage`.
+
+### Recommendation
+
+**Phase 6 (Accounting Core) UI انتهت.** Phase 6 frontend فقط يَستخدم الـ APIs؛ كل
+الأرقام strings بصرف Decimal @db.Decimal(18,4) ولا Number حسابي في الـ UI. أي
+مرحلة لاحقة يجب أن تَكون **single-domain** فقط:
+- إمّا **Reports / ZATCA / VAT** (read-only aggregations على الـ journal lines).
+- أو **AR / AP ledgers** (customer/supplier outstanding من الـ journal entries).
+- أو **Bank Reconciliation / Payments** (cash management).
+- أو **Fixed Assets / Depreciation**.
+- أو **HR / Payroll** (employees + monthly payroll cycle).
+- أو **Returned invoices / Debit-Credit notes** (Sales/Purchase returns).
+- أو **Period locking + Reverse entries** (rollback for posted journals).
+
+ولا جمع في مرحلة واحدة دون مبرر صريح. ولا deployment بأمر المستودع هذا — فقط
+local Docker Compose على جهاز المستخدم.
+
+
 

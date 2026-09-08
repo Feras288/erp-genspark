@@ -66,7 +66,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-3xl font-bold text-slate-800">لوحة المعلومات</h1>
           <p className="text-sm text-slate-500">
-            نظام إدارة الموارد (ERP) — المرحلة 4: المبيعات ونقطة البيع (Sales + POS)
+            نظام إدارة الموارد (ERP) — المرحلة 6: المحاسبة (Accounting Core)
           </p>
         </div>
         <div className="flex gap-2 flex-wrap">
@@ -116,6 +116,14 @@ export default function DashboardPage() {
               className="rounded-md bg-rose-600 hover:bg-rose-700 text-white text-sm px-4 py-2"
             >
               نقطة البيع
+            </Link>
+          )}
+          {user.permissions.includes('accounting.read') && (
+            <Link
+              href="/accounting"
+              className="rounded-md bg-sky-600 hover:bg-sky-700 text-white text-sm px-4 py-2"
+            >
+              المحاسبة
             </Link>
           )}
           <button

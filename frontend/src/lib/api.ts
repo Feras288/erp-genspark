@@ -380,7 +380,7 @@ export const api = {
       body: data,
     }),
 
-  // Convenience: list active suppliers only (Partner type SUPPLIER | BOTH) — server
+// Convenience: list active suppliers only (Partner type SUPPLIER | BOTH) — server
   // enforces the rule regardless, but the UI filters to avoid 400s.
   listActiveSuppliers: () =>
     api
@@ -391,6 +391,103 @@ export const api = {
           (p) => p.type === 'SUPPLIER' || p.type === 'BOTH',
         ),
       })),
+
+  // ===== Phase 6: Accounting Core =====
+  // Scope: Chart of Accounts + Manual Journal Entries only.
+  // NOT in scope: Trial Balance / Balance Sheet / P&L / VAT reports,
+  // automated posting from Sales/Purchases, AR/AP ledgers, payments,
+  // cost accounting, fixed assets, payroll, SaaS billing, reversal
+  // entries, period locking. companyId is always JWT — never sent.
+
+  // ---- Chart of Accounts ----
+  listAccounts: (
+    params: {
+      page?: number;
+      pageSize?: number;
+      search?: string;
+      type?: AccountTypeKey;
+      includeInactive?: boolean;
+      rootsOnly?: boolean;
+    } = {},
+  ) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 50));
+    if (params.search) q.set('search', params.search);
+    if (params.type) q.set('type', params.type);
+    if (params.includeInactive !== undefined)
+      q.set('includeInactive', String(params.includeInactive));
+    if (params.rootsOnly !== undefined)
+      q.set('rootsOnly', String(params.rootsOnly));
+    return apiRequest<Paginated<Account>>(`/accounting/accounts?${q.toString()}`);
+  },
+
+  getAccount: (id: string) =>
+    apiRequest<Account>(`/accounting/accounts/${id}`),
+
+  createAccount: (data: CreateAccountInput) =>
+    apiRequest<Account>('/accounting/accounts', {
+      method: 'POST',
+      body: data,
+    }),
+
+  updateAccount: (id: string, data: UpdateAccountInput) =>
+    apiRequest<Account>(`/accounting/accounts/${id}`, {
+      method: 'PATCH',
+      body: data,
+    }),
+
+  deleteAccount: (id: string) =>
+    apiRequest<{ id: string; deletedAt: string; isActive: boolean }>(
+      `/accounting/accounts/${id}`,
+      { method: 'DELETE' },
+    ),
+
+  // ---- Manual Journal Entries ----
+  listJournalEntries: (
+    params: {
+      page?: number;
+      pageSize?: number;
+      search?: string;
+      status?: JournalEntryStatusKey;
+    } = {},
+  ) => {
+    const q = new URLSearchParams();
+    q.set('page', String(params.page ?? 1));
+    q.set('pageSize', String(params.pageSize ?? 20));
+    if (params.search) q.set('search', params.search);
+    if (params.status) q.set('status', params.status);
+    return apiRequest<Paginated<JournalEntry>>(
+      `/accounting/journal?${q.toString()}`,
+    );
+  },
+
+  getJournalEntry: (id: string) =>
+    apiRequest<JournalEntry>(`/accounting/journal/${id}`),
+
+  createJournalEntry: (data: CreateJournalEntryInput) =>
+    apiRequest<JournalEntry>('/accounting/journal', {
+      method: 'POST',
+      body: data,
+    }),
+
+  updateJournalEntry: (id: string, data: UpdateJournalEntryInput) =>
+    apiRequest<JournalEntry>(`/accounting/journal/${id}`, {
+      method: 'PATCH',
+      body: data,
+    }),
+
+  postJournalEntry: (id: string, data: PostJournalEntryInput = {}) =>
+    apiRequest<JournalEntry>(`/accounting/journal/${id}/post`, {
+      method: 'POST',
+      body: data,
+    }),
+
+  cancelJournalEntry: (id: string, data: CancelJournalEntryInput = {}) =>
+    apiRequest<JournalEntry>(`/accounting/journal/${id}/cancel`, {
+      method: 'POST',
+      body: data,
+    }),
 };
 
 // =====================================================
@@ -732,6 +829,156 @@ export type ReceivePurchaseInvoiceInput = {
 };
 
 export type CancelPurchaseInvoiceInput = {
+  reason?: string;
+  notes?: string;
+};
+
+// =====================================================
+// Phase 6 types — must mirror backend Prisma selections
+// in backend/src/accounting/** and the Prisma enum values
+// (`AccountType`, `NormalBalance`, `JournalEntryStatus`).
+// Money columns are `Prisma.Decimal` server-side, serialized
+// to strings at the JSON boundary like Sales / Purchases.
+// `companyId` is returned as a hint but authorization is
+// always from the JWT in currentUser.
+// =====================================================
+
+export type AccountTypeKey =
+  | 'ASSET'
+  | 'LIABILITY'
+  | 'EQUITY'
+  | 'REVENUE'
+  | 'EXPENSE';
+
+export type NormalBalanceKey = 'DEBIT' | 'CREDIT';
+
+export type JournalEntryStatusKey = 'DRAFT' | 'POSTED' | 'CANCELLED';
+
+export type Account = {
+  id: string;
+  companyId: string;
+  code: string;
+  name: string;
+  nameAr: string | null;
+  type: AccountTypeKey;
+  normalBalance: NormalBalanceKey;
+  parentId: string | null;
+  isActive: boolean;
+  deletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdById: string | null;
+  updatedById: string | null;
+  parent?: {
+    id: string;
+    code: string;
+    name: string;
+    type: AccountTypeKey;
+    normalBalance: NormalBalanceKey;
+  } | null;
+  children?: Array<{
+    id: string;
+    code: string;
+    name: string;
+    type: AccountTypeKey;
+    normalBalance: NormalBalanceKey;
+    isActive: boolean;
+  }>;
+};
+
+export type CreateAccountInput = {
+  code: string;
+  name: string;
+  nameAr?: string;
+  type: AccountTypeKey;
+  normalBalance: NormalBalanceKey;
+  parentId?: string;
+  isActive?: boolean;
+};
+
+export type UpdateAccountInput = {
+  name?: string;
+  nameAr?: string;
+  type?: AccountTypeKey;
+  normalBalance?: NormalBalanceKey;
+  parentId?: string | null;
+  isActive?: boolean;
+};
+
+export type JournalEntryLine = {
+  id: string;
+  companyId: string;
+  entryId: string;
+  debitAccountId: string | null;
+  creditAccountId: string | null;
+  description: string | null;
+  debit: string; // Decimal
+  credit: string; // Decimal
+  createdAt: string;
+  updatedAt: string;
+  debitAccount?: {
+    id: string;
+    code: string;
+    name: string;
+    type: AccountTypeKey;
+  } | null;
+  creditAccount?: {
+    id: string;
+    code: string;
+    name: string;
+    type: AccountTypeKey;
+  } | null;
+};
+
+export type JournalEntry = {
+  id: string;
+  companyId: string;
+  entryNumber: string; // je-YYYYMMDD-NNNN
+  status: JournalEntryStatusKey;
+  entryDate: string;
+  description: string | null;
+  reference: string | null;
+  totalDebit: string; // Decimal
+  totalCredit: string; // Decimal
+  notes: string | null;
+  postedAt: string | null;
+  cancelledAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdById: string | null;
+  updatedById: string | null;
+  postedById: string | null;
+  cancelledById: string | null;
+  lines?: JournalEntryLine[];
+  _count?: { lines: number };
+};
+
+export type CreateJournalEntryLineInput = {
+  accountId: string;
+  description?: string;
+  debit: string; // e.g. "100.0000" or "0.0000"
+  credit: string;
+};
+
+export type CreateJournalEntryInput = {
+  entryDate?: string; // ISO date
+  description?: string;
+  reference?: string;
+  notes?: string;
+  lines: CreateJournalEntryLineInput[]; // >=2 lines; per line: debit XOR credit
+};
+
+export type UpdateJournalEntryInput =
+  Partial<Omit<CreateJournalEntryInput, 'lines'>> & {
+    lines?: CreateJournalEntryLineInput[];
+  };
+
+export type PostJournalEntryInput = {
+  entryDate?: string;
+  notes?: string;
+};
+
+export type CancelJournalEntryInput = {
   reason?: string;
   notes?: string;
 };
