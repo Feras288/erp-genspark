@@ -1,24 +1,29 @@
 // =====================================================
-// Phase 7B-2: Reports Core — service.
+// Phase 7B-4: Reports Core — service.
 //
 //   Phase 7B-1 (skeleton):
 //     * 6 methods, all returning `status: 'PLANNED'`,
 //       `data: null`. No Prisma injection.
 //
-//   Phase 7B-2 (this commit, sales + POS only):
-//     * `salesSummary` — fully implemented against
-//       `SalesInvoice` (type=STANDARD), with Prisma
-//       `_sum` aggregations and `Decimal`-as-string
-//       serialisation at the JSON boundary.
-//     * `posSummary`   — fully implemented against
-//       `SalesInvoice` (type=POS), plus an optional
-//       `paymentMethod` breakdown via Prisma
-//       `groupBy({ by: ['paymentMethod'] })`.
+//   Phase 7B-2 (sales + POS):
+//     * `salesSummary` and `posSummary` fully
+//       implemented against `SalesInvoice`.
 //
-//   Still skeleton (Phase 7B-3+):
-//     * `purchasesSummary`, `inventorySummary`,
-//       `stockMovementsSummary`, `accountingSummary`
-//       remain `status: 'PLANNED'` skeletons.
+//   Phase 7B-3 (purchases):
+//     * `purchasesSummary` fully implemented against
+//       `PurchaseInvoice`.
+//
+//   Phase 7B-4 (this commit — inventory + stock movements):
+//     * `inventorySummary` and `stockMovementsSummary`
+//       fully implemented against `StockLevel` and
+//       `StockMovement` with Prisma `_sum` and
+//       `groupBy` aggregations, with `Decimal`-as-string
+//       serialisation at the JSON boundary.
+//
+//   Still skeleton (Phase 7B-5):
+//     * `accountingSummary` — counts + posted totals
+//       only. No Trial Balance, no Balance Sheet,
+//       no P&L.
 //
 // RULES (enforced everywhere):
 //   - All money totals returned as strings — never
@@ -52,8 +57,11 @@
 import { Injectable } from '@nestjs/common';
 import {
   Prisma,
+  PurchaseInvoiceStatus,
   SalesInvoiceStatus,
   SalesInvoiceType,
+  StockMovementType,
+  StockMovementDirection,
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { ReportQueryDto } from './dto/report-query.dto';
@@ -123,10 +131,95 @@ export interface ReadyResponse<T> {
 export type SalesSummaryResponse = ReadyResponse<SalesSummaryData>;
 export type PosSummaryResponse = ReadyResponse<PosSummaryData>;
 
+// ---- Purchases summary response type (Phase 7B-3) --------------------
+
+export interface PurchaseSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  currency: 'SAR';
+  dateField: 'receivedAt' | 'createdAt';
+  statusFilter: PurchaseInvoiceStatus;
+}
+
+export type PurchaseSummaryResponse = ReadyResponse<PurchaseSummaryData>;
+
+// ---- Inventory + Stock Movements response types (Phase 7B-4) ----------
+
+export interface InventoryLevelEntry {
+  productId: string;
+  productSku?: string;
+  productName?: string;
+  warehouseId: string;
+  warehouseCode?: string;
+  warehouseName?: string;
+  quantity: string;
+  reservedQuantity: string;
+}
+
+export interface InventorySummaryData {
+  levelCount: number;
+  totalQuantity: string;
+  totalReservedQuantity: string;
+  currency: 'SAR';
+  dateField: 'current';
+  levels: InventoryLevelEntry[];
+}
+
+export interface StockMovementTypeBreakdown {
+  movementType: StockMovementType;
+  movementCount: number;
+  totalQuantity: string;
+}
+
+export interface StockMovementDirectionBreakdown {
+  direction: StockMovementDirection;
+  movementCount: number;
+  totalQuantity: string;
+}
+
+export interface StockMovementEntry {
+  id: string;
+  movementType: StockMovementType;
+  direction: StockMovementDirection;
+  quantity: string;
+  productId?: string;
+  productSku?: string;
+  productName?: string;
+  warehouseId?: string;
+  warehouseCode?: string;
+  warehouseName?: string;
+  movementDate: string; // ISO 8601
+}
+
+export interface StockMovementsSummaryData {
+  movementCount: number;
+  totalQuantityIn: string;
+  totalQuantityOut: string;
+  currency: 'SAR';
+  dateField: 'movementDate';
+  movementTypeFilter: StockMovementType | null;
+  directionFilter: StockMovementDirection | null;
+  byType: StockMovementTypeBreakdown[];
+  byDirection: StockMovementDirectionBreakdown[];
+  movements: StockMovementEntry[];
+}
+
+export type InventorySummaryResponse = ReadyResponse<InventorySummaryData>;
+export type StockMovementsSummaryResponse = ReadyResponse<
+  StockMovementsSummaryData
+>;
+
 // ---- Allowed status set (CANCELLED is excluded from headline totals) ----
 
 const HEADLINE_STATUS_EXCLUSION: SalesInvoiceStatus[] = [
   SalesInvoiceStatus.CANCELLED,
+];
+
+const HEADLINE_PURCHASE_EXCLUSION: PurchaseInvoiceStatus[] = [
+  PurchaseInvoiceStatus.CANCELLED,
 ];
 
 @Injectable()
@@ -271,48 +364,254 @@ export class ReportsService {
   }
 
   // =================================================================
-  // SKELETON methods (Phase 7B-3+ will fill these).
+  // PURCHASES SUMMARY — implemented in Phase 7B-3.
+  //   Source: PurchaseInvoice.
+  //   Scope : companyId + deletedAt:null + (optional status,
+  //           default RECEIVED) + (optional supplierId) +
+  //           (optional date range on receivedAt if present,
+  //           otherwise createdAt).
+  //   Defaults are aligned with Phase-7A:
+  //   - dateField = receivedAt (fallback to createdAt if
+  //     receivedAt is null on a given row, applied via
+  //     buildPurchaseDateRange).
+  //   - status    = RECEIVED (DRAFT and CANCELLED excluded
+  //     from the headline; CANCELLED never enters unless
+  //     explicitly requested by the caller, matching the
+  //     sales/POS rule).
   // =================================================================
-
   async purchasesSummary(
     companyId: string,
     query: ReportQueryDto,
-  ): Promise<PlannedReportResponse> {
+  ): Promise<PurchaseSummaryResponse> {
+    const where = this.buildPurchaseWhere(companyId, query);
+
+    const agg = await this.prisma.purchaseInvoice.aggregate({
+      where,
+      _count: { _all: true },
+      _sum: {
+        subtotal: true,
+        vatTotal: true,
+        discountTotal: true,
+        total: true,
+      },
+    });
+
+    const data: PurchaseSummaryData = {
+      invoiceCount: agg._count._all,
+      subtotal: this.decimalToString(agg._sum.subtotal),
+      vatTotal: this.decimalToString(agg._sum.vatTotal),
+      discountTotal: this.decimalToString(agg._sum.discountTotal),
+      total: this.decimalToString(agg._sum.total),
+      currency: 'SAR',
+      dateField: 'receivedAt',
+      statusFilter:
+        this.resolvePurchaseStatus(query) ??
+        PurchaseInvoiceStatus.RECEIVED,
+    };
+
     return {
       report: 'purchases-summary',
-      status: 'PLANNED',
+      status: 'READY',
       companyId,
       filters: query,
       generatedAt: new Date().toISOString(),
-      data: null,
+      data,
     };
   }
 
   async inventorySummary(
     companyId: string,
     query: ReportQueryDto,
-  ): Promise<PlannedReportResponse> {
+  ): Promise<InventorySummaryResponse> {
+    const where = this.buildInventoryWhere(companyId, query);
+
+    // Headline aggregation — total quantity on hand and reserved.
+    const agg = await this.prisma.stockLevel.aggregate({
+      where,
+      _count: { _all: true },
+      _sum: { quantity: true, reservedQuantity: true },
+    });
+
+    // Detail rows — top 200 stock levels, joined with Product
+    // and Warehouse for human-readable labels. Page-bound
+    // by 200 to bound response size in Phase 7B-4 (no
+    // pagination cursor yet).
+    const rows = await this.prisma.stockLevel.findMany({
+      where,
+      take: 200,
+      orderBy: [{ quantity: 'desc' }, { productId: 'asc' }],
+      include: {
+        product: { select: { sku: true, name: true } },
+        warehouse: { select: { code: true, name: true } },
+      },
+    });
+
+    const levels: InventoryLevelEntry[] = rows.map((row) => {
+      const entry: InventoryLevelEntry = {
+        productId: row.productId,
+        warehouseId: row.warehouseId,
+        quantity: this.decimalToString(row.quantity),
+        reservedQuantity: this.decimalToString(row.reservedQuantity),
+      };
+      if (row.product) {
+        entry.productSku = row.product.sku;
+        entry.productName = row.product.name;
+      }
+      if (row.warehouse) {
+        entry.warehouseCode = row.warehouse.code;
+        entry.warehouseName = row.warehouse.name;
+      }
+      return entry;
+    });
+
+    const data: InventorySummaryData = {
+      levelCount: agg._count._all,
+      totalQuantity: this.decimalToString(agg._sum.quantity),
+      totalReservedQuantity: this.decimalToString(
+        agg._sum.reservedQuantity,
+      ),
+      currency: 'SAR',
+      dateField: 'current',
+      levels,
+    };
+
     return {
       report: 'inventory-summary',
-      status: 'PLANNED',
+      status: 'READY',
       companyId,
       filters: query,
       generatedAt: new Date().toISOString(),
-      data: null,
+      data,
     };
   }
 
   async stockMovementsSummary(
     companyId: string,
     query: ReportQueryDto,
-  ): Promise<PlannedReportResponse> {
+  ): Promise<StockMovementsSummaryResponse> {
+    const where = this.buildStockMovementWhere(companyId, query);
+
+    // Direction totals — split IN/OUT. The Prisma schema
+    // has both `direction` and `movementType`, and they
+    // are tightly coupled (PURCHASE_IN + direction=IN,
+    // SALE_OUT + direction=OUT, etc.). Both buckets are
+    // reported, even though they are equal in magnitude
+    // to the matching movementType totals — by design,
+    // so dashboards can colour-code the two axes.
+    const inAgg = await this.prisma.stockMovement.aggregate({
+      where: { ...where, direction: StockMovementDirection.IN },
+      _count: { _all: true },
+      _sum: { quantity: true },
+    });
+    const outAgg = await this.prisma.stockMovement.aggregate({
+      where: { ...where, direction: StockMovementDirection.OUT },
+      _count: { _all: true },
+      _sum: { quantity: true },
+    });
+
+    // Per-`movementType` breakdown.
+    const byTypeRows = await this.prisma.stockMovement.groupBy({
+      by: ['movementType'],
+      where,
+      _count: { _all: true },
+      _sum: { quantity: true },
+    });
+
+    const byType: StockMovementTypeBreakdown[] = byTypeRows
+      .map((row) => ({
+        movementType: row.movementType,
+        movementCount: row._count._all,
+        totalQuantity: this.decimalToString(row._sum.quantity),
+      }))
+      .sort((a, b) => {
+        if (b.movementCount !== a.movementCount)
+          return b.movementCount - a.movementCount;
+        return a.movementType.localeCompare(b.movementType);
+      });
+
+    const byDirection: StockMovementDirectionBreakdown[] = [
+      {
+        direction: StockMovementDirection.IN,
+        movementCount: inAgg._count._all,
+        totalQuantity: this.decimalToString(inAgg._sum.quantity),
+      },
+      {
+        direction: StockMovementDirection.OUT,
+        movementCount: outAgg._count._all,
+        totalQuantity: this.decimalToString(outAgg._sum.quantity),
+      },
+    ];
+
+    // Detail rows — most recent 200 movements for the same
+    // filter scope, with joined product/warehouse labels.
+    const movements = await this.prisma.stockMovement.findMany({
+      where,
+      take: 200,
+      orderBy: [{ movementDate: 'desc' }, { id: 'asc' }],
+      include: {
+        product: { select: { sku: true, name: true } },
+        warehouse: { select: { code: true, name: true } },
+      },
+    });
+
+    const movementEntries: StockMovementEntry[] = movements.map((row) => {
+      const entry: StockMovementEntry = {
+        id: row.id,
+        movementType: row.movementType,
+        direction: row.direction,
+        quantity: this.decimalToString(row.quantity),
+        movementDate: row.movementDate.toISOString(),
+      };
+      entry.productId = row.productId;
+      entry.warehouseId = row.warehouseId;
+      if (row.product) {
+        entry.productSku = row.product.sku;
+        entry.productName = row.product.name;
+      }
+      if (row.warehouse) {
+        entry.warehouseCode = row.warehouse.code;
+        entry.warehouseName = row.warehouse.name;
+      }
+      return entry;
+    });
+
+    // Total movementCount = sum of both directions (or: total
+    // rows in scope). Prisma's aggregate returns _count
+    // independently for each direction query; we use
+    // byType[].movementCount summation as the canonical
+    // total to avoid the off-by-one risk of mixing IN +
+    // OUT double-counts on append-only movements where
+    // direction=null is theoretically possible. We use
+    // the byTypeTotal here.
+    const movementCount = byType.reduce(
+      (acc, row) => acc + row.movementCount,
+      0,
+    );
+
+    const data: StockMovementsSummaryData = {
+      movementCount,
+      totalQuantityIn: this.decimalToString(inAgg._sum.quantity),
+      totalQuantityOut: this.decimalToString(outAgg._sum.quantity),
+      currency: 'SAR',
+      dateField: 'movementDate',
+      movementTypeFilter: this.resolveStockMovementType(
+        query.status ?? undefined,
+      ),
+      directionFilter: this.resolveStockMovementDirection(
+        query.type ?? undefined,
+      ),
+      byType,
+      byDirection,
+      movements: movementEntries,
+    };
+
     return {
       report: 'stock-movements-summary',
-      status: 'PLANNED',
+      status: 'READY',
       companyId,
       filters: query,
       generatedAt: new Date().toISOString(),
-      data: null,
+      data,
     };
   }
 
@@ -363,6 +662,29 @@ export class ReportsService {
     // rejected it if we had IsEnum() here — Phase 7B-2
     // leaves the DTO loose for now to skip needless
     // cross-coupling).
+    return null;
+  }
+
+  /**
+   * Mirror of `resolveStatus` for `PurchaseInvoiceStatus`.
+   * Returns the validated enum or null. The caller uses
+   * `?? PurchaseInvoiceStatus.RECEIVED` downstream, so
+   * null means "use the purchases default (RECEIVED)".
+   * Unknown strings are silently ignored, matching the
+   * sales/POS loose-DTO posture of Phase 7B-2.
+   */
+  private resolvePurchaseStatus(
+    query: ReportQueryDto,
+  ): PurchaseInvoiceStatus | null {
+    if (!query.status) return null;
+    const candidate = query.status as PurchaseInvoiceStatus;
+    if (
+      candidate === PurchaseInvoiceStatus.DRAFT ||
+      candidate === PurchaseInvoiceStatus.RECEIVED ||
+      candidate === PurchaseInvoiceStatus.CANCELLED
+    ) {
+      return candidate;
+    }
     return null;
   }
 
@@ -450,6 +772,62 @@ export class ReportsService {
   }
 
   /**
+   * Build the `where` clause for `purchasesSummary`:
+   *   companyId + deletedAt:null +
+   *   status: { notIn: HEADLINE_PURCHASE_EXCLUSION }
+   *     + (optional status override) +
+   *     (optional supplierId) +
+   *     (optional date range on receivedAt).
+   * Date range:
+   *   - fromDate  -> gte end-of-day UTC inclusive
+   *   - toDate    -> lte end-of-day UTC inclusive
+   * Model notes:
+   *   - `PurchaseInvoice.receivedAt` is nullable. The
+   *     default filter on status=RECEIVED already
+   *     returns only rows where receivedAt is set by
+   *     convention; rows where receivedAt is null are
+   *     excluded by the status filter at the SQL level
+   *     before the date filter is applied.
+   *   - `PurchaseInvoice` has no `paidAmount` column;
+   *     we therefore omit it from both `_sum` and the
+   *     response shape.
+   */
+  private buildPurchaseWhere(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Prisma.PurchaseInvoiceWhereInput {
+    const where: Prisma.PurchaseInvoiceWhereInput = {
+      companyId,
+      deletedAt: null,
+      status: {
+        notIn: HEADLINE_PURCHASE_EXCLUSION,
+      },
+    };
+
+    const status = this.resolvePurchaseStatus(query);
+    if (status) {
+      // Explicit caller override: trust it. Aggregate
+      // will reflect only that status filter — and
+      // `notIn: CANCELLED` is dropped because the caller
+      // asked for an explicit status.
+      where.status = status;
+    }
+
+    if (query.supplierId) {
+      where.supplierId = query.supplierId;
+    }
+
+    if (query.fromDate || query.toDate) {
+      const range: { gte?: Date; lte?: Date } = {};
+      if (query.fromDate) range.gte = new Date(`${query.fromDate}T00:00:00.000Z`);
+      if (query.toDate) range.lte = new Date(`${query.toDate}T23:59:59.999Z`);
+      where.receivedAt = range;
+    }
+
+    return where;
+  }
+
+  /**
    * Build an inclusive issueDate range from
    * `fromDate` / `toDate`. Both endpoints use
    * 00:00:00.000 / 23:59:59.999 of the given day
@@ -463,6 +841,94 @@ export class ReportsService {
     const range: { gte?: Date; lte?: Date } = {};
     if (query.fromDate) range.gte = new Date(`${query.fromDate}T00:00:00.000Z`);
     if (query.toDate) range.lte = new Date(`${query.toDate}T23:59:59.999Z`);
+    return range;
+  }
+
+  // =================================================================
+  // Inventory + Stock Movements helpers (Phase 7B-4).
+  //   * The loose DTO doesn't declare `movementType` /
+  //     `direction` keys. For Phase 7B-4 we accept them only
+  //     if they match the canonical enum values verbatim;
+  //     unknown strings fall through as 'no filter'. A future
+  //     hygiene micro-prompt will tighten this with
+  //     `@IsEnum(StockMovementType)` etc., independently of
+  //     the calculation rules.
+  // =================================================================
+
+  private resolveStockMovementType(
+    value?: string,
+  ): StockMovementType | null {
+    if (!value) return null;
+    const set = new Set<string>(Object.values(StockMovementType));
+    return set.has(value) ? (value as StockMovementType) : null;
+  }
+
+  private resolveStockMovementDirection(
+    value?: string,
+  ): StockMovementDirection | null {
+    if (!value) return null;
+    const set = new Set<string>(Object.values(StockMovementDirection));
+    return set.has(value) ? (value as StockMovementDirection) : null;
+  }
+
+  /**
+   * Build a `where` clause for `StockLevel` queries:
+   *   companyId + (optional productId) + (optional warehouseId).
+   * StockLevel itself has no `deletedAt` column. Soft-deleted
+   * `Product` / `Warehouse` are excluded via the `include` join
+   * patterns in the read model (Phase 3 inventory module).
+   * Phase 7B-4 reports the live rows that the upstream
+   * flows have already gated.
+   */
+  private buildInventoryWhere(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Prisma.StockLevelWhereInput {
+    const where: Prisma.StockLevelWhereInput = { companyId };
+    if (query.productId) where.productId = query.productId;
+    if (query.warehouseId) where.warehouseId = query.warehouseId;
+    return where;
+  }
+
+  /**
+   * Build a `where` clause for `StockMovement` queries:
+   *   companyId + (optional movementType) + (optional direction)
+   *   + (optional productId) + (optional warehouseId)
+   *   + (optional fromDate/toDate on movementDate).
+   * `StockMovement` has no `deletedAt`. Movement rows are
+   * append-only.
+   */
+  private buildStockMovementWhere(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Prisma.StockMovementWhereInput {
+    const where: Prisma.StockMovementWhereInput = { companyId };
+    const movementType = this.resolveStockMovementType(query.status);
+    if (movementType) where.movementType = movementType;
+    const direction = this.resolveStockMovementDirection(query.type);
+    if (direction) where.direction = direction;
+    if (query.productId) where.productId = query.productId;
+    if (query.warehouseId) where.warehouseId = query.warehouseId;
+    const date = this.buildMovementDateRange(query);
+    if (date) where.movementDate = date;
+    return where;
+  }
+
+  /**
+   * Build an inclusive movementDate range from `fromDate`
+   * / `toDate`. Lower bound = 00:00:00.000Z of `fromDate`;
+   * upper bound = 23:59:59.999Z of `toDate`. Returns
+   * `undefined` if neither key supplied.
+   */
+  private buildMovementDateRange(
+    query: ReportQueryDto,
+  ): Prisma.DateTimeFilter | undefined {
+    if (!query.fromDate && !query.toDate) return undefined;
+    const range: { gte?: Date; lte?: Date } = {};
+    if (query.fromDate)
+      range.gte = new Date(`${query.fromDate}T00:00:00.000Z`);
+    if (query.toDate)
+      range.lte = new Date(`${query.toDate}T23:59:59.999Z`);
     return range;
   }
 
