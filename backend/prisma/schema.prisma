@@ -47,6 +47,7 @@ model Company {
   accounts             Account[]
   journalEntries       JournalEntry[]
   journalEntryLines    JournalEntryLine[]
+  payments             Payment[]
 
   @@index([name])
   @@map("companies")
@@ -97,6 +98,9 @@ model User {
   journalEntriesUpdated     JournalEntry[]    @relation("JournalEntryUpdatedBy")
   journalEntriesPosted      JournalEntry[]    @relation("JournalEntryPostedBy")
   journalEntriesCancelled   JournalEntry[]    @relation("JournalEntryCancelledBy")
+  paymentsCreated           Payment[]         @relation("PaymentCreatedBy")
+  paymentsUpdated           Payment[]         @relation("PaymentUpdatedBy")
+  paymentsCancelled         Payment[]         @relation("PaymentCancelledBy")
 
   @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
@@ -418,6 +422,70 @@ enum PaymentMethod {
   OTHER
 }
 
+// =====================================================
+// Phase 10A: AR Payments + Settlement Tracking.
+// Phase 10A-B-1: schema + enums skeleton only.
+//   * NO settlement calculations (Phase 10A-B-2).
+//   * NO PAID / PARTIALLY_PAID status enum (deferred — T-2 lock).
+//   * NO AR-Aging source change (Phase 9 invariants preserved).
+//   * NO AP payments (Phase 10B, separate domain).
+//   * NO GL / bank reconciliation / drill-down statements.
+// One of salesInvoiceId / purchaseInvoiceId is required (CHECK
+// enforced in migration SQL) so 10B can drop in cleanly.
+// =====================================================
+
+enum PaymentInvoiceType {
+  SALES
+  PURCHASE
+}
+
+enum PaymentStatus {
+  POSTED
+  CANCELLED
+}
+
+model Payment {
+  id                String             @id @default(cuid())
+  companyId         String
+  paymentMethod     PaymentMethod
+  amount            Decimal            @db.Decimal(18, 4)
+  paidAt            DateTime           @default(now())
+  reference         String?
+  notes             String?
+  // Exactly one of these two FKs is populated. We do NOT FK
+  // invoiceId on a polymorphic column because Prisma cannot
+  // express polymorphic FK + CHECK in one declaration; the
+  // migration SQL adds a CHECK constraint to enforce the
+  // exactly-one invariant.
+  salesInvoiceId    String?
+  purchaseInvoiceId String?
+  invoiceType       PaymentInvoiceType
+  status            PaymentStatus      @default(POSTED)
+  idempotencyKey    String? // optional client-supplied key (Phase 10A-B-2)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  createdById       String?
+  updatedById       String?
+  cancelledAt       DateTime?
+  cancelledById     String?
+  deletedAt         DateTime? // soft delete (reversible)
+
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  salesInvoice    SalesInvoice?    @relation("PaymentSalesInvoice", fields: [salesInvoiceId], references: [id], onDelete: SetNull)
+  purchaseInvoice PurchaseInvoice? @relation("PaymentPurchaseInvoice", fields: [purchaseInvoiceId], references: [id], onDelete: SetNull)
+  createdBy       User?            @relation("PaymentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy       User?            @relation("PaymentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  cancelledBy     User?            @relation("PaymentCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  @@index([companyId, status])
+  @@index([companyId, paidAt])
+  @@index([companyId, deletedAt])
+  @@index([companyId, invoiceType])
+  @@index([salesInvoiceId])
+  @@index([purchaseInvoiceId])
+  @@map("payments")
+}
+
 model SalesInvoice {
   id            String             @id @default(cuid())
   companyId     String
@@ -451,7 +519,8 @@ model SalesInvoice {
   issuedBy    User?    @relation("SalesInvoiceIssuedBy", fields: [issuedById], references: [id], onDelete: SetNull)
   cancelledBy User?    @relation("SalesInvoiceCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
 
-  lines SalesInvoiceLine[]
+  lines    SalesInvoiceLine[]
+  payments Payment[]          @relation("PaymentSalesInvoice")
 
   @@unique([companyId, invoiceNumber])
   @@index([companyId, status])
@@ -534,7 +603,8 @@ model PurchaseInvoice {
   receivedBy  User?    @relation("PurchaseInvoiceReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
   cancelledBy User?    @relation("PurchaseInvoiceCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
 
-  lines PurchaseInvoiceLine[]
+  lines    PurchaseInvoiceLine[]
+  payments Payment[]             @relation("PaymentPurchaseInvoice")
 
   @@unique([companyId, invoiceNumber])
   @@index([companyId, status])

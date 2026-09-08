@@ -35,6 +35,7 @@ import { PosModule } from './pos/pos.module';
 import { PurchasesModule } from './purchases/purchases.module';
 import { AccountingModule } from './accounting/accounting.module';
 import { ReportsModule } from './reports/reports.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   imports: [
@@ -76,6 +77,12 @@ import { ReportsModule } from './reports/reports.module';
     // No ZATCA, no VAT, no TB/BS/P&L, no AR/AP, no payments,
     // no reconciliation, no automated posting, no PDF/Excel.
     ReportsModule,
+    // Phase 10A-B-1: AR Payments + Settlement Tracking.
+    //   * Skeleton controller + service only; real settlement
+    //     transactions land in 10A-B-2.
+    //   * RBAC: ar_payments.read (GET) / ar_payments.write (POST).
+    //   * JWT-only tenant scope (Phase 7B-1 contract).
+    PaymentsModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.
