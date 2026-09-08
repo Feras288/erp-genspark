@@ -1,15 +1,17 @@
 'use client';
 
 // =====================================================
-// Phase 7C — Reports page.
+// Phase 7C + Phase 8C-code — Reports page.
 //
-// Six sections, one per backend report endpoint:
+// Eight sections, one per backend report endpoint:
 //   1. sales-summary             (ملخص المبيعات)
 //   2. pos-summary               (ملخص نقاط البيع)
 //   3. purchases-summary         (ملخص المشتريات)
 //   4. inventory-summary         (ملخص المخزون)
 //   5. stock-movements-summary   (ملخص حركات المخزون)
 //   6. accounting-summary        (ملخص القيود المحاسبية)
+//   7. ar-summary                (ملخص الذمم المدينة)
+//   8. ap-summary                (ملخص الذمم الدائنة)
 //
 // RBAC: only users with `reports.read` may view the page;
 // users without it see "ليست لديك صلاحية عرض التقارير".
@@ -30,7 +32,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
 import { useAuth } from '@/lib/auth';
-import { api, ApiError } from '@/lib/api';
+import { api, ApiError, apiRequest } from '@/lib/api';
 import type {
   AccountingSummaryReport,
   InventorySummaryReport,
@@ -53,7 +55,9 @@ type SectionKey =
   | 'purchases'
   | 'inventory'
   | 'stock-movements'
-  | 'accounting';
+  | 'accounting'
+  | 'ar'
+  | 'ap';
 
 type SectionStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 
@@ -76,6 +80,8 @@ interface FilterFormState {
   paymentMethod: string;
   productId: string;
   warehouseId: string;
+  customerId: string;
+  supplierId: string;
 }
 
 function emptyFilters(): FilterFormState {
@@ -86,6 +92,8 @@ function emptyFilters(): FilterFormState {
     paymentMethod: '',
     productId: '',
     warehouseId: '',
+    customerId: '',
+    supplierId: '',
   };
 }
 
@@ -97,6 +105,8 @@ function filtersToQuery(f: FilterFormState): ReportQueryParams {
   if (f.paymentMethod) q.paymentMethod = f.paymentMethod;
   if (f.productId) q.productId = f.productId;
   if (f.warehouseId) q.warehouseId = f.warehouseId;
+  if (f.customerId) q.customerId = f.customerId;
+  if (f.supplierId) q.supplierId = f.supplierId;
   return q;
 }
 
@@ -772,6 +782,425 @@ function AccountingSection({ state }: { state: SectionState }) {
   );
 }
 
+// ---- AR/AP local types + URL builder (Phase 8C-code) -------------
+//
+// We define the AR/AP Report shapes locally rather than touching
+// `frontend/src/lib/api.ts`. The backend already exposes them as
+// READY responses under /reports/ar-summary and /reports/ap-summary,
+// and `apiRequest<T>()` is exported from `@/lib/api` so the loadOne
+// switch can call them directly with the same URL builder.
+
+interface ArStatusBreakdown {
+  status: 'DRAFT' | 'ISSUED' | 'CANCELLED';
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+}
+
+interface ArRecentInvoice {
+  id: string;
+  invoiceNumber: string;
+  status: 'DRAFT' | 'ISSUED' | 'CANCELLED';
+  issueDate: string;
+  customerId: string | null;
+  customerCode: string | null;
+  customerName: string | null;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+}
+
+interface ArSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+  currency: 'SAR';
+  dateField: 'issueDate';
+  statusFilter: 'DRAFT' | 'ISSUED' | 'CANCELLED';
+  byStatus: ArStatusBreakdown[];
+  recentInvoices: ArRecentInvoice[];
+}
+
+interface ArSummaryReport {
+  report: 'ar-summary';
+  status: 'READY';
+  companyId: string;
+  filters: {
+    fromDate: string | null;
+    toDate: string | null;
+    customerId: string | null;
+    status: string | null;
+  };
+  generatedAt: string;
+  data: ArSummaryData;
+}
+
+interface ApStatusBreakdown {
+  status: 'DRAFT' | 'RECEIVED' | 'CANCELLED';
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+}
+
+interface ApRecentInvoice {
+  id: string;
+  invoiceNumber: string;
+  status: 'DRAFT' | 'RECEIVED' | 'CANCELLED';
+  receivedAt: string;
+  supplierId: string | null;
+  supplierCode: string | null;
+  supplierName: string | null;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+}
+
+interface ApSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  currency: 'SAR';
+  dateField: 'receivedAt';
+  statusFilter: 'DRAFT' | 'RECEIVED' | 'CANCELLED';
+  byStatus: ApStatusBreakdown[];
+  recentInvoices: ApRecentInvoice[];
+}
+
+interface ApSummaryReport {
+  report: 'ap-summary';
+  status: 'READY';
+  companyId: string;
+  filters: {
+    fromDate: string | null;
+    toDate: string | null;
+    supplierId: string | null;
+    status: string | null;
+  };
+  generatedAt: string;
+  data: ApSummaryData;
+}
+
+// Local URL builder for /reports/* callers that go through
+// apiRequest<>() (ar-summary / ap-summary). Mirrors the non-exported
+// `buildReportQuery` in `frontend/src/lib/api.ts` exactly so we
+// keep the same query-string contract (companyId NEVER sent — JWT only).
+function buildReportQueryForReportEndpoint(
+  params: ReportQueryParams,
+): URLSearchParams {
+  const q = new URLSearchParams();
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  if (params.status) q.set('status', params.status);
+  if (params.type) q.set('type', params.type);
+  if (params.customerId) q.set('customerId', params.customerId);
+  if (params.supplierId) q.set('supplierId', params.supplierId);
+  if (params.productId) q.set('productId', params.productId);
+  if (params.warehouseId) q.set('warehouseId', params.warehouseId);
+  if (params.paymentMethod) q.set('paymentMethod', params.paymentMethod);
+  return q;
+}
+
+// ---- AR section renderer (Phase 8C-code) -------------------------
+//
+// Mirrors the Sales/POS/Purchases six-family pattern (Phase 7C).
+// Adds byStatus + recentInvoices tables because the AR/AP endpoints
+// return invoice-level aggregates — single-tile grid would hide
+// the per-invoice cut. Currency is propagated as "SAR" by the parent
+// JSX, matching the existing six sections.
+
+function ArSection({
+  state,
+  currency,
+}: {
+  state: SectionState;
+  currency: string;
+}) {
+  if (state.status === 'idle') {
+    return (
+      <SectionHeader title="ملخص الذمم المدينة (AR)" status="idle" generatedAt={null} />
+    );
+  }
+  if (state.status === 'loading') {
+    return (
+      <SectionHeader title="ملخص الذمم المدينة (AR)" status="loading" generatedAt={null} />
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <div>
+        <SectionHeader title="ملخص الذمم المدينة (AR)" status="error" generatedAt={null} />
+        <ErrorBanner message={`تعذّر تحميل التقرير: ${state.error}`} />
+      </div>
+    );
+  }
+  if (state.status === 'empty' || !state.body) {
+    return (
+      <SectionHeader title="ملخص الذمم المدينة (AR)" status="empty" generatedAt={null} />
+    );
+  }
+  const r = state.body as ArSummaryReport;
+  return (
+    <div>
+      <SectionHeader
+        title="ملخص الذمم المدينة (AR)"
+        status="ok"
+        generatedAt={r.generatedAt}
+      />
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-3">
+        <StatTile label="عدد الفواتير" value={fmtInt(r.data.invoiceCount)} />
+        <StatTile label="الإجمالي قبل الضريبة" value={`${fmtMoney(r.data.subtotal)} ${currency}`} />
+        <StatTile label="إجمالي الضريبة" value={`${fmtMoney(r.data.vatTotal)} ${currency}`} />
+        <StatTile label="إجمالي الخصم" value={`${fmtMoney(r.data.discountTotal)} ${currency}`} />
+        <StatTile label="الإجمالي شامل الضريبة" value={`${fmtMoney(r.data.total)} ${currency}`} />
+        <StatTile label="المدفوع" value={`${fmtMoney(r.data.paidAmount ?? null)} ${currency}`} />
+        <StatTile
+          label="فلتر الحالة"
+          value={AR_SALES_STATUS[r.data.statusFilter] ?? r.data.statusFilter}
+          dir="rtl"
+        />
+        <StatTile label="حقل التاريخ" value="تاريخ الإصدار" dir="rtl" />
+      </div>
+      <p className="text-[11px] text-slate-400 mb-3">
+        مرجع التاريخ: تاريخ الإصدار (`issueDate`).
+      </p>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1">
+        التوزيع حسب الحالة
+      </h3>
+      <div className="overflow-x-auto mb-4">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">الحالة</th>
+              <th className="text-start py-1 px-2">عدد</th>
+              <th className="text-start py-1 px-2">قبل الضريبة</th>
+              <th className="text-start py-1 px-2">الضريبة</th>
+              <th className="text-start py-1 px-2">الخصم</th>
+              <th className="text-start py-1 px-2">الإجمالي</th>
+              <th className="text-start py-1 px-2">المدفوع</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!r.data.byStatus || r.data.byStatus.length === 0 ? (
+              <EmptyRow cols={7} message="لا توجد فواتير في النطاق." />
+            ) : (
+              r.data.byStatus.map((b, i) => (
+                <tr key={i} className="border-b border-slate-100">
+                  <td className="py-1 px-2" dir="rtl">
+                    {AR_SALES_STATUS[b.status] ?? b.status}
+                  </td>
+                  <td className="py-1 px-2" dir="ltr">{fmtInt(b.invoiceCount)}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.subtotal)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.vatTotal)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.discountTotal)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.total)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.paidAmount ?? null)} {currency}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1 mt-2">
+        آخر الفواتير (حد أقصى 20)
+      </h3>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">الرقم</th>
+              <th className="text-start py-1 px-2">العميل</th>
+              <th className="text-start py-1 px-2">الحالة</th>
+              <th className="text-start py-1 px-2">تاريخ الإصدار</th>
+              <th className="text-start py-1 px-2">الإجمالي</th>
+              <th className="text-start py-1 px-2">المدفوع</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!r.data.recentInvoices || r.data.recentInvoices.length === 0 ? (
+              <EmptyRow cols={6} message="لا توجد فواتير حديثة." />
+            ) : (
+              r.data.recentInvoices.slice(0, 20).map((inv) => (
+                <tr key={inv.id} className="border-b border-slate-100">
+                  <td className="py-1 px-2 font-mono" dir="ltr">{inv.invoiceNumber}</td>
+                  <td className="py-1 px-2" dir="rtl">
+                    <div>{inv.customerName ?? '—'}</div>
+                    {inv.customerCode && (
+                      <div className="text-[10px] text-slate-500" dir="ltr">{inv.customerCode}</div>
+                    )}
+                  </td>
+                  <td className="py-1 px-2" dir="rtl">
+                    {AR_SALES_STATUS[inv.status] ?? inv.status}
+                  </td>
+                  <td className="py-1 px-2" dir="ltr">{fmtDate(inv.issueDate)}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(inv.total)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(inv.paidAmount ?? null)} {currency}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ---- AP section renderer (Phase 8C-code) -------------------------
+//
+// Same per-family pattern as AR but pure-purchases-side:
+//   - AR_PURCHASE_STATUS for status dropdown
+//   - receivedAt as canonical date (NOT issueDate)
+//   - byStatus cols=6 (no paidAmount column)
+//   - recentInvoices cols=5 (no paidAmount column)
+
+function ApSection({
+  state,
+  currency,
+}: {
+  state: SectionState;
+  currency: string;
+}) {
+  if (state.status === 'idle') {
+    return (
+      <SectionHeader title="ملخص الذمم الدائنة (AP)" status="idle" generatedAt={null} />
+    );
+  }
+  if (state.status === 'loading') {
+    return (
+      <SectionHeader title="ملخص الذمم الدائنة (AP)" status="loading" generatedAt={null} />
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <div>
+        <SectionHeader title="ملخص الذمم الدائنة (AP)" status="error" generatedAt={null} />
+        <ErrorBanner message={`تعذّر تحميل التقرير: ${state.error}`} />
+      </div>
+    );
+  }
+  if (state.status === 'empty' || !state.body) {
+    return (
+      <SectionHeader title="ملخص الذمم الدائنة (AP)" status="empty" generatedAt={null} />
+    );
+  }
+  const r = state.body as ApSummaryReport;
+  return (
+    <div>
+      <SectionHeader
+        title="ملخص الذمم الدائنة (AP)"
+        status="ok"
+        generatedAt={r.generatedAt}
+      />
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-3">
+        <StatTile label="عدد الفواتير" value={fmtInt(r.data.invoiceCount)} />
+        <StatTile label="الإجمالي قبل الضريبة" value={`${fmtMoney(r.data.subtotal)} ${currency}`} />
+        <StatTile label="إجمالي الضريبة" value={`${fmtMoney(r.data.vatTotal)} ${currency}`} />
+        <StatTile label="إجمالي الخصم" value={`${fmtMoney(r.data.discountTotal)} ${currency}`} />
+        <StatTile label="الإجمالي شامل الضريبة" value={`${fmtMoney(r.data.total)} ${currency}`} />
+        <StatTile
+          label="فلتر الحالة"
+          value={AR_PURCHASE_STATUS[r.data.statusFilter] ?? r.data.statusFilter}
+          dir="rtl"
+        />
+        <StatTile label="حقل التاريخ" value="تاريخ الاستلام" dir="rtl" />
+      </div>
+      <p className="text-[11px] text-slate-400 mb-3">
+        مرجع التاريخ: تاريخ الاستلام (`receivedAt`). لا `paidAmount` —
+        بنية فاتورة الشراء في الـ backend لا تحوي عمود دفع.
+      </p>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1">
+        التوزيع حسب الحالة
+      </h3>
+      <div className="overflow-x-auto mb-4">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">الحالة</th>
+              <th className="text-start py-1 px-2">عدد</th>
+              <th className="text-start py-1 px-2">قبل الضريبة</th>
+              <th className="text-start py-1 px-2">الضريبة</th>
+              <th className="text-start py-1 px-2">الخصم</th>
+              <th className="text-start py-1 px-2">الإجمالي</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!r.data.byStatus || r.data.byStatus.length === 0 ? (
+              <EmptyRow cols={6} message="لا توجد فواتير في النطاق." />
+            ) : (
+              r.data.byStatus.map((b, i) => (
+                <tr key={i} className="border-b border-slate-100">
+                  <td className="py-1 px-2" dir="rtl">
+                    {AR_PURCHASE_STATUS[b.status] ?? b.status}
+                  </td>
+                  <td className="py-1 px-2" dir="ltr">{fmtInt(b.invoiceCount)}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.subtotal)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.vatTotal)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.discountTotal)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(b.total)} {currency}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1 mt-2">
+        آخر الفواتير (حد أقصى 20)
+      </h3>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">الرقم</th>
+              <th className="text-start py-1 px-2">المورّد</th>
+              <th className="text-start py-1 px-2">الحالة</th>
+              <th className="text-start py-1 px-2">تاريخ الاستلام</th>
+              <th className="text-start py-1 px-2">الإجمالي</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!r.data.recentInvoices || r.data.recentInvoices.length === 0 ? (
+              <EmptyRow cols={5} message="لا توجد فواتير حديثة." />
+            ) : (
+              r.data.recentInvoices.slice(0, 20).map((inv) => (
+                <tr key={inv.id} className="border-b border-slate-100">
+                  <td className="py-1 px-2 font-mono" dir="ltr">{inv.invoiceNumber}</td>
+                  <td className="py-1 px-2" dir="rtl">
+                    <div>{inv.supplierName ?? '—'}</div>
+                    {inv.supplierCode && (
+                      <div className="text-[10px] text-slate-500" dir="ltr">{inv.supplierCode}</div>
+                    )}
+                  </td>
+                  <td className="py-1 px-2" dir="rtl">
+                    {AR_PURCHASE_STATUS[inv.status] ?? inv.status}
+                  </td>
+                  <td className="py-1 px-2" dir="ltr">{fmtDate(inv.receivedAt)}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(inv.total)} {currency}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 // ---- Main component ---------------------------------------------
 
 export default function ReportsPage() {
@@ -788,6 +1217,8 @@ export default function ReportsPage() {
     inventory: emptySectionState(),
     'stock-movements': emptySectionState(),
     accounting: emptySectionState(),
+    ar: emptySectionState(),
+    ap: emptySectionState(),
   });
 
   // ---- Filters ---------------------------------------------------
@@ -834,6 +1265,20 @@ export default function ReportsPage() {
           case 'accounting':
             body = (await api.accountingSummary(q)).data;
             break;
+          case 'ar':
+            body = (
+              await apiRequest<ArSummaryReport>(
+                `/reports/ar-summary?${buildReportQueryForReportEndpoint(q).toString()}`,
+              )
+            ).data;
+            break;
+          case 'ap':
+            body = (
+              await apiRequest<ApSummaryReport>(
+                `/reports/ap-summary?${buildReportQueryForReportEndpoint(q).toString()}`,
+              )
+            ).data;
+            break;
         }
         setSection({ status: 'ok', error: null, body });
       } catch (e) {
@@ -852,7 +1297,7 @@ export default function ReportsPage() {
   const reloadAll = useCallback(async () => {
     if (!canRead) return;
     await Promise.all(
-      (['sales', 'pos', 'purchases', 'inventory', 'stock-movements', 'accounting'] as SectionKey[]).map(
+      (['sales', 'pos', 'purchases', 'inventory', 'stock-movements', 'accounting', 'ar', 'ap'] as SectionKey[]).map(
         (k) => loadOne(k),
       ),
     );
@@ -1034,6 +1479,26 @@ export default function ReportsPage() {
                 dir="ltr"
               />
             </label>
+            <label className="text-xs text-slate-600">
+              معرّف العميل — AR (اختياري)
+              <input
+                value={filters.customerId}
+                onChange={(e) => setFilterField('customerId', e.target.value)}
+                placeholder="customerId"
+                className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                dir="ltr"
+              />
+            </label>
+            <label className="text-xs text-slate-600">
+              معرّف المورّد — AP (اختياري)
+              <input
+                value={filters.supplierId}
+                onChange={(e) => setFilterField('supplierId', e.target.value)}
+                placeholder="supplierId"
+                className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                dir="ltr"
+              />
+            </label>
           </div>
 
           <div className="flex gap-2 flex-wrap">
@@ -1073,6 +1538,14 @@ export default function ReportsPage() {
 
         <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
           <InventorySection state={sections.inventory} />
+        </section>
+
+        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+          <ArSection state={sections.ar} currency="SAR" />
+        </section>
+
+        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+          <ApSection state={sections.ap} currency="SAR" />
         </section>
 
         <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">
