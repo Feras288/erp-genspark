@@ -97,6 +97,11 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
     // Mirrors the prior AR/AP entries: included in the
     // 401/403/200 loops and the query-filter smoke.
     { path: 'reports/ar-aging', report: 'ar-aging' },
+    // Phase 9E-B-3 addition: AP aging READY (Phase 9E-B-2).
+    // Same wiring as AR aging — picked up by the 401 /
+    // 403 / 200 loops below and by the fromDate/toDate
+    // query filter smoke in `it('5)`.
+    { path: 'reports/ap-aging', report: 'ap-aging' },
   ];
 
   beforeAll(async () => {
@@ -514,6 +519,110 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
     }
   });
 
+  // Phase 9E-B-3: AP aging contract shape. Mirrors the
+  // AR aging block above (4i). Differences:
+  //   * `filters.status` echoes 'RECEIVED' (the D4
+  //     hard-lock — service.ts) regardless of any
+  //     query.status override.
+  //   * `data.dateField` is 'receivedAt' (not 'dueDate'
+  //     — AP uses the canonical PurchaseInvoice column
+  //     for aging).
+  //   * `data.statusFilter` is 'RECEIVED'.
+  //   * The per-row breakdown is `bySupplier.rows` (not
+  //     `byCustomer.rows`) — PurchaseInvoice has no
+  //     `customerId`.
+  //   * Per-supplier rows have no `paid` column —
+  //     `PurchaseInvoice.paidAmount` does not exist on
+  //     the schema (schema.prisma lines 507-545), so
+  //     `outstanding = total` always and the `paid`
+  //     field would carry no information.
+  it('4j) ap-aging data (Phase 9E-B-3) has the AP aging contract shape', async () => {
+    const res = await adminAgent.get(`${API_PREFIX}/reports/ap-aging`);
+    expect(res.status).toBe(200);
+    const body = res.body as ReadyBody;
+    expect(body.report).toBe('ap-aging');
+    expect(body.status).toBe('READY');
+    expect(body.companyId).toBeDefined();
+    expect(typeof body.companyId).toBe('string');
+    expect(typeof body.generatedAt).toBe('string');
+    expect(body.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    // filters: shape + D4 echo (RECEIVED)
+    const filters = body.filters as Record<string, unknown>;
+    expect(filters).toBeDefined();
+    expect(filters['status']).toBe('RECEIVED');
+    expect(typeof filters['asOfDate']).toBe('string');
+    expect(filters['asOfDate'] as string).toMatch(
+      /^\d{4}-\d{2}-\d{2}T/,
+    );
+
+    const data = body.data as Record<string, unknown>;
+
+    // 1. data top-level keys match the 9E-B-2 contract
+    for (const k of [
+      'currency',
+      'dateField',
+      'statusFilter',
+      'buckets',
+      'totals',
+      'bySupplier',
+    ]) {
+      expect(data).toHaveProperty(k);
+    }
+    expect(data['currency']).toBe('SAR');
+    expect(data['dateField']).toBe('receivedAt');
+    expect(data['statusFilter']).toBe('RECEIVED');
+
+    // 2. buckets: exactly 5 keys, all in the canonical
+    //    bucket ring (matches the AR-side bucket keys
+    //    1:1; service.ts `computeApAgingBucket` uses
+    //    the same 5-key classification).
+    const buckets = data['buckets'] as Record<string, unknown>;
+    expect(buckets).toBeDefined();
+    expect(typeof buckets).toBe('object');
+    expect(Array.isArray(buckets)).toBe(false);
+    const bucketKeys = Object.keys(buckets).sort();
+    expect(bucketKeys).toEqual(['+90', '1-30', '31-60', '61-90', 'current']);
+    for (const k of bucketKeys) {
+      expect(buckets[k]).toBeDefined();
+      const b = buckets[k] as Record<string, unknown>;
+      expect(typeof b['invoiceCount']).toBe('number');
+      expect(typeof b['outstanding']).toBe('string');
+    }
+
+    // 3. totals: shape only (no numeric asserts — seed
+    //    has no AP aging fixtures).
+    const totals = data['totals'] as Record<string, unknown>;
+    expect(totals).toBeDefined();
+    expect(typeof totals['invoiceCount']).toBe('number');
+    expect(typeof totals['outstanding']).toBe('string');
+
+    // 4. bySupplier: rows array only (no top/otherCount,
+    //    no per-row numeric asserts). Each row carries
+    //    supplierId/supplierCode/supplierName labels,
+    //    total + outstanding aggregations, and the
+    //    per-bucket matrix. NO `paid` column (AP has
+    //    no schema-level paidAmount; see comment above).
+    const bySupplier = data['bySupplier'] as Record<string, unknown>;
+    expect(bySupplier).toBeDefined();
+    expect(Array.isArray(bySupplier['rows'])).toBe(true);
+    const rows = bySupplier['rows'] as Array<Record<string, unknown>>;
+    // No deterministic count assertion — empty seed is
+    // acceptable as long as the array exists.
+    for (const row of rows) {
+      for (const col of [
+        'supplierId',
+        'supplierCode',
+        'supplierName',
+        'total',
+        'outstanding',
+        'buckets',
+      ]) {
+        expect(row).toHaveProperty(col);
+      }
+    }
+  });
+
   // ---- 5. Query filter smoke: shape preserved on filters ----
   it('5) query filters are accepted and preserve 200 + READY + shape', async () => {
     const calls: Array<Promise<request.Response>> = [
@@ -569,6 +678,21 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
       // of any query override (D4 from 9B-1/9B-2).
       adminAgent
         .get(`${API_PREFIX}/reports/ar-aging`)
+        .query({
+          fromDate: '2026-01-01',
+          toDate: '2026-12-31',
+        }),
+      // Phase 9E-B-3 addition: AP aging query smoke.
+      // The fromDate/toDate pair hits the 3-leg OR-grouped
+      // `(receivedAt ∈ range) OR (receivedAt IS NULL AND
+      // dueDate ∈ range) OR (receivedAt IS NULL AND
+      // dueDate IS NULL AND purchaseDate ∈ range)` filter
+      // in service.ts. Not passing `status` here is
+      // intentional: the service hard-locks status to
+      // RECEIVED regardless of any query override (D4
+      // from 9E-B-1/9E-B-2).
+      adminAgent
+        .get(`${API_PREFIX}/reports/ap-aging`)
         .query({
           fromDate: '2026-01-01',
           toDate: '2026-12-31',
