@@ -140,4 +140,25 @@ export class ReportsController {
   ) {
     return this.svc.apSummary(me.companyId, q);
   }
+
+  // ===== AR Aging (Phase 9B-1 skeleton) =====
+  //
+  //   * Skeleton only: backend returns `status: 'PLANNED'`,
+  //     `data: null`. No bucket math, no per-customer
+  //     breakdown, no outstanding formula — all 9B-2.
+  //   * Same RBAC as the other 8 endpoints: `reports.read`.
+  //   * Tenant isolation unchanged: companyId comes from
+  //     JWT via @CurrentUser(); never from query / body.
+  //   * Endpoint shape (5 buckets + top-50 byCustomer +
+  //     `_other` aggregator) is documented in Phase 9A
+  //     plan §4 and locked by `ArAgingResponseOrPlanned`.
+
+  @Get('ar-aging')
+  @RequirePermissions('reports.read')
+  arAging(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() q: ReportQueryDto,
+  ) {
+    return this.svc.arAging(me.companyId, q);
+  }
 }

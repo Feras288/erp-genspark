@@ -54,6 +54,16 @@
 //         - AR/AP ledger sub-accounts
 //         - per-customer / per-supplier balance breakdown
 //
+//   Phase 9B-1 (this commit — AR aging skeleton):
+//     * `arAging` added as PLANNED skeleton only.
+//       No Prisma calls. The method body returns
+//       `status: 'PLANNED'`, `data: null`. Real
+//       bucket math (current / 1-30 / 31-60 / 61-90 / +90)
+//       and per-customer breakdown land in Phase 9B-2
+//       inside the same method body. Response shape
+//       `ArAgingResponse` (READY leg) and union
+//       `ArAgingResponseOrPlanned` are already locked.
+//
 // RULES (enforced everywhere):
 //   - All money totals returned as strings — never
 //     `Number()`. `Prisma.Decimal` serialised via
@@ -142,6 +152,89 @@ export interface ApSummaryFilters {
   supplierId: string | null;
   status: string | null;
 }
+
+// ---- AR Aging response types (Phase 9B-1) -------------------------
+//
+//   Bucket key ring matches the 9B-2 calculation:
+//     'current' = daysPastDue <= 0
+//     '1-30'    = 1 <= daysPastDue <= 30
+//     '31-60'   = 31 <= daysPastDue <= 60
+//     '61-90'   = 61 <= daysPastDue <= 90
+//     '+90'     = 91 <= daysPastDue (treated as +infinity)
+//   per-customer breakdown lands in 9B-2.
+// --------------------------------------------------------------------
+export type ArAgingBucketKey =
+  | 'current'
+  | '1-30'
+  | '31-60'
+  | '61-90'
+  | '+90';
+
+export interface ArAgingFilters {
+  fromDate: string | null;
+  toDate: string | null;
+  customerId: string | null;
+  status: string | null;
+  asOfDate: string;
+}
+
+export interface ArAgingBucketCounts {
+  invoiceCount: number;
+}
+
+export interface ArAgingBucketOutstanding {
+  outstanding: string;
+}
+
+export interface ArAgingBucket
+  extends ArAgingBucketCounts,
+    ArAgingBucketOutstanding {}
+
+export interface ArAgingCustomerRow {
+  customerId: string;
+  customerCode: string | null;
+  customerName: string | null;
+  total: string;
+  paid: string;
+  outstanding: string;
+  buckets: Record<ArAgingBucketKey, ArAgingBucket>;
+}
+
+export interface ArAgingByCustomer {
+  rows: ArAgingCustomerRow[];
+}
+
+export interface ArAgingData {
+  currency: 'SAR';
+  dateField: 'dueDate';
+  statusFilter: 'ISSUED';
+  buckets: Record<ArAgingBucketKey, ArAgingBucket>;
+  totals: Omit<ArAgingBucket, 'invoiceCount'> & {
+    invoiceCount: number;
+  };
+  byCustomer: ArAgingByCustomer;
+}
+
+export type ArAgingResponse = Omit<ReadyResponse<ArAgingData>, 'filters'> & {
+  filters: ArAgingFilters;
+};
+
+// 'PLANNED' leg for the 9B-1 skeleton. 9B-2 replaces the
+// branch entry by re-typing this as
+//   ArAgingResponse | ArAgingPlannedResponse
+// once the buckets are filled.
+export interface ArAgingPlannedResponse {
+  report: 'ar-aging';
+  status: 'PLANNED';
+  companyId: string;
+  filters: ArAgingFilters;
+  generatedAt: string;
+  data: null;
+}
+
+export type ArAgingResponseOrPlanned =
+  | ArAgingResponse
+  | ArAgingPlannedResponse;
 
 // ---- AR data shapes (Phase 8B-2) ----------------------------------
 //   Backed by SalesInvoice — invoice-level aggregates + status
@@ -1668,6 +1761,52 @@ export class ReportsService {
       },
       generatedAt: new Date().toISOString(),
       data,
+    };
+  }
+
+  /**
+   * AR Aging (Phase 9B-1 skeleton).
+   *
+   *   Returns PLANNED only (data: null). Real bucket math
+   *   and per-customer breakdown land in 9B-2 inside the
+   *   same method body. The response shape is already
+   *   locked by `ArAgingResponse` (READY leg) and
+   *   `ArAgingResponseOrPlanned` (READY | PLANNED leg).
+   *   The 9B-1 skeleton uses the PLANNED leg only.
+   *
+   *   Filter contract (ArAgingFilters):
+   *     - fromDate / toDate → "dueDate in [fromDate, toDate]"
+   *       (9B-2 falls back to issueDate per-row when
+   *       dueDate IS NULL; skeleton keeps the surface
+   *       narrow).
+   *     - customerId → "SalesInvoice.customerId = customerId".
+   *     - status    → forced to ISSUED (D4 locks this).
+   *     - asOfDate  → echoed in filters; 9B-2 fills with
+   *                   new Date().toISOString() at every call.
+   *
+   *   Tenant isolation: companyId comes from the controller
+   *   JWT parameter, never from the body or query. The DTO
+   *   ReportQueryDto does not expose companyId (verified in
+   *   Phase 7B-1); CurrentUser() is the single source of
+   *   truth.
+   */
+  async arAging(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Promise<ArAgingResponseOrPlanned> {
+    return {
+      report: 'ar-aging',
+      status: 'PLANNED',
+      companyId,
+      filters: {
+        fromDate: query.fromDate ?? null,
+        toDate: query.toDate ?? null,
+        customerId: query.customerId ?? null,
+        status: 'ISSUED',
+        asOfDate: '', // 9B-2 fills with new Date().toISOString()
+      },
+      generatedAt: new Date().toISOString(),
+      data: null,
     };
   }
 
