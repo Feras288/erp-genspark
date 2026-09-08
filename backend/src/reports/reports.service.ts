@@ -93,7 +93,7 @@
 //     entirely to PostgreSQL via Prisma.
 //   - No mock / demo data on any branch.
 // =====================================================
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import {
   Prisma,
   JournalEntryStatus,
@@ -116,7 +116,8 @@ export type ReportName =
   | 'stock-movements-summary'
   | 'accounting-summary'
   | 'ar-summary'
-  | 'ap-summary';
+  | 'ap-summary'
+  | 'ar-aging';
 
 export interface PlannedReportResponse {
   report: ReportName;
@@ -1765,48 +1766,463 @@ export class ReportsService {
   }
 
   /**
-   * AR Aging (Phase 9B-1 skeleton).
+   * AR Aging (Phase 9B-2 — implemented).
    *
-   *   Returns PLANNED only (data: null). Real bucket math
-   *   and per-customer breakdown land in 9B-2 inside the
-   *   same method body. The response shape is already
-   *   locked by `ArAgingResponse` (READY leg) and
-   *   `ArAgingResponseOrPlanned` (READY | PLANNED leg).
-   *   The 9B-1 skeleton uses the PLANNED leg only.
+   *   Source: SalesInvoice.
+   *   Scope : companyId + deletedAt:null + status:'ISSUED'
+   *           + (optional customerId) +
+   *             (optional fromDate/toDate → dueDate range
+   *              with per-row fallback to issueDate when
+   *              dueDate IS NULL).
+   *   Status: hard-locked to ISSUED. The caller cannot pass
+   *           query.status to override it (the field is
+   *           intentionally ignored here). Final
+   *           filters.status is always 'ISSUED'. This locks
+   *           D4 from Phase 9B-1.
+   *   Math in JS/TS using Prisma.Decimal — no raw SQL and
+   *     no Prisma `$queryRaw`. Decimal-as-string is preserved
+   *     across the JSON boundary (`.toFixed(4)`, matches the
+   *     Phase 4B-2 sales-side convention).
    *
-   *   Filter contract (ArAgingFilters):
-   *     - fromDate / toDate → "dueDate in [fromDate, toDate]"
-   *       (9B-2 falls back to issueDate per-row when
-   *       dueDate IS NULL; skeleton keeps the surface
-   *       narrow).
-   *     - customerId → "SalesInvoice.customerId = customerId".
-   *     - status    → forced to ISSUED (D4 locks this).
-   *     - asOfDate  → echoed in filters; 9B-2 fills with
-   *                   new Date().toISOString() at every call.
+   *   Buckets (5):
+   *     'current' : daysPastDue <= 0
+   *     '1-30'    : 1 <= daysPastDue <= 30
+   *     '31-60'   : 31 <= daysPastDue <= 60
+   *     '61-90'   : 61 <= daysPastDue <= 90
+   *     '+90'     : 91 <= daysPastDue (covers +infinity)
+   *
+   *   Aging date: dueDate per row; falls back to issueDate
+   *   when dueDate IS NULL. Both date columns are nullable
+   *   on SalesInvoice per schema.prisma (verified Phase 9B-1).
+   *   ROWS with BOTH dates NULL are excluded silently (no
+   *   date → no bucket → not an open receivable).
+   *
+   *   Outstanding = max(0, total - paidAmount). paidAmount
+   *   NULL is treated as 0. Rows with outstanding <= 0 are
+   *   excluded from buckets / counts / totals so cancelled-
+   *   paid and fully-settled invoices do not pollute the
+   *   aging grid.
+   *
+   *   Safety: take = 5001 (limit + sentinel). If the
+   *   underlying invoice set exceeds 5000 rows, this method
+   *   throws BadRequestException with a clear message
+   *   asking the caller to narrow the date/customer filter.
+   *   No partial numbers are returned in that case.
    *
    *   Tenant isolation: companyId comes from the controller
    *   JWT parameter, never from the body or query. The DTO
    *   ReportQueryDto does not expose companyId (verified in
    *   Phase 7B-1); CurrentUser() is the single source of
    *   truth.
+   *
+   *   Out of scope (still future): AP aging, payments /
+   *   receipts / settlements, bank reconciliation, AR/AP
+   *   ledger sub-accounts, GL/VAT integration, frontend /
+   *   UI / README / schema / e2e / RBAC changes (this
+   *   commit touches only this method body + class
+   *   imports).
    */
+  private static readonly AR_AGING_TAKE_LIMIT = 5000;
+  private static readonly AR_AGING_BUCKET_KEYS: ReadonlyArray<
+    'current' | '1-30' | '31-60' | '61-90' | '+90'
+  > = ['current', '1-30', '31-60', '61-90', '+90'];
+
+  /**
+   * Build the `where` clause for `arAging`. Mirrors the
+   * Phase 8B-2 pattern but hard-locks `status: ISSUED` and
+   * composes an OR-group on the date filter so that
+   *   dueDate-in-range rows + dueDate-NULL rows where
+   *   issueDate-in-range both pass.
+   */
+  private buildArAgingWhere(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Prisma.SalesInvoiceWhereInput {
+    const where: Prisma.SalesInvoiceWhereInput = {
+      companyId,
+      deletedAt: null,
+      status: SalesInvoiceStatus.ISSUED, // hard-locked (D4)
+    };
+
+    if (query.customerId) {
+      where.customerId = query.customerId;
+    }
+
+    const date = this.buildIssueDateRange(query);
+    if (date) {
+      // Two-leg date filter, no raw SQL:
+      //   (a) dueDate ∈ [fromDate, toDate]
+      //   (b) dueDate IS NULL AND issueDate ∈ [fromDate, toDate]
+      // Anything still NULL on both columns after that is
+      // excluded (no aging date → no bucket).
+      where.OR = [
+        { dueDate: date },
+        { dueDate: null, issueDate: date },
+      ];
+    }
+
+    return where;
+  }
+
+  /**
+   * Resolve the per-row aging date (dueDate preferred;
+   * issueDate fallback). Both nullable — returns null if
+   * both are null and the caller is expected to skip.
+   */
+  private effectiveAgingDate(row: {
+    dueDate: Date | null;
+    issueDate: Date | null;
+  }): Date | null {
+    return row.dueDate ?? row.issueDate;
+  }
+
+  /**
+   * Map a row's `daysPastDue` to one of the 5 bucket keys.
+   * Returns null when the row is outside any bucket
+   * (shouldn't happen on the condtion
+   * `daysPastDue = Math.floor((asOf − agingDate)/86_400_000)`
+   * but kept defensive).
+   *
+   *   daysPastDue <= 0                       → 'current'
+   *   1  <= daysPastDue <= 30                → '1-30'
+   *   31 <= daysPastDue <= 60                → '31-60'
+   *   61 <= daysPastDue <= 90                → '61-90'
+   *   91 <= daysPastDue                      → '+90'
+   */
+  private computeAgingBucket(daysPastDue: number): ArAgingBucketKey | null {
+    if (daysPastDue <= 0) return 'current';
+    if (daysPastDue <= 30) return '1-30';
+    if (daysPastDue <= 60) return '31-60';
+    if (daysPastDue <= 90) return '61-90';
+    return '+90';
+  }
+
+  /**
+   * Compute `outstanding = max(0, total - paidAmount)`.
+   * paidAmount NULL is treated as 0. Both inputs are
+   * Prisma.Decimal; the result is a Decimal whose
+   * `.toFixed(4)` matches the JSON-boundary contract.
+   */
+  private safeOutstanding(
+    total: Prisma.Decimal,
+    paidAmount: Prisma.Decimal | null,
+  ): Prisma.Decimal {
+    const paid =
+      paidAmount === null || paidAmount === undefined
+        ? new Prisma.Decimal(0)
+        : paidAmount;
+    const diff = total.minus(paid);
+    return diff.lessThan(new Prisma.Decimal(0))
+      ? new Prisma.Decimal(0)
+      : diff;
+  }
+
   async arAging(
     companyId: string,
     query: ReportQueryDto,
-  ): Promise<ArAgingResponseOrPlanned> {
+  ): Promise<ArAgingResponse> {
+    // 1. asOfDate — server-computed (matches 9B-1 contract).
+    const asOf = new Date();
+    const asOfDate = asOf.toISOString();
+
+    // 2. Compose the WHERE clause (status hard-locked,
+    //    OR-grouped date filter on dueDate / issueDate).
+    const where = this.buildArAgingWhere(companyId, query);
+
+    // 3. Single findMany with a tight select + customer
+    //    include (code + name). take = 5001 acts as a
+    //    safety sentinel (see step 5 below).
+    const rows = await this.prisma.salesInvoice.findMany({
+      where,
+      orderBy: [
+        { issueDate: 'desc' },
+        { createdAt: 'desc' },
+      ],
+      take: ReportsService.AR_AGING_TAKE_LIMIT + 1,
+      select: {
+        id: true,
+        invoiceNumber: true,
+        issueDate: true,
+        dueDate: true,
+        paidAmount: true,
+        total: true,
+        customerId: true,
+        customer: { select: { code: true, name: true } },
+      },
+    });
+
+    // 4. Safety sentinel. If we hit 5001, the underlying
+    //    invoice set is too large for the in-process
+    //    bucket accumulation (we already said no raw SQL).
+    //    Fail loudly rather than return truncated numbers.
+    if (rows.length > ReportsService.AR_AGING_TAKE_LIMIT) {
+      throw new BadRequestException(
+        `ar-aging invoice set exceeded ${ReportsService.AR_AGING_TAKE_LIMIT} rows; ` +
+          'narrow the date range or supply a customerId filter. ' +
+          'A raw-SQL/fact-table pass is left for Phase 9B-3+.',
+      );
+    }
+
+    // 5. JS bucket accumulator. three layers:
+    //    (a) per-bucket totals { outstanding Decimal, invoiceCount }
+    //    (b) per-customer × per-bucket matrix
+    //    (c) per-customer totals (total / paid / outstanding)
+    //
+    //    Decimal registry seeded at zero; arithmetic stays
+    //    in Prisma.Decimal end-to-end (no float math).
+    const ZERO = new Prisma.Decimal(0);
+    const bucketSeeds = (): {
+      outstanding: Prisma.Decimal;
+      invoiceCount: number;
+    } => ({ outstanding: ZERO, invoiceCount: 0 });
+
+    const buckets: Record<
+      ArAgingBucketKey,
+      { outstanding: Prisma.Decimal; invoiceCount: number }
+    > = {
+      current: bucketSeeds(),
+      '1-30': bucketSeeds(),
+      '31-60': bucketSeeds(),
+      '61-90': bucketSeeds(),
+      '+90': bucketSeeds(),
+    };
+
+    type CustKey = string; // SalesInvoice.customerId
+    type CustAcc = {
+      customerId: CustKey;
+      customerCode: string | null;
+      customerName: string | null;
+      total: Prisma.Decimal;
+      paid: Prisma.Decimal;
+      outstanding: Prisma.Decimal;
+      invoiceCount: number;
+      buckets: Record<ArAgingBucketKey, {
+        outstanding: Prisma.Decimal;
+        invoiceCount: number;
+      }>;
+    };
+    const custAcc = new Map<CustKey, CustAcc>();
+    const custSeeds = (
+      cid: CustKey,
+      code: string | null,
+      name: string | null,
+    ): CustAcc => ({
+      customerId: cid,
+      customerCode: code,
+      customerName: name,
+      total: ZERO,
+      paid: ZERO,
+      outstanding: ZERO,
+      invoiceCount: 0,
+      buckets: {
+        current: bucketSeeds(),
+        '1-30': bucketSeeds(),
+        '31-60': bucketSeeds(),
+        '61-90': bucketSeeds(),
+        '+90': bucketSeeds(),
+      },
+    });
+
+    let grandTotal = ZERO;
+    let grandPaid = ZERO;
+    let grandOutstanding = ZERO;
+    let grandInvoiceCount = 0;
+
+    for (const row of rows) {
+      // 5a. Aging date (dueDate preferred; issueDate fallback).
+      const agingDate = this.effectiveAgingDate(row);
+      if (agingDate === null) {
+        // Both date columns null → cannot bucket. Skip
+        // silently (no aging date invented).
+        continue;
+      }
+
+      // 5b. daysPastDue = floor((asOf − agingDate) / 86_400_000ms).
+      //     floor collapses sub-day precision to whole days;
+      //     milliseconds are exactly representable as Number
+      //     here (safe across the 100k-year JS range we use).
+      const daysPastDue = Math.floor(
+        (asOf.getTime() - agingDate.getTime()) / 86_400_000,
+      );
+
+      const bucketKey = this.computeAgingBucket(daysPastDue);
+      if (bucketKey === null) continue;
+
+      // 5c. Outstanding calculus. total is non-null per the
+      //     schema (`@default(0)`); paidAmount is nullable.
+      const outstandingDecimal = this.safeOutstanding(
+        row.total,
+        row.paidAmount,
+      );
+
+      // Rows fully paid (outstanding <= 0) drop out of the
+      // aging grid entirely.
+      if (outstandingDecimal.lessThanOrEqualTo(ZERO)) {
+        continue;
+      }
+
+      // 5d. Bucket-level accumulation (Decimal column-wise).
+      buckets[bucketKey].outstanding = buckets[bucketKey].outstanding.plus(
+        outstandingDecimal,
+      );
+      buckets[bucketKey].invoiceCount += 1;
+
+      // 5e. Customer-level accumulation. Rows with
+      //     customerId=null are grouped under a synthetic
+      //     key '__no_customer__' so that the per-customer
+      //     breakdown still surfaces them as one row.
+      const custId = row.customerId ?? '__no_customer__';
+      let acc = custAcc.get(custId);
+      if (!acc) {
+        acc = custSeeds(
+          custId,
+          row.customer?.code ?? null,
+          row.customer?.name ?? null,
+        );
+        custAcc.set(custId, acc);
+      }
+      acc.total = acc.total.plus(row.total);
+      const paid =
+        row.paidAmount === null || row.paidAmount === undefined
+          ? ZERO
+          : row.paidAmount;
+      acc.paid = acc.paid.plus(paid);
+      acc.outstanding = acc.outstanding.plus(outstandingDecimal);
+      acc.invoiceCount += 1;
+      acc.buckets[bucketKey].outstanding = acc.buckets[
+        bucketKey
+      ].outstanding.plus(outstandingDecimal);
+      acc.buckets[bucketKey].invoiceCount += 1;
+
+      // 5f. Grand totals.
+      grandTotal = grandTotal.plus(row.total);
+      grandPaid = grandPaid.plus(paid);
+      grandOutstanding = grandOutstanding.plus(outstandingDecimal);
+      grandInvoiceCount += 1;
+    }
+
+    // 6. Materialize the byCustomer rows in stable order
+    //    (sorted by outstanding desc, then by customerId).
+    const byCustomerRows: ArAgingCustomerRow[] = Array.from(
+      custAcc.values(),
+    )
+      .sort((a, b) => {
+        const cmp = b.outstanding.comparedTo(a.outstanding);
+        if (cmp !== 0) return cmp;
+        return a.customerId.localeCompare(b.customerId);
+      })
+      .filter((acc) => acc.customerId !== '__no_customer__')
+      .map((acc) => {
+        // Serialise customer-level buckets via the
+        // standard decimalToString helper, matching the
+        // rest of the report tree.
+        const serializedBuckets: Record<
+          ArAgingBucketKey,
+          ArAgingBucket
+        > = {
+          current: {
+            invoiceCount: acc.buckets.current.invoiceCount,
+            outstanding: this.decimalToString(
+              acc.buckets.current.outstanding,
+            ),
+          },
+          '1-30': {
+            invoiceCount: acc.buckets['1-30'].invoiceCount,
+            outstanding: this.decimalToString(
+              acc.buckets['1-30'].outstanding,
+            ),
+          },
+          '31-60': {
+            invoiceCount: acc.buckets['31-60'].invoiceCount,
+            outstanding: this.decimalToString(
+              acc.buckets['31-60'].outstanding,
+            ),
+          },
+          '61-90': {
+            invoiceCount: acc.buckets['61-90'].invoiceCount,
+            outstanding: this.decimalToString(
+              acc.buckets['61-90'].outstanding,
+            ),
+          },
+          '+90': {
+            invoiceCount: acc.buckets['+90'].invoiceCount,
+            outstanding: this.decimalToString(acc.buckets['+90'].outstanding),
+          },
+        };
+
+        // After the filter above, every `acc.customerId` that
+        // reaches this .map() block is a real customerId
+        // (the synthetic '__no_customer__' key was excluded),
+        // so we can pass it through verbatim. Rows whose
+        // SalesInvoice.customerId was NULL contribute to the
+        // grand totals only — they never surface in the
+        // byCustomer breakdown, matching the Phase 8B-2
+        // arSummary.recentInvoices convention where rows
+        // with customerId=null are kept in aggregates and
+        // dropped from the per-row list when no label is
+        // available.
+        return {
+          customerId: acc.customerId,
+          customerCode: acc.customerCode,
+          customerName: acc.customerName,
+          total: this.decimalToString(acc.total),
+          paid: this.decimalToString(acc.paid),
+          outstanding: this.decimalToString(acc.outstanding),
+          buckets: serialisedBuckets,
+        };
+      });
+
+    // 7. Bucket materialisation — same serialisation rules
+    //    plus a conformant `totals` shape (extends the bucket
+    //    shape with an overall invoiceCount).
+    const serialisedBuckets: Record<ArAgingBucketKey, ArAgingBucket> = {
+      current: {
+        invoiceCount: buckets.current.invoiceCount,
+        outstanding: this.decimalToString(buckets.current.outstanding),
+      },
+      '1-30': {
+        invoiceCount: buckets['1-30'].invoiceCount,
+        outstanding: this.decimalToString(buckets['1-30'].outstanding),
+      },
+      '31-60': {
+        invoiceCount: buckets['31-60'].invoiceCount,
+        outstanding: this.decimalToString(buckets['31-60'].outstanding),
+      },
+      '61-90': {
+        invoiceCount: buckets['61-90'].invoiceCount,
+        outstanding: this.decimalToString(buckets['61-90'].outstanding),
+      },
+      '+90': {
+        invoiceCount: buckets['+90'].invoiceCount,
+        outstanding: this.decimalToString(buckets['+90'].outstanding),
+      },
+    };
+
+    const data: ArAgingData = {
+      currency: 'SAR',
+      dateField: 'dueDate',
+      statusFilter: 'ISSUED',
+      buckets: serialisedBuckets,
+      totals: {
+        invoiceCount: grandInvoiceCount,
+        outstanding: this.decimalToString(grandOutstanding),
+      },
+      byCustomer: { rows: byCustomerRows },
+    };
+
     return {
       report: 'ar-aging',
-      status: 'PLANNED',
+      status: 'READY',
       companyId,
       filters: {
         fromDate: query.fromDate ?? null,
         toDate: query.toDate ?? null,
         customerId: query.customerId ?? null,
-        status: 'ISSUED',
-        asOfDate: '', // 9B-2 fills with new Date().toISOString()
+        status: 'ISSUED', // echoed regardless of query.status
+        asOfDate,
       },
       generatedAt: new Date().toISOString(),
-      data: null,
+      data,
     };
   }
 
