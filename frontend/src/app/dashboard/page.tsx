@@ -126,6 +126,14 @@ export default function DashboardPage() {
               المحاسبة
             </Link>
           )}
+          {user.permissions.includes('reports.read') && (
+            <Link
+              href="/reports"
+              className="rounded-md bg-violet-600 hover:bg-violet-700 text-white text-sm px-4 py-2"
+            >
+              التقارير
+            </Link>
+          )}
           <button
             onClick={onLogout}
             className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"

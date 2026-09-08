@@ -488,6 +488,29 @@ export const api = {
       method: 'POST',
       body: data,
     }),
+
+  // ===== Phase 7C: Reports =====
+  // Read-only aggregates. All 6 endpoints are gated by `reports.read`
+  // server-side; the client passes the query params supported by
+  // backend ReportQueryDto (no `companyId` — JWT-only tenant scope).
+
+  salesSummary: (params: ReportQueryParams = {}) =>
+    apiRequest<SalesSummaryReport>(`/reports/sales-summary?${buildReportQuery(params)}`),
+
+  posSummary: (params: ReportQueryParams = {}) =>
+    apiRequest<PosSummaryReport>(`/reports/pos-summary?${buildReportQuery(params)}`),
+
+  purchasesSummary: (params: ReportQueryParams = {}) =>
+    apiRequest<PurchasesSummaryReport>(`/reports/purchases-summary?${buildReportQuery(params)}`),
+
+  inventorySummary: (params: ReportQueryParams = {}) =>
+    apiRequest<InventorySummaryReport>(`/reports/inventory-summary?${buildReportQuery(params)}`),
+
+  stockMovementsSummary: (params: ReportQueryParams = {}) =>
+    apiRequest<StockMovementsSummaryReport>(`/reports/stock-movements-summary?${buildReportQuery(params)}`),
+
+  accountingSummary: (params: ReportQueryParams = {}) =>
+    apiRequest<AccountingSummaryReport>(`/reports/accounting-summary?${buildReportQuery(params)}`),
 };
 
 // =====================================================
@@ -982,3 +1005,223 @@ export type CancelJournalEntryInput = {
   reason?: string;
   notes?: string;
 };
+
+// =====================================================
+// Phase 7C types — Reports endpoints.
+// Must mirror backend/src/reports/reports.service.ts
+// READY response shape. `companyId` is a hint echoed by
+// the server (authz is always from JWT). Money is string-typed.
+// `ReportEnvelope` is the common report wrapper shape.
+// =====================================================
+
+export type ReportName =
+  | 'sales-summary'
+  | 'pos-summary'
+  | 'purchases-summary'
+  | 'inventory-summary'
+  | 'stock-movements-summary'
+  | 'accounting-summary';
+
+export type ReportStatusKey = 'READY' | 'PLANNED';
+
+export interface ReportEnvelope<TData> {
+  report: ReportName;
+  status: ReportStatusKey;
+  companyId: string;
+  filters: Record<string, unknown> | null;
+  generatedAt: string; // ISO 8601
+  data: TData;
+}
+
+export interface ReportQueryParams {
+  fromDate?: string;
+  toDate?: string;
+  status?: string;
+  type?: string;
+  customerId?: string;
+  supplierId?: string;
+  productId?: string;
+  warehouseId?: string;
+  paymentMethod?: string;
+}
+
+// Build a URLSearchParams from ReportQueryParams, omitting empty
+// entries. Never serialise `companyId` — that comes from the JWT.
+function buildReportQuery(params: ReportQueryParams): URLSearchParams {
+  const q = new URLSearchParams();
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  if (params.status) q.set('status', params.status);
+  if (params.type) q.set('type', params.type);
+  if (params.customerId) q.set('customerId', params.customerId);
+  if (params.supplierId) q.set('supplierId', params.supplierId);
+  if (params.productId) q.set('productId', params.productId);
+  if (params.warehouseId) q.set('warehouseId', params.warehouseId);
+  if (params.paymentMethod) q.set('paymentMethod', params.paymentMethod);
+  return q;
+}
+
+// ---- sales-summary ----
+
+export type SalesInvoiceStatusFilter = 'DRAFT' | 'ISSUED' | 'CANCELLED';
+
+export interface SalesSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+  currency: 'SAR';
+  dateField: 'issueDate';
+  typeFilter: 'STANDARD';
+  statusFilter: SalesInvoiceStatusFilter;
+}
+
+export type SalesSummaryReport = ReportEnvelope<SalesSummaryData>;
+
+// ---- pos-summary ----
+
+export interface PosPaymentMethodBreakdown {
+  paymentMethod: string | null;
+  invoiceCount: number;
+  total: string;
+  paidAmount?: string;
+}
+
+export interface PosSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+  currency: 'SAR';
+  dateField: 'issueDate';
+  typeFilter: 'POS';
+  statusFilter: SalesInvoiceStatusFilter;
+  paymentMethods: PosPaymentMethodBreakdown[];
+}
+
+export type PosSummaryReport = ReportEnvelope<PosSummaryData>;
+
+// ---- purchases-summary ----
+
+export type PurchaseInvoiceStatusFilter = 'DRAFT' | 'RECEIVED' | 'CANCELLED';
+
+export interface PurchaseSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  currency: 'SAR';
+  dateField: 'receivedAt' | 'createdAt';
+  statusFilter: PurchaseInvoiceStatusFilter;
+}
+
+export type PurchasesSummaryReport = ReportEnvelope<PurchaseSummaryData>;
+
+// ---- inventory-summary ----
+
+export interface InventoryLevelEntry {
+  productId: string;
+  productSku?: string;
+  productName?: string;
+  warehouseId: string;
+  warehouseCode?: string;
+  warehouseName?: string;
+  quantity: string;
+  reservedQuantity: string;
+}
+
+export interface InventorySummaryData {
+  levelCount: number;
+  totalQuantity: string;
+  totalReservedQuantity: string;
+  currency: 'SAR';
+  dateField: 'current';
+  levels: InventoryLevelEntry[];
+}
+
+export type InventorySummaryReport = ReportEnvelope<InventorySummaryData>;
+
+// ---- stock-movements-summary ----
+
+export interface StockMovementTypeBreakdown {
+  movementType: string;
+  movementCount: number;
+  totalQuantity: string;
+}
+
+export interface StockMovementDirectionBreakdown {
+  direction: 'IN' | 'OUT';
+  movementCount: number;
+  totalQuantity: string;
+}
+
+export interface StockMovementEntry {
+  id: string;
+  movementType: string;
+  direction: 'IN' | 'OUT';
+  quantity: string;
+  productId?: string;
+  productSku?: string;
+  productName?: string;
+  warehouseId?: string;
+  warehouseCode?: string;
+  warehouseName?: string;
+  movementDate: string;
+}
+
+export interface StockMovementsSummaryData {
+  movementCount: number;
+  totalQuantityIn: string;
+  totalQuantityOut: string;
+  currency: 'SAR';
+  dateField: 'movementDate';
+  movementTypeFilter: string | null;
+  directionFilter: 'IN' | 'OUT' | null;
+  byType: StockMovementTypeBreakdown[];
+  byDirection: StockMovementDirectionBreakdown[];
+  movements: StockMovementEntry[];
+}
+
+export type StockMovementsSummaryReport = ReportEnvelope<StockMovementsSummaryData>;
+
+// ---- accounting-summary ----
+
+export type JournalEntryStatusFilter = 'DRAFT' | 'POSTED' | 'CANCELLED';
+
+export interface AccountingStatusBreakdown {
+  status: JournalEntryStatusFilter;
+  entryCount: number;
+  totalDebit: string;
+  totalCredit: string;
+}
+
+export interface AccountingRecentEntry {
+  id: string;
+  entryNumber: string;
+  status: JournalEntryStatusFilter;
+  entryDate: string;
+  description?: string;
+  totalDebit: string;
+  totalCredit: string;
+  postedAt?: string;
+}
+
+export interface AccountingSummaryData {
+  entryCount: number;
+  lineCount: number;
+  totalDebit: string;
+  totalCredit: string;
+  balanceDifference: string;
+  currency: 'SAR';
+  dateField: 'entryDate';
+  statusFilter: JournalEntryStatusFilter;
+  byStatus: AccountingStatusBreakdown[];
+  recentEntries: AccountingRecentEntry[];
+}
+
+export type AccountingSummaryReport = ReportEnvelope<AccountingSummaryData>;
