@@ -93,6 +93,10 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
     //                      READY (Phase 8B-2).
     { path: 'reports/ar-summary', report: 'ar-summary' },
     { path: 'reports/ap-summary', report: 'ap-summary' },
+    // Phase 9B-3 addition: AR aging READY (Phase 9B-2).
+    // Mirrors the prior AR/AP entries: included in the
+    // 401/403/200 loops and the query-filter smoke.
+    { path: 'reports/ar-aging', report: 'ar-aging' },
   ];
 
   beforeAll(async () => {
@@ -388,6 +392,128 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
     expect(Array.isArray(data['recentInvoices'])).toBe(true);
   });
 
+  // ---- Phase 9B-3 — AR aging shape assertions ----
+  //
+  //   Mirrors the prior 4a-4h shape-only assertions. The
+  //   actual `ArAgingData` contract (Phase 9B-2 commit
+  //   c85a59d in reports.service.ts) has:
+  //
+  //     - top-level keys present in `data`:
+  //         currency:SAR
+  //         dateField:'dueDate'
+  //         statusFilter:'ISSUED'   (D4-hard-locked)
+  //         buckets: Record<5 keys, { invoiceCount, outstanding }>
+  //         totals:  { invoiceCount, outstanding }
+  //         byCustomer: { rows: ArAgingCustomerRow[] }
+  //
+  //     - the 5 bucket keys: 'current' | '1-30' |
+  //       '31-60' | '61-90' | '+90'.
+  //
+  //     - per-bucket payload is intentionally narrow at
+  //       the controller boundary: only `invoiceCount`
+  //       (number) + `outstanding` (Decimal-as-string
+  //       serialised via `.toFixed(4)`). No `key` /
+  //       `label` / `lowerDays` / `upperDays` decoration
+  //       in the response — that level of labelling is
+  //       left to the frontend in 9C-frontend.
+  //
+  //     - buckets-by-customer property is `byCustomer.rows`
+  //       (a tightly-typed ArAgingCustomerRow[]). No
+  //       `top` / `otherCount` / `otherOutstanding`
+  //       pagination split at this boundary — the seed
+  //       is too thin to justify that yet (Phase 9C-code
+  //       will rebuild the breakdown at the frontend
+  //       layer).
+  //
+  //     - `asOfDate` is echoed inside `filters.asOfDate`
+  //       (server-computed) — not inside `data.asOfDate`.
+  //
+  //   This block asserts only the keys that the actual
+  //   contract exposes. Decimal strings are NOT parsed
+  //   to numbers here — that brittle assertion is left
+  //   to a unit test if it becomes useful later.
+  it('4i) ar-aging data (Phase 9B-2) has the AR aging contract shape', async () => {
+    const res = await adminAgent.get(`${API_PREFIX}/reports/ar-aging`);
+    expect(res.status).toBe(200);
+    const body = res.body as ReadyBody;
+    expect(body.report).toBe('ar-aging');
+    expect(body.status).toBe('READY');
+    expect(body.companyId).toBeDefined();
+    expect(typeof body.companyId).toBe('string');
+    expect(typeof body.generatedAt).toBe('string');
+    expect(body.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    // filters: shape + D4 echo
+    const filters = body.filters as Record<string, unknown>;
+    expect(filters).toBeDefined();
+    expect(filters['status']).toBe('ISSUED');
+    expect(typeof filters['asOfDate']).toBe('string');
+    expect(filters['asOfDate'] as string).toMatch(
+      /^\d{4}-\d{2}-\d{2}T/,
+    );
+
+    const data = body.data as Record<string, unknown>;
+
+    // 1. data top-level keys match the 9B-2 contract
+    for (const k of [
+      'currency',
+      'dateField',
+      'statusFilter',
+      'buckets',
+      'totals',
+      'byCustomer',
+    ]) {
+      expect(data).toHaveProperty(k);
+    }
+    expect(data['currency']).toBe('SAR');
+    expect(data['dateField']).toBe('dueDate');
+    expect(data['statusFilter']).toBe('ISSUED');
+
+    // 2. buckets: exactly 5 keys, all in the canonical
+    //    bucket ring (no-key/label/lowerDays/upperDays
+    //    decoration here — that lives on the frontend).
+    const buckets = data['buckets'] as Record<string, unknown>;
+    expect(buckets).toBeDefined();
+    expect(typeof buckets).toBe('object');
+    expect(Array.isArray(buckets)).toBe(false);
+    const bucketKeys = Object.keys(buckets).sort();
+    expect(bucketKeys).toEqual(['+90', '1-30', '31-60', '61-90', 'current']);
+    for (const k of bucketKeys) {
+      expect(buckets[k]).toBeDefined();
+      const b = buckets[k] as Record<string, unknown>;
+      expect(typeof b['invoiceCount']).toBe('number');
+      expect(typeof b['outstanding']).toBe('string');
+    }
+
+    // 3. totals: shape only (no numeric asserts — seed
+    //    has no AR aging fixtures).
+    const totals = data['totals'] as Record<string, unknown>;
+    expect(totals).toBeDefined();
+    expect(typeof totals['invoiceCount']).toBe('number');
+    expect(typeof totals['outstanding']).toBe('string');
+
+    // 4. byCustomer: rows array only (no top/otherCount).
+    const byCustomer = data['byCustomer'] as Record<string, unknown>;
+    expect(byCustomer).toBeDefined();
+    expect(Array.isArray(byCustomer['rows'])).toBe(true);
+    const rows = byCustomer['rows'] as Array<Record<string, unknown>>;
+    // No deterministic count assertion — empty seed is
+    // acceptable as long as the array exists.
+    for (const row of rows) {
+      for (const col of [
+        'customerId',
+        'customerCode',
+        'customerName',
+        'total',
+        'paid',
+        'outstanding',
+        'buckets',
+      ]) {
+        expect(row).toHaveProperty(col);
+      }
+    }
+  });
+
   // ---- 5. Query filter smoke: shape preserved on filters ----
   it('5) query filters are accepted and preserve 200 + READY + shape', async () => {
     const calls: Array<Promise<request.Response>> = [
@@ -433,6 +559,19 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
           fromDate: '2026-01-01',
           toDate: '2026-12-31',
           status: 'RECEIVED',
+        }),
+      // Phase 9B-3 addition: AR aging query smoke.
+      // The fromDate/toDate pair hits the OR-grouped
+      // `(dueDate ∈ range) OR (dueDate IS NULL AND
+      // issueDate ∈ range)` filter in service.ts. Not
+      // passing `status` here is intentional: the
+      // service hard-locks status to ISSUED regardless
+      // of any query override (D4 from 9B-1/9B-2).
+      adminAgent
+        .get(`${API_PREFIX}/reports/ar-aging`)
+        .query({
+          fromDate: '2026-01-01',
+          toDate: '2026-12-31',
         }),
     ];
 
