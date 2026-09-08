@@ -33,6 +33,27 @@
 //       authoritative for Phase-8B wiring, but `data: null`
 //       until Phase 8B-2.
 //
+//   Phase 8B-2 (this commit — AR/AP calculations):
+//     * `arSummary` and `apSummary` converted to READY.
+//       AR uses SalesInvoice (all types) with the same
+//       `HEADLINE_STATUS_EXCLUSION` and date range rule as
+//       `salesSummary` (issueDate-based). AP uses
+//       PurchaseInvoice with the same pattern as
+//       `purchasesSummary` (receivedAt-based, no
+//       paidAmount). Both expose:
+//         - invoiceCount + subtotal/vatTotal/discountTotal/
+//           total aggregates (Decimal-as-string)
+//         - byStatus breakdown via `groupBy`
+//         - recentInvoices: top 20 newest rows with
+//           partner labels (customer / supplier codes//
+//           + names)
+//     * NOT in scope (still PLANNED/future):
+//         - aging buckets (0–30 / 31–60 / 61–90 / 90+)
+//         - payments / receipts / settlements
+//         - bank reconciliation
+//         - AR/AP ledger sub-accounts
+//         - per-customer / per-supplier balance breakdown
+//
 // RULES (enforced everywhere):
 //   - All money totals returned as strings — never
 //     `Number()`. `Prisma.Decimal` serialised via
@@ -96,46 +117,131 @@ export interface PlannedReportResponse {
   data: null;
 }
 
-// ---- AR / AP summary response types (Phase 8B-1) --------------------
+// ---- AR / AP summary response types (Phase 8B-1/8B-2) ---------------
 //
-// Skeleton-only. Filters are projected from the loose `ReportQueryDto`
-// without any Prisma access. The `ArSummaryFilters` / `ApSummaryFilters`
-// shapes are the authoritative filters echoed in the response — per-report
-// (AR uses `customerId`, AP uses `supplierId`). `data` is `null` until
-// Phase 8B-2. Tenant isolation: `companyId` comes from the JWT parameter
-// of each service method, never from the query / body.
+//   Phase 8B-1 added the PLANNED skeletons. Phase 8B-2
+//   converts them to READY responses with the data shapes
+//   below. Filters are projected from the loose
+//   `ReportQueryDto` without any Prisma access and are
+//   emitted as `{ fromDate, toDate, ...Id, status }` with
+//   explicit `null` for unset keys (matches the response
+//   contract requested by the caller). Tenant isolation:
+//   `companyId` comes from the JWT parameter of each
+//   service method, never from the query / body.
 
 export interface ArSummaryFilters {
-  fromDate: string | undefined;
-  toDate: string | undefined;
-  customerId: string | undefined;
-  status: string | undefined;
+  fromDate: string | null;
+  toDate: string | null;
+  customerId: string | null;
+  status: string | null;
 }
 
 export interface ApSummaryFilters {
-  fromDate: string | undefined;
-  toDate: string | undefined;
-  supplierId: string | undefined;
-  status: string | undefined;
+  fromDate: string | null;
+  toDate: string | null;
+  supplierId: string | null;
+  status: string | null;
 }
 
-export interface ArSummaryResponse {
-  report: 'ar-summary';
-  status: 'PLANNED';
-  companyId: string;
+// ---- AR data shapes (Phase 8B-2) ----------------------------------
+//   Backed by SalesInvoice — invoice-level aggregates + status
+//   groupBy + 20 most recent invoices with customer labels.
+//   DOES NOT compute outstanding / aging / payments: this is
+//   invoiced receivables only. `paidAmount` is included as an
+//   optional field because `SalesInvoice.paidAmount` exists
+//   (`Decimal? @db.Decimal(18,4)`); for aggregates with no
+//   paid invoices, the key is omitted via `decimalToNullableString`.
+
+export interface ArStatusBreakdown {
+  status: SalesInvoiceStatus;
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+}
+
+export interface ArRecentInvoice {
+  id: string;
+  invoiceNumber: string;
+  status: SalesInvoiceStatus;
+  issueDate: string; // ISO 8601
+  customerId: string | null;
+  customerCode: string | null;
+  customerName: string | null;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+}
+
+export interface ArSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  paidAmount?: string;
+  currency: 'SAR';
+  dateField: 'issueDate';
+  statusFilter: SalesInvoiceStatus;
+  byStatus: ArStatusBreakdown[];
+  recentInvoices: ArRecentInvoice[];
+}
+
+// ---- AP data shapes (Phase 8B-2) ----------------------------------
+//   Backed by PurchaseInvoice — same pattern as AR, with
+//   supplier-side labels and `receivedAt` as the canonical
+//   date. `paidAmount` is intentionally OMITTED: the
+//   `PurchaseInvoice` schema has no `paidAmount` column
+//   (verified in `schema.prisma`, model PurchaseInvoice,
+//   line 507–545). The Phase 7B-3 purchasesSummary already
+//   documented this as a hard constraint.
+
+export interface ApStatusBreakdown {
+  status: PurchaseInvoiceStatus;
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+}
+
+export interface ApRecentInvoice {
+  id: string;
+  invoiceNumber: string;
+  status: PurchaseInvoiceStatus;
+  receivedAt: string; // ISO 8601 — may be a createdAt fallback
+  supplierId: string | null;
+  supplierCode: string | null;
+  supplierName: string | null;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+}
+
+export interface ApSummaryData {
+  invoiceCount: number;
+  subtotal: string;
+  vatTotal: string;
+  discountTotal: string;
+  total: string;
+  currency: 'SAR';
+  dateField: 'receivedAt';
+  statusFilter: PurchaseInvoiceStatus;
+  byStatus: ApStatusBreakdown[];
+  recentInvoices: ApRecentInvoice[];
+}
+
+export type ArSummaryResponse = Omit<ReadyResponse<ArSummaryData>, 'filters'> & {
   filters: ArSummaryFilters;
-  generatedAt: string;
-  data: null;
-}
-
-export interface ApSummaryResponse {
-  report: 'ap-summary';
-  status: 'PLANNED';
-  companyId: string;
+};
+export type ApSummaryResponse = Omit<ReadyResponse<ApSummaryData>, 'filters'> & {
   filters: ApSummaryFilters;
-  generatedAt: string;
-  data: null;
-}
+};
 
 export interface SalesSummaryData {
   invoiceCount: number;
@@ -1054,6 +1160,62 @@ export class ReportsService {
   }
 
   /**
+   * Build the `where` clause for `arSummary` (Phase 8B-2):
+   *   companyId + deletedAt:null +
+   *   status: { notIn: HEADLINE_STATUS_EXCLUSION }
+   *     + (optional status override) +
+   *     (optional customerId) +
+   *     (optional date range on issueDate).
+   * Model notes:
+   *   - AR covers EVERY `SalesInvoice.type` (STANDARD and
+   *     POS alike), because both create receivables on
+   *     the customer side. The `type` filter that
+   *     `salesSummary` and `posSummary` enforce is
+   *     intentionally OMITTED here.
+   *   - Default status = ISSUED (matches salesSummary);
+   *     CANCELLED never enters the headline unless the
+   *     caller explicitly overrides `status`.
+   *   - `deletedAt:null` is the standard Phase-7
+   *     soft-delete guard.
+   * Date range:
+   *   - fromDate -> gte 00:00:00.000 UTC
+   *   - toDate   -> lte 23:59:59.999 UTC
+   * `companyId` source: function parameter only —
+   * mirror of `buildSalesWhere`.
+   */
+  private buildArWhere(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Prisma.SalesInvoiceWhereInput {
+    const where: Prisma.SalesInvoiceWhereInput = {
+      companyId,
+      deletedAt: null,
+      status: {
+        notIn: HEADLINE_STATUS_EXCLUSION,
+      },
+    };
+
+    const status = this.resolveStatus(query);
+    if (status) {
+      // Explicit caller override: trust it. Aggregate
+      // will reflect only that status filter — and
+      // `notIn: CANCELLED` is dropped because the caller
+      // asked for an explicit status, mirroring
+      // `buildSalesWhere` line 894.
+      where.status = status;
+    }
+
+    if (query.customerId) {
+      where.customerId = query.customerId;
+    }
+
+    const date = this.buildIssueDateRange(query);
+    if (date) where.issueDate = date;
+
+    return where;
+  }
+
+  /**
    * Build the `where` clause for `accountingSummary`:
    *   companyId +
    *   status: { notIn: HEADLINE_JOURNAL_EXCLUSION } +
@@ -1204,68 +1366,308 @@ export class ReportsService {
   }
 
   // =================================================================
-  // AR SUMMARY — implemented in Phase 8B-2. Currently a skeleton
-  //   (Phase 8B-1): no Prisma aggregations, no
-  //   JournalEntryLine reads, no aging buckets, no payments.
-  //
-  //   Source of truth (for Phase 8B-2 +): AR per customer =
-  //   sum(unpaid SalesInvoice.total) − sum(allocations). For
-  //   this skeleton we return `data: null` and only the
-  //   projected filters so the client wiring is pinned down.
-  //
-  //   companyId: JWT-only parameter (set in the controller
-  //   via @CurrentUser()).
+  // AR SUMMARY — implemented in Phase 8B-2.
+  //   Source : SalesInvoice (every type — AR covers both
+  //            STANDARD and POS invoices, since both create
+  //            receivables from the same customer side).
+  //   Scope  : companyId + deletedAt:null +
+  //            status: { notIn: HEADLINE_STATUS_EXCLUSION }
+  //            + (optional status override) +
+  //            (optional customerId) +
+  //            (optional date range on issueDate).
+  //   Default status: ISSUED (caller override wins —
+  //                     CANCELLED cancels the headline
+  //                     exclusion just like sales/POS).
+  //   Outputs:
+  //     * invoiceCount + subtotal/vatTotal/discountTotal/
+  //       total/paidAmount aggregates.
+  //     * byStatus breakdown via groupBy.
+  //     * recentInvoices: top 20 newest invoices with
+  //       customer labels (code + name from Partner).
+  //   Not implemented (still future):
+  //     aging buckets, payments, receipts, allocations,
+  //     outstanding = total - paidAmount per invoice.
+  //     This endpoint reports *invoiced receivables*; it
+  //     is not a collections or aging report.
+  //   companyId: JWT-only parameter (controller-side
+  //              @CurrentUser() with no companyId in body).
   // =================================================================
   async arSummary(
     companyId: string,
     query: ReportQueryDto,
   ): Promise<ArSummaryResponse> {
-    const filters: ArSummaryFilters = {
-      fromDate: query.fromDate ?? undefined,
-      toDate: query.toDate ?? undefined,
-      customerId: query.customerId ?? undefined,
-      status: query.status ?? undefined,
+    const where = this.buildArWhere(companyId, query);
+
+    // 1. Headline aggregates — sums over the filtered
+    //    invoice set. paidAmount is included since the
+    //    SalesInvoice schema has it as `Decimal?`; it is
+    //    stringified via decimalToNullableString so the
+    //    key is omitted when the aggregate is null
+    //    (matches Phase 7B-2 salesSummary convention).
+    const agg = await this.prisma.salesInvoice.aggregate({
+      where,
+      _count: { _all: true },
+      _sum: {
+        subtotal: true,
+        vatTotal: true,
+        discountTotal: true,
+        total: true,
+        paidAmount: true,
+      },
+    });
+
+    // 2. byStatus breakdown. Same `where` filter so
+    //    status composition is observable; CANCELLED
+    //    is only present if caller explicitly overrode
+    //    the status (matching the sales/POS pattern).
+    const byStatusRaw = await this.prisma.salesInvoice.groupBy({
+      by: ['status'],
+      where,
+      _count: { _all: true },
+      _sum: {
+        subtotal: true,
+        vatTotal: true,
+        discountTotal: true,
+        total: true,
+        paidAmount: true,
+      },
+    });
+    const byStatus: ArStatusBreakdown[] = byStatusRaw
+      .sort((a, b) => a.status.localeCompare(b.status))
+      .map((row) => {
+        const entry: ArStatusBreakdown = {
+          status: row.status,
+          invoiceCount: row._count._all,
+          subtotal: this.decimalToString(row._sum.subtotal),
+          vatTotal: this.decimalToString(row._sum.vatTotal),
+          discountTotal: this.decimalToString(row._sum.discountTotal),
+          total: this.decimalToString(row._sum.total),
+        };
+        const paid = this.decimalToNullableString(row._sum.paidAmount);
+        if (paid !== undefined) entry.paidAmount = paid;
+        return entry;
+      });
+
+    // 3. recentInvoices — 20 most recent invoices for
+    //    the same filter scope, joined with Partner
+    //    (customer) for human-readable labels.
+    const recentRaw = await this.prisma.salesInvoice.findMany({
+      where,
+      orderBy: { issueDate: 'desc' },
+      take: 20,
+      select: {
+        id: true,
+        invoiceNumber: true,
+        status: true,
+        issueDate: true,
+        customerId: true,
+        subtotal: true,
+        vatTotal: true,
+        discountTotal: true,
+        total: true,
+        paidAmount: true,
+        customer: { select: { code: true, name: true } },
+      },
+    });
+    const recentInvoices: ArRecentInvoice[] = recentRaw.map((row) => {
+      const entry: ArRecentInvoice = {
+        id: row.id,
+        invoiceNumber: row.invoiceNumber,
+        status: row.status,
+        issueDate: (row.issueDate ?? row.customerId ?? new Date())
+          ? (row.issueDate?.toISOString() ?? new Date(0).toISOString())
+          : new Date(0).toISOString(),
+        customerId: row.customerId,
+        customerCode: row.customer?.code ?? null,
+        customerName: row.customer?.name ?? null,
+        subtotal: this.decimalToString(row.subtotal),
+        vatTotal: this.decimalToString(row.vatTotal),
+        discountTotal: this.decimalToString(row.discountTotal),
+        total: this.decimalToString(row.total),
+      };
+      const paid = this.decimalToNullableString(row.paidAmount);
+      if (paid !== undefined) entry.paidAmount = paid;
+      return entry;
+    });
+
+    // 4. Effective status filter for the response shape
+    //    (default = ISSUED when caller did not override).
+    const statusFilter =
+      this.resolveStatus(query) ?? SalesInvoiceStatus.ISSUED;
+
+    const data: ArSummaryData = {
+      invoiceCount: agg._count._all,
+      subtotal: this.decimalToString(agg._sum.subtotal),
+      vatTotal: this.decimalToString(agg._sum.vatTotal),
+      discountTotal: this.decimalToString(agg._sum.discountTotal),
+      total: this.decimalToString(agg._sum.total),
+      currency: 'SAR',
+      dateField: 'issueDate',
+      statusFilter,
+      byStatus,
+      recentInvoices,
     };
+    if (
+      agg._sum.paidAmount !== null &&
+      agg._sum.paidAmount !== undefined
+    ) {
+      data.paidAmount = this.decimalToString(agg._sum.paidAmount);
+    }
+
     return {
       report: 'ar-summary',
-      status: 'PLANNED',
+      status: 'READY',
       companyId,
-      filters,
+      filters: {
+        fromDate: query.fromDate ?? null,
+        toDate: query.toDate ?? null,
+        customerId: query.customerId ?? null,
+        status: query.status ?? null,
+      },
       generatedAt: new Date().toISOString(),
-      data: null,
+      data,
     };
   }
 
   // =================================================================
-  // AP SUMMARY — implemented in Phase 8B-2. Currently a skeleton
-  //   (Phase 8B-1): no Prisma aggregations, no
-  //   JournalEntryLine reads, no aging buckets, no payments.
-  //
-  //   Source of truth (for Phase 8B-2 +): AP per supplier =
-  //   sum(unpaid PurchaseInvoice.total) − sum(allocations). For
-  //   this skeleton we return `data: null` and only the
-  //   projected filters so the client wiring is pinned down.
-  //
-  //   companyId: JWT-only parameter (set in the controller
-  //   via @CurrentUser()).
+  // AP SUMMARY — implemented in Phase 8B-2.
+  //   Source : PurchaseInvoice.
+  //   Scope  : companyId + deletedAt:null +
+  //            status: { notIn: HEADLINE_PURCHASE_EXCLUSION }
+  //            + (optional status override) +
+  //            (optional supplierId) +
+  //            (optional date range on receivedAt, with
+  //            receivedAt-null rows still considered for
+  //            the headline via status default).
+  //   Default status: RECEIVED (matches purchasesSummary).
+  //   Outputs (parallel to AR):
+  //     * invoiceCount + subtotal/vatTotal/discountTotal/
+  //       total aggregates — NO paidAmount (PurchaseInvoice
+  //       has no such column; this is the Phase 7B-3
+  //       constraint).
+  //     * byStatus breakdown via groupBy.
+  //     * recentInvoices: top 20 newest invoices with
+  //       supplier labels (code + name from Partner).
+  //   Not implemented (still future):
+  //     aging buckets, payments/vouchers, allocations,
+  //     and reconciliation. This endpoint reports
+  //     invoiced payables only.
+  //   companyId: JWT-only parameter (controller-side
+  //              @CurrentUser() with no companyId in body).
   // =================================================================
   async apSummary(
     companyId: string,
     query: ReportQueryDto,
   ): Promise<ApSummaryResponse> {
-    const filters: ApSummaryFilters = {
-      fromDate: query.fromDate ?? undefined,
-      toDate: query.toDate ?? undefined,
-      supplierId: query.supplierId ?? undefined,
-      status: query.status ?? undefined,
+    const where = this.buildPurchaseWhere(companyId, query);
+
+    // 1. Headline aggregates — sums over the filtered
+    //    invoice set. paidAmount is intentionally omitted.
+    const agg = await this.prisma.purchaseInvoice.aggregate({
+      where,
+      _count: { _all: true },
+      _sum: {
+        subtotal: true,
+        vatTotal: true,
+        discountTotal: true,
+        total: true,
+      },
+    });
+
+    // 2. byStatus breakdown.
+    const byStatusRaw = await this.prisma.purchaseInvoice.groupBy({
+      by: ['status'],
+      where,
+      _count: { _all: true },
+      _sum: {
+        subtotal: true,
+        vatTotal: true,
+        discountTotal: true,
+        total: true,
+      },
+    });
+    const byStatus: ApStatusBreakdown[] = byStatusRaw
+      .sort((a, b) => a.status.localeCompare(b.status))
+      .map((row) => ({
+        status: row.status,
+        invoiceCount: row._count._all,
+        subtotal: this.decimalToString(row._sum.subtotal),
+        vatTotal: this.decimalToString(row._sum.vatTotal),
+        discountTotal: this.decimalToString(row._sum.discountTotal),
+        total: this.decimalToString(row._sum.total),
+      }));
+
+    // 3. recentInvoices — 20 most recent. Orderby
+    //    `(receivedAt desc, createdAt desc)` so that
+    //    invoices with receivedAt=null still get a
+    //    deterministic ordering via createdAt. Prisma
+    //    `orderBy` accepts an array.
+    const recentRaw = await this.prisma.purchaseInvoice.findMany({
+      where,
+      orderBy: [{ receivedAt: 'desc' }, { createdAt: 'desc' }],
+      take: 20,
+      select: {
+        id: true,
+        invoiceNumber: true,
+        status: true,
+        receivedAt: true,
+        createdAt: true,
+        supplierId: true,
+        subtotal: true,
+        vatTotal: true,
+        discountTotal: true,
+        total: true,
+        supplier: { select: { code: true, name: true } },
+      },
+    });
+    const recentInvoices: ApRecentInvoice[] = recentRaw.map((row) => {
+      const effectiveDate = row.receivedAt ?? row.createdAt;
+      const entry: ApRecentInvoice = {
+        id: row.id,
+        invoiceNumber: row.invoiceNumber,
+        status: row.status,
+        receivedAt: effectiveDate.toISOString(),
+        supplierId: row.supplierId,
+        supplierCode: row.supplier?.code ?? null,
+        supplierName: row.supplier?.name ?? null,
+        subtotal: this.decimalToString(row.subtotal),
+        vatTotal: this.decimalToString(row.vatTotal),
+        discountTotal: this.decimalToString(row.discountTotal),
+        total: this.decimalToString(row.total),
+      };
+      return entry;
+    });
+
+    // 4. Effective status filter (default = RECEIVED).
+    const statusFilter =
+      this.resolvePurchaseStatus(query) ??
+      PurchaseInvoiceStatus.RECEIVED;
+
+    const data: ApSummaryData = {
+      invoiceCount: agg._count._all,
+      subtotal: this.decimalToString(agg._sum.subtotal),
+      vatTotal: this.decimalToString(agg._sum.vatTotal),
+      discountTotal: this.decimalToString(agg._sum.discountTotal),
+      total: this.decimalToString(agg._sum.total),
+      currency: 'SAR',
+      dateField: 'receivedAt',
+      statusFilter,
+      byStatus,
+      recentInvoices,
     };
+
     return {
       report: 'ap-summary',
-      status: 'PLANNED',
+      status: 'READY',
       companyId,
-      filters,
+      filters: {
+        fromDate: query.fromDate ?? null,
+        toDate: query.toDate ?? null,
+        supplierId: query.supplierId ?? null,
+        status: query.status ?? null,
+      },
       generatedAt: new Date().toISOString(),
-      data: null,
+      data,
     };
   }
 
