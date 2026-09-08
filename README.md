@@ -1859,3 +1859,215 @@ math path. أي مرحلة لاحقة يجب أن تَكون **single-domain** �
 ولا جمع في مرحلة واحدة دون مبرر صريح. ولا deployment بأمر المستودع
 هذا — فقط local Docker Compose على جهاز المستخدم. ولا hosted
 deploy / hosted identity في هذه المرحلة.
+
+---
+
+## Phase 8: AR / AP Summary Reports (Phase 8B + Phase 8C-code + Phase 8D)
+
+### Commit map (Phase 8 — على branch `main`, HEAD `8ad91f7` عند الـ closure)
+
+```
+8ad91f7 feat(phase-8): wire AR AP into reports frontend          ← Phase 8C-code
+272d268 test(phase-8): add AR AP reports e2e smoke tests        ← Phase 8B-3
+896a2a7 feat(phase-8): add AR AP summary calculations           ← Phase 8B-2
+dd411e3 feat(phase-8): add AR AP report skeleton                ← Phase 8B-1
+a143444 docs(phase-7): update README for phase 7 final          ← (Phase 7D-2 السابق)
+```
+
+- **Phase 8A** (planning only, no commit): تحديد النطاق — حصر Phase 8 في ملخصات AR/AP فقط دون aging/outstanding/payments، مع مخطط تقسيم المراحل إلى 8B-1/2/3 و 8C و 8D.
+- **Phase 8B-1**: skeleton — `ArSummaryFilters`, `ApSummaryFilters` interfaces + `PLANNED` method stubs في `reports.service.ts` + `@Get('ar-summary')` و `@Get('ap-summary')` في `reports.controller.ts` (كلاهما gated بـ `reports.read`).
+- **Phase 8B-2**: تكميل الـ data shapes (`ArSummaryData`, `ApSummaryData`، status breakdowns، recent invoices) + `prisma.salesInvoice.{aggregate, groupBy, findMany}` و `prisma.purchaseInvoice.{aggregate, groupBy, findMany}` + `buildArWhere` helper + `Omit<ReadyResponse<T>, 'filters'> & { filters: ... }` لـ تخصيص الـ filters shape.
+- **Phase 8B-3**: backend e2e smoke tests — Tests 4g/4h + AR/AP extensions لـ Test 5 + `adminAgent = request.agent(http)` shared across all tests (إصلاح flakiness من إعادة login per test).
+- **Phase 8C**: (planning only, no commit): per-component data-shape table يحدد KPIs + tables بالضبط.
+- **Phase 8C-code**: frontend AR/AP wiring في `frontend/src/app/reports/page.tsx` — إضافة `'ar' | 'ap'` للـ `SectionKey` union + 2 renderers (`ArSection`, `ApSection`) + توسيع `FilterFormState` بـ `customerId`/`supplierId` + 2 inputs في الـ filter UI + 2 new `<section>` cards في الـ layout grid.
+- **Phase 8D-1**: (verification only, no commit): rebuild + retest — frontend build OK، e2e 111/111 PASS.
+- **Phase 8D-2**: هذا الـ README closure.
+
+### Scope of Phase 8
+
+**ما تم بناؤه** (داخل النطاق):
+
+- **AR-side Read-only Aggregates**: مجموع الفواتير الصادرة (`SalesInvoice.type = 'STANDARD'`) لـ partner من نوع `CUSTOMER` أو `BOTH`، مع `byStatus` groupBy + 20 آخر الفواتير (`recentInvoices`) مع customer labels (`customerCode`, `customerName`).
+- **AP-side Read-only Aggregates**: مجموع فواتير المشتريات (`PurchaseInvoice`) لـ partner من نوع `SUPPLIER` أو `BOTH`، مع `byStatus` groupBy + 20 آخر الفواتير (`recentInvoices`) مع supplier labels (`supplierCode`, `supplierName`).
+- **`dateField`**: AR = `issueDate`، AP = `receivedAt` (verified في Prisma schema).
+- **`paidAmount`**: AR فقط (حقل اختياري null، مربوط بـ `SalesInvoice.paidAmount Decimal? @db.Decimal(18,4)`). AP لا يحوي العمود (verified في Prisma `PurchaseInvoice` line 507).
+
+**ما لم يتم بناؤه عمداً** (خارج النطاق في هذه المرحلة):
+
+- **AR / AP Aging buckets** (current / 1-30 / 31-60 / 61-90 / >90 days).
+- **Outstanding receivables/payables** (أي worked-out balance — `total − paidAmount`).
+- **Customer/Supplier statements** (per-partner drill-down مع invoice-by-invoice view).
+- **AR / AP payments + settlement tracking**.
+- **AR / AP integration مع الـ journal entries** (لا posting تلقائي للـ receivables on invoice issue ولا settlement).
+- **AR / AP opening balances** (لا migration للأرصدة الافتتاحية).
+- **Currency conversion** (لا multi-currency — `'SAR'` literal فقط).
+- **GL control accounts** (لا chart-of-accounts binding للـ AR / AP control).
+
+### Database / Prisma Changes (Phase 8)
+
+لا تغييرات schema. Phase 8 read-only على البيانات الموجودة:
+
+- `SalesInvoice` (line 421): aggregates على `subtotal`, `vatTotal`, `discountTotal`, `total`, `paidAmount` + groupBy على `status` + findMany للـ 20 recent.
+- `PurchaseInvoice` (line 507): aggregates على `subtotal`, `vatTotal`, `discountTotal`, `total` (NO `paidAmount`) + groupBy على `status` + findMany للـ 20 recent.
+- `Partner` (line 255): joined للـ `customer.*`/`supplier.*` في الـ recent invoices.
+
+الـ where clause يبني صراحة `companyId = JWT + deletedAt: null` + `customerId/supplierId/status/fromDate/toDate` اختياري + (AR فقط) **بدون** `type: STANDARD` (بخلاف sales-summary — الـ AR يشمل كل الـ STANDARD sales invoices بغض النظر عن `type`).
+
+### Permissions (unchanged from Phase 7)
+
+Phase 8 لم تضف أي permission جديدة. الـ endpointان الجديدان يستخدمان نفس `reports.read` الـ seeded في Phase 7A-2.
+
+- `GET /reports/ar-summary` → `@RequirePermissions('reports.read')`
+- `GET /reports/ap-summary` → `@RequirePermissions('reports.read')`
+
+### Endpoints (Phase 8 — الـ 2 مسارات الجديدة)
+
+| Method | Path | Permission | Filter inputs | Response shape |
+|--------|------|------------|---------------|----------------|
+| `GET` | `/reports/ar-summary` | `reports.read` | `fromDate`?, `toDate`?, `customerId`?, `status`? | `ArSummaryResponse` |
+| `GET` | `/reports/ap-summary` | `reports.read` | `fromDate`?, `toDate`?, `supplierId`?, `status`? | `ApSummaryResponse` |
+
+كل endpoint في `@Controller('reports')` class-level:
+
+```
+@ApiTags('Reports')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@Controller('reports')
+```
+
+Response shape لكل واحد — `ReadyResponse<T>′` = `Omit<ReadyResponse<T>, 'filters'> & { filters: ArSummaryFilters | ApSummaryFilters }`:
+
+```
+{
+  report: 'ar-summary' | 'ap-summary',
+  status: 'READY',
+  companyId: string,                       ← JWT-only
+  filters: { fromDate, toDate, customerId\|supplierId, status },
+  generatedAt: '2026-...',
+  data: ArSummaryData | ApSummaryData {
+    invoiceCount, subtotal, vatTotal, discountTotal, total, (paidAmount AR only),
+    currency: 'SAR', dateField: 'issueDate' | 'receivedAt',
+    statusFilter: SalesInvoiceStatus | PurchaseInvoiceStatus,
+    byStatus: [...],
+    recentInvoices: [...]                  ← حد أقصى 20
+  }
+}
+```
+
+### Frontend routes (Phase 8C-code — extension of Phase 7C)
+
+`frontend/src/app/reports/page.tsx` — تعديل واحد فقط (478 insertions, 5 deletions):
+
+- **SectionKey union**: `'sales' | 'pos' | 'purchases' | 'inventory' | 'stock-movements' | 'accounting' | 'ar' | 'ap'` (8 sections بدل 6).
+- **الأقسام الجديدة**: `ArSection` و `ApSection` مع per-section idle/loading/error/empty/ok pattern (نفس verbatim النمط كما في الـ 6 الأصلية).
+- **الـ KPI tiles (AR)**: invoiceCount, subtotal SAR, vatTotal SAR, discountTotal SAR, total SAR, paidAmount SAR (اختياري), statusFilter (عبر `AR_SALES_STATUS`), dateField label (`'تاريخ الإصدار'`).
+- **الـ KPI tiles (AP)**: نفس بالضبط **بدون** paidAmount tile، statusFilter (عبر `AR_PURCHASE_STATUS`), dateField label (`'تاريخ الاستلام'`), مع نص تحذير صريح أسفل الـ KPI grid: "لا `paidAmount` — بنية فاتورة الشراء في الـ backend لا تحوي عمود دفع".
+- **جدول byStatus (AR)**: 7 columns (الحالة، عدد، قبل الضريبة، الضريبة، الخصم، الإجمالي، المدفوع).
+- **جدول byStatus (AP)**: 6 columns (بدون عمود المدفوع).
+- **جدول recentInvoices (AR)**: 6 columns (الرقم، العميل+code، الحالة، تاريخ الإصدار، الإجمالي، المدفوع).
+- **جدول recentInvoices (AP)**: 5 columns (الرقم، المورّد+code، الحالة، تاريخ الاستلام، الإجمالي — بدون المدفوع).
+- **filter UI inputs الإضافية**: `customerId` (اختياري، placeholder `"customerId"`، dir="ltr") + `supplierId` (اختياري، placeholder `"supplierId"`، dir="ltr"). النص الحر — لا autocomplete، لا dropdown — مع تصميم Phase 7C نفسه (label + input + Tailwind slate border).
+- **loadOne switch**: حالتا `'ar'` و `'ap'` تستخدم `apiRequest<ArSummaryReport | ApSummaryReport>` (الـ `api.arSummary()` و `api.apSummary()` غير موجودتين في الـ api object — استخدم الـ exported generic مباشرة).
+- **reloadAll**: 8-key array يضمن الـ parallel `Promise.all` لكل التقارير الـ 8.
+
+`route /reports` size بعد Phase 8C-code → **6.34 kB / 106 kB First Load JS** (قفز من 5.39 kB / 105 kB في Phase 7C بسبب الـ +478 lines).
+
+### Tests (Phase 8B-3 + Phase 8D-1 verification)
+
+`backend/test/reports.e2e-spec.ts` — إضافات Phase 8:
+
+1. **التوسعة بـ 2 routes**: ROUTES array = `['reports/sales-summary', 'pos-summary', 'purchases-summary', 'inventory-summary', 'stock-movements-summary', 'accounting-summary', 'reports/ar-summary', 'reports/ap-summary']`.
+2. **Tests 4g + 4h** (نفس pattern 4a..4f لـ Phase 7):
+   - **4g**: AR-shape — `data.{invoiceCount, subtotal, vatTotal, discountTotal, total, currency, statusFilter, dateField, byStatus[], recentInvoices[]}` + recent-invoice `{id, status, customerId nullable, issueDate, total}` + `byStatus[].{invoiceCount, subtotal, vatTotal, total}`.
+   - **4h**: AP-shape — نفس مع `recentInvoices[0].{id, status, supplierId nullable, receivedAt, total}` + لا `paidAmount` (schema-enforced).
+3. **Test 5 (query filter smoke) — AR/AP extensions**: AR test = `fromDate=2026-01-01&toDate=2026-12-31&status=ISSUED` → 200 READY، AP test = `status=RECEIVED` → 200 READY.
+4. **إصلاح flakiness**: `adminAgent = request.agent(http)` shared مُعتمد في `beforeAll` بـ `adminAgent.set('Authorization', Bearer <adminToken>)`. كل الاختبارات تستعمل `adminAgent.get(...)` بدل fresh `request(http).post('/auth/login')` per test (الجذر كان supertest socket-pool fragmentation).
+
+إجمالي backend e2e **بعد Phase 8**: **111/111 passing** في ~19 s:
+
+```
+PASS test/app.e2e-spec.ts (16.82 s)
+PASS test/reports.e2e-spec.ts
+Test Suites: 2 passed, 2 total
+Tests:       111 passed, 111 total
+Time:        19.4 s
+```
+
+### AR/AP Per-Component Data-Shape Table (frontend ↔ backend contract)
+
+| Tile / Row | AR (`ar-summary`) | AP (`ap-summary`) |
+|------------|--------------------|--------------------|
+| `invoiceCount` | ✅ `StatTile` | ✅ `StatTile` |
+| `subtotal` SAR | ✅ `StatTile` | ✅ `StatTile` |
+| `vatTotal` SAR | ✅ `StatTile` | ✅ `StatTile` |
+| `discountTotal` SAR | ✅ `StatTile` | ✅ `StatTile` |
+| `total` SAR | ✅ `StatTile` | ✅ `StatTile` |
+| `paidAmount` SAR | ✅ `StatTile` (اختياري، `?? null`) | ❌ **محذوف عمداً** |
+| `currency: 'SAR'` | literal ✅ | literal ✅ |
+| `dateField` label | "تاريخ الإصدار" (`issueDate`) | "تاريخ الاستلام" (`receivedAt`) |
+| `statusFilter` enum | DRAFT / ISSUED / CANCELLED | DRAFT / RECEIVED / CANCELLED |
+| `byStatus[]` table cols | 7 (incl. paidAmount) | 6 (لا paidAmount col) |
+| `recentInvoices[]` table cols | 6 (incl. paidAmount) | 5 (لا paidAmount col) |
+| Recent invoices rows | 20 max (`slice(0, 20)`) | 20 max (`slice(0, 20)`) |
+| Customer/Supplier labels | `customerName` + `customerCode` | `supplierName` + `supplierCode` |
+| Filter inputs | `customerId` (free-text, opt-in) | `supplierId` (free-text, opt-in) |
+
+### Security / tenancy (unchanged from Phase 1+2+3+4+5+6+7)
+
+- `companyId` من `@CurrentUser() me.companyId` فقط — **لا** يقبل من الـ query ولا الـ body على أيٍّ من الـ 8 endpoints.
+- `@UseGuards(JwtAuthGuard, PermissionsGuard)` global على `ReportsController` class-level، يغطي الـ 2 الجديدتين تلقائياً.
+- كل الـ 8 methods مقيَّدة بـ `@RequirePermissions('reports.read')`.
+- `Recent invoices` SQL يحوي `companyId = JWT + deletedAt: null` صراحة.
+- AR: `customerId` filter اختياري — لو مُحدد، backend يتحقق ضمناً أن الـ customer ينتمي لنفس الـ `companyId` عبر الـ JOIN على `Partner`.
+- AP: `supplierId` filter اختياري — بنفس النمط على `Partner`.
+- `Prisma.Decimal` arithmetic في الـ service (subtotal/vatTotal/discountTotal/total)؛ `Number()` في أي math path الحسابية **ممنوع**. الـ serialization عبر `decimalToString` / `decimalToNullableString` على حد كل حقل.
+- لا `companyId` من الـ URL أو الـ form body.
+- لا tokens في `localStorage` / `sessionStorage`.
+
+### Hard prohibitions honored (Phase 8)
+
+- لا skills مُشغَّلة أو مُستدعاة في الـ loop الكامل (8A → 8D-2).
+- لا cloudflare / workers / wrangler / OAuth / external auth / Google / social login.
+- لا `gsk hosted_*` أوامر؛ لا hosted Deploy؛ لا hosted Identity.
+- لا deployment بأمر المستودع هذا — فقط local Docker Compose على جهاز المستخدم.
+- لا PDF / Excel / SVG / canvas / recharts / Chart.js / D3 في الـ frontend.
+- لا mock / demo / fake data في الـ backend ولا الـ frontend.
+- لا `git add .` ولا `git add -A` في أي commit من الـ 4 commits.
+- لا modification خارج file الـ scope الوحيد المُصرَّح به:
+  - 8B-1 + 8B-2 → `backend/src/reports/{reports.service.ts, reports.controller.ts}`
+  - 8B-3 → `backend/test/reports.e2e-spec.ts`
+  - 8C-code → `frontend/src/app/reports/page.tsx`
+  - 8D-2 → `README.md` فقط (هذا الـ commit).
+
+### Recommendation
+
+**Phase 8 (AR / AP Summary Reports) انتهت** على مستوى:
+
+- `8B-1` (skeleton) و `8B-2` (calculations) و `8B-3` (smoke tests) — backend.
+- `8C` (planning) و `8C-code` (frontend wiring) — frontend.
+- `8D-1` (verification) و `8D-2` (README closure) — closure.
+
+كل من `ar-summary` و `ap-summary` يرجعان `status: 'READY'` بـ `Prisma.Decimal` aggregations server-side، ولا Number حسابي في أي math path. الـ permissions واحدة (`reports.read`) لـ 8 endpoints، والـ tenant isolation من JWT فقط.
+
+**الحدود الـ strict لـ Phase 8**:
+
+- لا computation لـ outstanding receivables/payables (`total − paidAmount`) في الـ AR أو AP.
+- لا aging buckets في الـ AR أو AP.
+- لا customer/supplier statements (no per-partner drill-down).
+- لا payments ولا settlement tracking ولا payment reconciliation.
+- لا posting تلقائي للـ receivables/payables إلى الـ journal على invoice issue/receive.
+- لا opening balances migration.
+- لا multi-currency — `'SAR'` literal فقط.
+
+كل واحد من هذه الـ 6 بنود هو **مرحلة منفصلة قادمة محتملة** (بحجمها الخاص)، ولا يجب جمعها:
+
+- إمّا **AR Aging + Outstanding** (9A).
+- أو **AP Aging + Outstanding** (9B).
+- أو **AR Payments + Settlement Tracking** (10A).
+- أو **AP Payments + Settlement Tracking** (10B).
+- أو **Customer/Supplier Statements** (11A — frontend drill-down).
+- أو **AR / AP ↔ GL Integration** (12A — auto-posting).
+- أو **Multi-currency layer** (13A — لو multi-currency صار أولوية؛ الآن خارج النطاق).
+
+وكل مرحلة يجب أن تكون **single-domain** فقط. ولا deployment بأمر المستودع هذا — فقط local Docker Compose. ولا hosted deploy / hosted identity في هذه المرحلة (ولا في المراحل القادمة إلا بموافقة صريحة).
