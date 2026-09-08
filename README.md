@@ -1614,5 +1614,248 @@ pnpm --filter @erp/frontend build                      # exit 0
 ولا جمع في مرحلة واحدة دون مبرر صريح. ولا deployment بأمر المستودع هذا — فقط
 local Docker Compose على جهاز المستخدم.
 
+---
 
+## Phase 7: Reports (Backend + Frontend, read-only aggregations)
 
+**نطاق صارم:** 6 endpoints تقارير مجمّعة read-only فقط عبر `/api/reports/*`
+بصلاحية `reports.read`. لا Trial Balance، لا Balance Sheet، لا P&L، لا
+Cash Flow، لا AR/AP aging، لا VAT/ZATCA، لا payments/reconciliation، لا
+automated posting من المبيعات/المشتريات، لا PDF/Excel export، لا charts
+ثقيلة في الـ frontend، لا mocking. كل التقارير تستخدم `Prisma`
+aggregations server-side، Decimal يخرج strings للنهاية، و`companyId` يجي
+من JWT فقط.
+
+### Commit map (Phase 7)
+
+- **Phase 7B-1** — `bdc6e5b feat(phase-7): add reports backend skeleton`
+  `backend/src/reports/reports.module.ts` + `reports.controller.ts` +
+  `reports.service.ts` + `dto/report-query.dto.ts`. 6 endpoints
+  مسجّلة (`JwtAuthGuard` + `PermissionsGuard` + `@RequirePermissions('reports.read')`)
+  لكن 6 methods كلها placeholder يَرجعان `status: 'PLANNED'` و`data: null`.
+  لا Prisma injections؛ schema/DTO/permissions لا تُلمس في هذه الخطوة.
+
+- **Phase 7B-2** — `9ba9cf0 feat(phase-7): add sales and POS report summaries`
+  `salesSummary` و`posSummary` تتحول إلى `READY`:
+  - sales: aggregate على `SalesInvoice` مفروض `type=STANDARD`,
+    `deletedAt:null`، فلتر status (افتراضي ISSUED، CANCELLED مستبعد من
+    headline إضافي)، فلتر `customerId`، فلتر نطاق تاريخ على `issueDate`.
+  - pos: نفس البناء لكن `type=POS`، زائد `paymentMethods` breakdown
+    عبر `groupBy({ by: ['paymentMethod'] })`، زائد فلتر `paymentMethod`.
+  - كل Decimal مخرَج كـ string (`.toFixed(4)`).
+
+- **Phase 7B-3/4 (reconciled in one commit)** — `00bf328 feat(phase-7): add purchases inventory report summaries`
+  `purchasesSummary` على `PurchaseInvoice` (default status=RECEIVED،
+  CANCELLED مستبعد من headline)، زائد `inventorySummary` على
+  `StockLevel` (levelCount + totalQuantity + totalReservedQuantity +
+  top 200 levels مع join على Product/Warehouse لعرض الأسماء)، زائد
+  `stockMovementsSummary` على `StockMovement` (movementCount +
+  totalQuantityIn + totalQuantityOut + byType + byDirection + top 200
+  recent movements، breakdown على `direction` وعلى `movementType`).
+  ترتيب IN/OUT وbyType deterministic (sort by count desc ثم enum asc).
+
+- **Phase 7B-5** — `ce425be feat(phase-7): add accounting report summary`
+  `accountingSummary` على `JournalEntry` + `JournalEntryLine`:
+  entryCount, lineCount, totalDebit, totalCredit, balanceDifference
+  عبر `Prisma.Decimal.minus` (لا Number)، `byStatus` breakdown،
+  `recentEntries` top 20. default status=POSTED؛ `DRAFT` و`CANCELLED`
+  مستبعدان من headline افتراضياً (HEADLINE_JOURNAL_EXCLUSION).
+
+- **Phase 7B-6** — `bd4169b test(phase-7): add reports backend e2e smoke tests`
+  ملف جديد `backend/test/reports.e2e-spec.ts` (10 e2e اختبارات):
+  - 401 بدون token لكل الـ 6 routes.
+  - 403 بـ cashier role بدون `reports.read` لكل الـ 6 routes (`beforeAll`
+    يبني cashier_e2e role + cashier-e2e@example.sa فيعتمد نفسه).
+  - 200 + READY + body shape لكل الـ 6 routes بـ admin token.
+  - Per-endpoint shape assertions: sales (headline + statusFilter +
+    currency)، pos (نفس + paymentMethods[])، purchases (نفس الـ shape)，
+    inventory (levelCount + totalQuantity + levels[*])، stock-movements
+    (movementCount + byType + byDirection + movements[*])، accounting
+    (totalDebit/Credit + byStatus + recentEntries).
+  - Query filter smoke عبر `Promise.all` يطلق 6 filtered requests
+    متوازية (fromDate/toDate/status/paymentMethod/productId/warehouseId).
+  إجمالي suite الآن 109/109 passing في 23.047 s (2 suites: app.e2e-spec.ts
+  + reports.e2e-spec.ts). لا production code touched في هذه الخطوة.
+
+- **Phase 7C** — `55c9547 feat(phase-7): add reports frontend page` (هذا الـ README commit لاحقة)
+  صفحة `/reports` جديدة في الـ frontend Next.js 14 مع `use client`،
+  RTL Arabic، 6 cards (sales / POS / purchases / inventory / stock-movements
+  / accounting)، filter form (fromDate, toDate, status, paymentMethod,
+  productId, warehouseId) يحفظ state محلي فقط ولا يَلمس
+  localStorage/sessionStorage، loading/error/empty states per section،
+  refresh-all button، "تحديث الكل" apology-free. Money fields يَبقَو
+  strings بصرف Decimal؛ `Number()` يُستخدم فقط في display formatting
+  عبر `toLocaleString` (لا math).
+  رابط `/reports` من `/dashboard` (مُقيَّد بـ `reports.read` بنفس
+  pattern الـ existing cluster).
+
+- **Phase 7D-1** — read-only verification (لا commit). bash
+  `pnpm --filter @erp/backend build` → exit 0؛
+  `pnpm --filter @erp/backend test:e2e` → 109/109 passing في 21.931 s؛
+  `pnpm --filter @erp/frontend build` → exit 0 مع 13 routes في الـ
+  output (شامل `/reports` 5.39 kB / 105 kB First Load JS، prerendered
+  كـ static).
+
+- **Phase 7D-2** — هذا الـ commit `docs(phase-7): update README for phase 7 final`.
+  لا backend، لا frontend، لا schema/migration/seed، لا RBAC،
+  لا deployment — تحديث README فقط.
+
+### Scope of Phase 7
+
+**ما تم بناؤه:**
+- 6 endpoints `/api/reports/{sales-summary,pos-summary,purchases-summary,inventory-summary,stock-movements-summary,accounting-summary}`، كل واحد
+  - مقيَّد بـ `JwtAuthGuard` + `PermissionsGuard` + `@RequirePermissions('reports.read')`.
+  - يأخذ `@Query() q: ReportQueryDto` (`fromDate`, `toDate`, `status`, `type`,
+    `customerId`, `supplierId`, `productId`, `warehouseId`, `paymentMethod` — كلها optional).
+  - مكافأة tenant scope: `companyId` فقط من JWT عبر `@CurrentUser() me`.
+  - يَرجع `ReadyResponse<T>` بـ `{ report, status: 'READY', companyId, filters, generatedAt, data }`.
+- Prisma aggregations لا `Number()` arithmetic:
+  - `aggregate({ _count, _sum })` لـ headline totals.
+  - `groupBy({ by: ['paymentMethod'] })` للـ POS breakdown.
+  - `groupBy({ by: ['status'] })` للـ accounting `byStatus`.
+  - `groupBy({ by: ['movementType'] })` + 2 `aggregate`s (IN/OUT) لـ stock-movements.
+  - `findMany({ take: 200 })` لـ detail rows (inventory levels + recent movements + 20 recent journal entries).
+- Decimal-as-string ends-to-end: `.toFixed(4)` للـ non-nullable،
+  `.toString()` للـ nullable (`paidAmount`)، مع تمييز null (omit key)
+  عبر helper `decimalToNullableString`.
+- `balanceDifference` عبر `Prisma.Decimal.minus(...)` — لا Number.
+- Phase 7 frontend: `/reports` صفحة واحدة، 6 sections، cards + tables فقط
+  (لا charts)، filter form، RTL Arabic، refresh-all.
+- 10 e2e tests (Phase 7B-6): 401/403/200/shape/per-endpoint/query-filter smoke.
+
+**ممنوع عمداً في Phase 7:**
+- لا Trial Balance، لا Balance Sheet، لا P&L، لا Cash Flow.
+- لا AR/AP aging (لا customers/suppliers outstanding ledger).
+- لا VAT / ZATCA reports ولا VAT auto-posting من المبيعات/المشتريات.
+- لا payments / bank reconciliation / cash management.
+- لا automated journal posting (لا `event-driven` GL updates).
+- لا PDF / Excel export.
+- لا charts / dashboards ثقيلة (Chart.js / recharts / D3).
+- لا sales/purchase returns / debit-credit notes.
+- لا period locking / reverse entries.
+- لا period-close workflow.
+
+### Database / Prisma Changes (Phase 7)
+
+**لا schema/migration/seed changes** في Phase 7. كل الـ 6 endpoints
+تقرأ من الـ models الموجودة (SalesInvoice + SalesInvoiceLine،
+PurchaseInvoice + PurchaseInvoiceLine، StockLevel، StockMovement،
+JournalEntry + JournalEntryLine) عبر الـ aggregations و joins
+الموصوفة أعلاه. لا partial unique indexes جديدة. لا FK changes.
+
+### Permissions Added in Phase 7
+
+**لا permissions جديدة** في Phase 7. الصلاحية `reports.read` الموجودة
+من Phase 7A-2 (planning) هي المُستخدمة. الـ service-level guard
+سيرفض أي user بدون `reports.read` بـ 403 Forbidden.
+
+### Endpoints (Phase 7 الـ 6)
+
+| Method | Path | Source model | Permission |
+|--------|------|--------------|------------|
+| GET | `/api/reports/sales-summary` | `SalesInvoice WHERE type=STANDARD` | `reports.read` |
+| GET | `/api/reports/pos-summary` | `SalesInvoice WHERE type=POS` | `reports.read` |
+| GET | `/api/reports/purchases-summary` | `PurchaseInvoice` | `reports.read` |
+| GET | `/api/reports/inventory-summary` | `StockLevel` | `reports.read` |
+| GET | `/api/reports/stock-movements-summary` | `StockMovement` | `reports.read` |
+| GET | `/api/reports/accounting-summary` | `JournalEntry + JournalEntryLine` | `reports.read` |
+
+ملاحظات عامّة:
+- كل endpoint يَقبل نفس الـ `ReportQueryDto` (loose، لا IsEnum()).
+- `fromDate`/`toDate` يَترجما إلى `gte/lte` UTC inclusive
+  (`00:00:00.000Z` → `23:59:59.999Z`).
+- `status`/`paymentMethod` ينظفان server-side عبر `resolve*()` helpers.
+- CANCELLED مستبعد من headline totals افتراضياً لكل من Sales/POS
+  (`HEADLINE_STATUS_EXCLUSION`) والمشتريات (`HEADLINE_PURCHASE_EXCLUSION`)
+  والقيود (HEADLINE_JOURNAL_EXCLUSION = DRAFT + CANCELLED). لو الـ caller
+  يَمُر `status=CANCELLED` صراحةً، الـ aggregate يصير audit count not revenue.
+- POS يَرجع `paymentMethods[]` إلا عند تمرير `paymentMethod=...` (single-bucket).
+- Accounting `byStatus` يَستثني الـ explicit status filter (يعكس كل الـ statuses
+  داخل الـ date scope موجودة).
+
+### Frontend routes (Phase 7C + Phase 7D-2 verification)
+
+```
+┌ ○ /_not-found                          870 B          88.2 kB
+├ ○ /accounting                          6.35 kB         106 kB
+├ ○ /dashboard                           1.97 kB         101 kB
+├ ○ /inventory                           3.65 kB         103 kB
+├ ○ /login                               2.22 kB        92.1 kB
+├ ○ /partners                            3.33 kB         103 kB
+├ ○ /pos                                 4.53 kB         104 kB
+├ ○ /products                            3.11 kB         103 kB
+├ ○ /purchases                           4.7 kB          104 kB
+├ ○ /reports                             5.39 kB         105 kB   ← Phase 7C addition
+├ ○ /sales                               4.72 kB         104 kB
+├ ○ /users                               1.73 kB         101 kB
+└ ○ /warehouses                          2.81 kB         102 kB
++ First Load JS shared by all            87.3 kB
+```
+
+### Tests (Phase 7B-6 + Phase 7D-1 verification)
+
+`backend/test/reports.e2e-spec.ts` (Phase 7B-6) — 10 اختبارات جديدة:
+
+1. 401 without Authorization header → كل الـ 6 routes.
+2. 403 with cashier role (`cashier_e2e`) without `reports.read` → كل الـ 6 routes (`beforeAll`
+   يبني role + user فيعتمد نفسه).
+3. 200 + `body.status === 'READY'` + body shape → كل الـ 6 routes.
+4a. sales-shape: `data.{invoiceCount, subtotal, vatTotal, discountTotal, total, currency, statusFilter, typeFilter}`.
+4b. pos-shape: sales-shape + `data.paymentMethods[]` (`method`, `count`, `total`).
+4c. purchases-shape: `data.{invoiceCount, subtotal, vatTotal, discountTotal, total, currency, statusFilter, dateField}`.
+4d. inventory-shape: `data.{levelCount, totalQuantity, totalReservedQuantity, levels[]}` + per-level `productId/warehouseId/quantity`.
+4e. stock-movements-shape: `data.{movementCount, totalQuantityIn, totalQuantityOut, byType[], byDirection[], movements[]}`
+   + per-movement `{type, direction, quantity}`.
+4f. accounting-shape: `data.{entryCount, lineCount, totalDebit, totalCredit, balanceDifference, byStatus[], recentEntries[]}`
+   + recent-entry `id, status`.
+5. Query filter smoke: 6 parallel `Promise.all` requests (`fromDate/toDate/status/paymentMethod/...`) → 200.
+
+إجمالي backend e2e الآن: **109/109 passing** في ~22 s (2 suites):
+app.e2e-spec.ts (~17 s) + reports.e2e-spec.ts (~5 s).
+
+### Security / tenancy (unchanged from Phase 1+2+3+4+5+6)
+
+- `companyId` من `@CurrentUser()` فقط — **لا** يقبل من الـ query ولا من الـ body
+  على أيٍّ من الـ 6 endpoints.
+- `@UseGuards(JwtAuthGuard, PermissionsGuard)` global على `ReportsController`.
+- كل الـ 6 methods مقيَّدة بـ `@RequirePermissions('reports.read')`.
+- Soft-delete (`deletedAt: null`) مضاف صراحة للـ where على
+  SalesInvoice/PurchaseInvoice؛ StockLevel وStockMovement وJournalEntry
+  لا `deletedAt` أصلاً (append-only or lifetime-row).
+- `Prisma.Decimal` arithmetic في الـ service؛ `Number()` في الـ paths الحسابية **ممنوع**.
+- لا `companyId` من الـ URL أو الـ form body.
+- لا tokens في `localStorage` / `sessionStorage` (frontend token
+  in-memory فقط، refresh cookie HttpOnly لا يُلمس).
+
+### Hard prohibitions honored (Phase 7)
+
+- لا skills مُشغَّلة أو مُستدعاة في الـ loop الكامل (7A → 7D-2).
+- لا cloudflare / workers / wrangler / OAuth / external auth / Google / social login.
+- لا PDF / Excel / SVG / canvas charts / recharts / Chart.js / D3 في
+  الـ frontend.
+- لا network calls إلى third-party APIs باستثناء الـ backend Local Docker.
+- لا in-memory caching في الـ backend؛ responses تُحسب fresh كل request
+  من Postgres.
+- لا mock / demo / fake data في الـ backend ولا الـ frontend.
+
+### Recommendation
+
+**Phase 7 (Reports) انتهت** على مستوى الـ backend (Phase 7B-1 → 7B-6)
+والـ frontend (Phase 7C) والـ verification (Phase 7D-1) والـ README
+final (Phase 7D-2). كل التقارير الستة تُرجع `status: 'READY'` بصرف
+`Prisma.Decimal` aggregations server-side، ولا Number حسابي في أي
+math path. أي مرحلة لاحقة يجب أن تَكون **single-domain** فقط:
+
+- إمّا **AR / AP ledgers** (customer/supplier outstanding من الـ journal entries).
+- أو **Bank Reconciliation / Payments** (cash + bank matching).
+- أو **VAT / ZATCA** filings (لو Saudi compliance صار أولوية؛ الآن خارج النطاق).
+- أو **Fixed Assets / Depreciation**.
+- أو **HR / Payroll** (employees + monthly payroll cycle).
+- أو **Sales / Purchase Returns + Debit-Credit notes**.
+- أو **Period locking + Reverse entries** (rollback for posted journals).
+- أو **PDF / Excel export layer** للـ reports الحالية (Frontend-only).
+- أو **Charts / dashboards layer** للـ reports الحالية (Frontend-only).
+
+ولا جمع في مرحلة واحدة دون مبرر صريح. ولا deployment بأمر المستودع
+هذا — فقط local Docker Compose على جهاز المستخدم. ولا hosted
+deploy / hosted identity في هذه المرحلة.
