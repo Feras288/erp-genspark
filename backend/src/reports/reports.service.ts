@@ -25,6 +25,14 @@
 //       only. No Trial Balance, no Balance Sheet,
 //       no P&L.
 //
+//   Phase 8B-1 (this commit — AR/AP skeleton):
+//     * `arSummary` and `apSummary` added as PLANNED
+//       skeletons only. No Prisma calls, no JournalEntryLine
+//       balance aggregations, no aging buckets, no payments,
+//       no reconciliation. The shape and filters are
+//       authoritative for Phase-8B wiring, but `data: null`
+//       until Phase 8B-2.
+//
 // RULES (enforced everywhere):
 //   - All money totals returned as strings — never
 //     `Number()`. `Prisma.Decimal` serialised via
@@ -75,13 +83,56 @@ export type ReportName =
   | 'purchases-summary'
   | 'inventory-summary'
   | 'stock-movements-summary'
-  | 'accounting-summary';
+  | 'accounting-summary'
+  | 'ar-summary'
+  | 'ap-summary';
 
 export interface PlannedReportResponse {
   report: ReportName;
   status: 'PLANNED';
   companyId: string;
   filters: ReportQueryDto | null;
+  generatedAt: string;
+  data: null;
+}
+
+// ---- AR / AP summary response types (Phase 8B-1) --------------------
+//
+// Skeleton-only. Filters are projected from the loose `ReportQueryDto`
+// without any Prisma access. The `ArSummaryFilters` / `ApSummaryFilters`
+// shapes are the authoritative filters echoed in the response — per-report
+// (AR uses `customerId`, AP uses `supplierId`). `data` is `null` until
+// Phase 8B-2. Tenant isolation: `companyId` comes from the JWT parameter
+// of each service method, never from the query / body.
+
+export interface ArSummaryFilters {
+  fromDate: string | undefined;
+  toDate: string | undefined;
+  customerId: string | undefined;
+  status: string | undefined;
+}
+
+export interface ApSummaryFilters {
+  fromDate: string | undefined;
+  toDate: string | undefined;
+  supplierId: string | undefined;
+  status: string | undefined;
+}
+
+export interface ArSummaryResponse {
+  report: 'ar-summary';
+  status: 'PLANNED';
+  companyId: string;
+  filters: ArSummaryFilters;
+  generatedAt: string;
+  data: null;
+}
+
+export interface ApSummaryResponse {
+  report: 'ap-summary';
+  status: 'PLANNED';
+  companyId: string;
+  filters: ApSummaryFilters;
   generatedAt: string;
   data: null;
 }
@@ -1150,6 +1201,72 @@ export class ReportsService {
     if (query.toDate)
       range.lte = new Date(`${query.toDate}T23:59:59.999Z`);
     return range;
+  }
+
+  // =================================================================
+  // AR SUMMARY — implemented in Phase 8B-2. Currently a skeleton
+  //   (Phase 8B-1): no Prisma aggregations, no
+  //   JournalEntryLine reads, no aging buckets, no payments.
+  //
+  //   Source of truth (for Phase 8B-2 +): AR per customer =
+  //   sum(unpaid SalesInvoice.total) − sum(allocations). For
+  //   this skeleton we return `data: null` and only the
+  //   projected filters so the client wiring is pinned down.
+  //
+  //   companyId: JWT-only parameter (set in the controller
+  //   via @CurrentUser()).
+  // =================================================================
+  async arSummary(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Promise<ArSummaryResponse> {
+    const filters: ArSummaryFilters = {
+      fromDate: query.fromDate ?? undefined,
+      toDate: query.toDate ?? undefined,
+      customerId: query.customerId ?? undefined,
+      status: query.status ?? undefined,
+    };
+    return {
+      report: 'ar-summary',
+      status: 'PLANNED',
+      companyId,
+      filters,
+      generatedAt: new Date().toISOString(),
+      data: null,
+    };
+  }
+
+  // =================================================================
+  // AP SUMMARY — implemented in Phase 8B-2. Currently a skeleton
+  //   (Phase 8B-1): no Prisma aggregations, no
+  //   JournalEntryLine reads, no aging buckets, no payments.
+  //
+  //   Source of truth (for Phase 8B-2 +): AP per supplier =
+  //   sum(unpaid PurchaseInvoice.total) − sum(allocations). For
+  //   this skeleton we return `data: null` and only the
+  //   projected filters so the client wiring is pinned down.
+  //
+  //   companyId: JWT-only parameter (set in the controller
+  //   via @CurrentUser()).
+  // =================================================================
+  async apSummary(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Promise<ApSummaryResponse> {
+    const filters: ApSummaryFilters = {
+      fromDate: query.fromDate ?? undefined,
+      toDate: query.toDate ?? undefined,
+      supplierId: query.supplierId ?? undefined,
+      status: query.status ?? undefined,
+    };
+    return {
+      report: 'ap-summary',
+      status: 'PLANNED',
+      companyId,
+      filters,
+      generatedAt: new Date().toISOString(),
+      data: null,
+    };
   }
 
   /**

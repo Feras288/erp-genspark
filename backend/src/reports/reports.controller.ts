@@ -104,4 +104,40 @@ export class ReportsController {
   ) {
     return this.svc.accountingSummary(me.companyId, q);
   }
+
+  // ===== AR (Accounts Receivable) — Phase 8B-1 skeleton =====
+  //
+  //   * Skeleton only: backend returns `status: 'PLANNED'`,
+  //     `data: null`. No aging buckets, no per-customer
+  //     balances, no payments, no reconciliation.
+  //   * Tenant isolation unchanged: companyId comes from
+  //     @CurrentUser() (JWT). The DTO does not expose
+  //     companyId; any companyId in query/body is ignored.
+
+  @Get('ar-summary')
+  @RequirePermissions('reports.read')
+  arSummary(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() q: ReportQueryDto,
+  ) {
+    return this.svc.arSummary(me.companyId, q);
+  }
+
+  // ===== AP (Accounts Payable) — Phase 8B-1 skeleton =====
+  //
+  //   * Skeleton only: backend returns `status: 'PLANNED'`,
+  //     `data: null`. No aging buckets, no per-supplier
+  //     balances, no payments, no reconciliation.
+  //   * Tenant isolation unchanged: companyId comes from
+  //     @CurrentUser() (JWT). The DTO does not expose
+  //     companyId; any companyId in query/body is ignored.
+
+  @Get('ap-summary')
+  @RequirePermissions('reports.read')
+  apSummary(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() q: ReportQueryDto,
+  ) {
+    return this.svc.apSummary(me.companyId, q);
+  }
 }
