@@ -2220,3 +2220,191 @@ type ArAgingResponse = Omit<ReadyResponse<ArAgingData>, 'filters'> & {
 وكل مرحلة يجب أن تكون **single-domain** فقط. ولا deployment بأمر المستودع هذا — فقط local Docker Compose. ولا hosted deploy / hosted identity في هذه المرحلة (ولا في المراحل القادمة إلا بموافقة صريحة).
 
 → Phase 9 closure verified. Phase 9D-2 (README update) sealed.
+
+## Phase 9E: AP Aging — Outstanding-only buckets (no payments, no reconciliation, no settlement)
+
+### Family
+
+- `9E-B-1`: backend skeleton — endpoint registration + DTO lock + PLANNED shape.
+- `9E-B-2`: backend calculations — RECEIVED hard-lock + JS bucket math + per-supplier rows + 3-leg OR-group date filter + `paidAmount` absence compensated by `apSafeOutstanding = max(0, total)`.
+- `9E-B-3`: backend e2e smoke — ROUTES 401/403 + READY shape + query smoke (no `supplierId` query smoke — لا fixture supplier للـ filter الـ exact في الـ seed، مُحترم الـ scope contract).
+- `9E-C-code`: frontend wiring — Next.js API helper + types mirror (6 types بدون `paid` field) + reports page sub-section بدون `paid` column.
+- `9E-D-1`: final verification only — no commits, no edits, no pushes; build + e2e regression check.
+- `9E-D-2`: README update and final closure (هذا الـ commit).
+
+### Conventional Commits على `main`
+
+```
+ba0b014 feat(phase-9e): wire AP aging into reports frontend     ← Phase 9E-C-code
+e27971c test(phase-9e): add AP aging backend e2e smoke          ← Phase 9E-B-3
+79f7d55 feat(phase-9e): add AP aging calculations               ← Phase 9E-B-2
+c447d31 feat(phase-9e): add AP aging skeleton                   ← Phase 9E-B-1
+```
+
+### Backend additions
+
+- Endpoint جديد: `GET /api/reports/ap-aging` مُقيَّد بـ `@RequirePermissions('reports.read')` تمامًا مثل الـ 9 endpoints السابقة.
+- `companyId` من `@CurrentUser() me.companyId` فقط — **لا** يقبل من الـ query ولا الـ body (Phase 7B-1 contract، نفس الـ guardrails التي مُحكمت في Phase 7).
+- DTO lock: `ReportQueryDto` بدون `companyId`، **وأيضًا** بدون `asOfDate` (يُحسب من الخادم `new Date().toISOString()` تمامًا مثل `ar-aging`).
+- status مقفل على `RECEIVED` داخل الـ `where` ويُتجاهل `query.status` عمداً (D4-style lock؛ الـ AP flip لـ Phase 9E).
+- `WHERE` clause (3-leg OR-group على خلاف AR ذو الـ 2 legs):
+  - `receivedAt ∈ [fromDate, toDate]`  **OR**
+  - `receivedAt null + dueDate ∈ [fromDate, toDate]`  **OR**
+  - `receivedAt null + dueDate null + purchaseDate ∈ [fromDate, toDate]`
+  - وبالطبع `companyId = JWT` + `status = RECEIVED` + `deletedAt = null`.
+- `findMany({ take: 5001 })` كحماية: لو عدد الـ invoices الـ returned > 5000، يُرمى `BadRequestException`.
+- Aging-date fallback (per-row على حدة):
+  - `effectiveApAgingDate = receivedAt ?? dueDate ?? purchaseDate` — كل صف ممكن يكون له `effectiveDate` مختلفة حسب الـ signal الـ close-to-payment.
+  - `daysPastDue = max(0, ceil((asOfDate - effectiveApAgingDate) / 1 day))`.
+  - 5 buckets: `current` (≤0)، `1-30` (1..30)، `31-60` (31..60)، `61-90` (61..90)، `+90` (+infinity).
+- Outstanding formula خاص بـ Phase 9E (بدون `paidAmount` على الـ schema):
+  - `apSafeOutstanding(total) = max(0, total)` — دائمًا. السبب: `model PurchaseInvoice` في lineup الـ 7B-3 وما قبله (و 8B-2) **لم** يُحَوِّل `paidAmount` — الـ field غير موجود على الـ schema، والـ outstanding هو الـ full `total` (لا subtraction logic).
+  - rows ذات `outstanding ≤ 0` تُحذف.
+  - الـ Prisma.Decimal arithmetic حصراً، `Number()` الحسابي **ممنوع** تمامًا مثل Phase 9.
+- Per-supplier breakdown: تجميع الـ rows على `supplierId` — الـ null supplierId يُجمَّع تحت `'__no_supplier__'` placeholder ثم يُفلتر من `bySupplier.rows` (لا يظهر في الـ UI).
+- الـ serialization: `Prisma.Decimal @db.Decimal(18,4)` عبر `decimalToString` على كل حقل مالي في الـ serialization (تمامًا مثل Phase 9).
+
+### Backend data contract (`ApAgingResponse`)
+
+```ts
+type ApAgingBucketKey = 'current' | '1-30' | '31-60' | '61-90' | '+90';
+
+type ApAgingData = {
+  currency: 'SAR';
+  dateField: 'receivedAt';          // ← not 'dueDate' (AR is dueDate)
+  statusFilter: 'RECEIVED';         // ← not 'ISSUED'
+  buckets: Record<ApAgingBucketKey, { invoiceCount: number; outstanding: string }>;
+  totals: { invoiceCount: number; outstanding: string };
+  bySupplier: { rows: ApAgingSupplierRow[] };   // ← not byCustomer
+};
+
+type ApAgingResponse = Omit<ReadyResponse<ApAgingData>, 'filters'> & {
+  filters: { fromDate; toDate; supplierId; status; asOfDate };
+};
+```
+
+**Contract deltas vs `ArAgingResponse`** (مهم لتجنّب client regressions):
+
+- `dateField`: `'receivedAt'` بدل `'dueDate'` (الـ AR mirror).
+- `statusFilter`: `'RECEIVED'` بدل `'ISSUED'` (الـ AR mirror للـ AP world).
+- `bySupplier.rows` بدل `byCustomer.rows` (الـ grouping key flip ومنطق الـ null-customer/-supplier handling نفس النمط).
+- **لا** field اسمه `paid` على الـ per-row shape — `PurchaseInvoice` schema لا يحوي `paidAmount`؛ الـ fields المالية على الـ per-supplier row هي `total` و `outstanding` فقط.
+- `filters.supplierId` بدل `filters.customerId` — والـ frontend mirror يحترم ذلك بدون padding لأي `paid` key في الـ typings.
+
+### Frontend additions
+
+- `frontend/src/lib/api.ts`:
+  - Wrapper جديد واحد: `apAgingReport: (params: ReportQueryParams = {}) => apiRequest<ApAgingReport>(...)` — نفس النمط الـ 7 wrappers الموجودة (sales/pos/purchases/inventory/stockMovements/accounting/arAging).
+  - 6 types جديدة mirror: `ApAgingBucketKey`, `ApAgingFilters`, `ApAgingBucket`, `ApAgingSupplierRow`, `ApAgingData`, `ApAgingReport`. الـ `ApAgingSupplierRow` يحوي `total` + `outstanding` فقط (بدون `paid` field — mirrored from الـ backend contract الـ exact).
+  - لا تعديل على `arAgingReport` / arSummary / apSummary wrappers.
+
+- `frontend/src/app/reports/page.tsx`:
+  - استيراد `ApAgingBucketKey` و `ApAgingReport`.
+  - `'ap-aging'` في `SectionKey` union + `sections` state initializer.
+  - `case 'ap-aging'` في `loadOne` switch (يستخدم `api.apAgingReport(q)`).
+  - `'ap-aging'` في `reloadAll` array — parallel fire مع `'ar-aging'`.
+  - ثابتا `AP_AGING_BUCKET_LABEL` و `AP_AGING_BUCKET_ORDER` (5 مفاتيح بأسماء عربية، typing مُحَكَّم: `Record<ApAgingBucketKey, string>` و `readonly ApAgingBucketKey[]` — نفس الـ `tsc --strict` discipline الـ introduced في Phase 9C-code).
+  - مكوّن `<ApAgingSection>` كامل (≈ 155 سطر، mirror لـ `<ArAgingSection>`): 5 StatTiles + جدول 5 buckets + جدول `bySupplier.rows` 3 أعمدة (Name, total, outstanding — **بدون** عمود `paid`؛ slide max 30).
+  - JSX `<section>` للقسم AP Aging جنب الـ AR Aging section، كلاهما `lg:col-span-2`، `statusFilterLabel={AR_PURCHASE_STATUS.RECEIVED}` (للحالة مقفلة `'مستلمة'` echoing من الخادم).
+
+### AP Aging Per-Component Data-Shape Table (frontend ↔ backend contract)
+
+| Tile / Row | مصدر Backend | عرض Frontend |
+|------------|---------------|---------------|
+| `data.currency = 'SAR'` | `ApAgingData.currency` | ✅ `StatTile` "العملة" |
+| `data.dateField = 'receivedAt'` | `ApAgingData.dateField` | ✅ `StatTile` "حقل التاريخ" → "تاريخ الاستلام (receivedAt)" |
+| `filters.status = 'RECEIVED'` | `ApAgingFilters.status` (locked من الخادم) | ✅ `StatTile` "فلتر الحالة" → echoes "مستلمة" من الخادم |
+| `filters.asOfDate` | `ApAgingFilters.asOfDate` (server-computed ISO) | ✅ `StatTile` "تاريخ التقرير (asOfDate)" |
+| `totals.invoiceCount` | `ApAgingData.totals.invoiceCount` | ✅ `StatTile` "إجمالي الفواتير" |
+| `totals.outstanding` | `ApAgingData.totals.outstanding` | ✅ `StatTile` "إجمالي المتبقي (outstanding)" |
+| `buckets[5]` × `{invoiceCount, outstanding}` | `ApAgingData.buckets` | ✅ جدول 5 صفوف (current, 1-30, 31-60, 61-90, +90) × (2 cols، بنفس النمط الـ AR) |
+| `bySupplier.rows[]` × `{supplierId, supplierCode, supplierName, total, outstanding, buckets}` | `ApAgingData.bySupplier.rows` | ✅ جدول 3 cols (Name, total, outstanding) — **بدون** عمود `paid`؛ slide max 30؛ الـ `buckets` field موجود على الـ type لكن لا يظهر في الجدول (للـ symmetry مع AR side؛ ممكن 9F drill-down) |
+
+### Security / tenancy (unchanged from Phase 1+2+3+4+5+6+7+8+9)
+
+- `companyId` من `@CurrentUser() me.companyId` فقط — **لا** يقبل من الـ query ولا الـ body.
+- `@UseGuards(JwtAuthGuard, PermissionsGuard)` global على `ReportsController` يغطي الـ endpoint الجديد تلقائياً.
+- `@RequirePermissions('reports.read')` على `apAging` exactly مثل الـ 9 methods الأخرى (10 endpoints الآن لـ `reports.read`).
+- `status = RECEIVED` hard-locked داخل الـ `where` — حتى لو الـ client مرّر `query.status` لن يصل إلى الـ DB.
+- `supplierId` filter اختياري — لو مُحدد، الـ JOIN ضمناً يحقق أن الـ supplier ينتمي للـ `companyId` نفسها (`Partner.companyId == @CurrentUser().companyId`).
+- `Prisma.Decimal` arithmetic في الـ service عبر `decimalToString`؛ `Number()` في أي math path الحسابي **ممنوع**.
+- لا `companyId` من الـ URL أو الـ form body.
+- لا tokens في `localStorage` / `sessionStorage`.
+- لا `asOfDate` في الـ input — يُحسب من الخادم (`new Date().toISOString()`)، frontend يعرضه فقط.
+- لا `paidAmount` field مخترَع client-side — الـ schema في الـ backend لا يحوي `paidAmount` على `PurchaseInvoice`، فـ mirror النوع `ApAgingSupplierRow` يحوي `total` + `outstanding` فقط.
+
+### Out of scope (Phase 9E — explicit)
+
+- لا `payments` module — لا API لـ "تسجيل دفعة" ولا "تعديل دفعة" أو "حذف دفعة" أو "إلغاء دفعة" على الـ AP side.
+- لا `reconciliation` logic — لا شيء يُطابق الـ payments مع الـ GL (الـ GL الـ raw payments غير موجودة أصلاً في الـ lineup Phase 6).
+- لا `AP payment settlement` — الـ outstanding يبقى = الـ full `total` حتى الـ future Phase 10B (التالية الـ scoped).
+- لا schema migration — لا `prisma migrate dev` ولا `schema.prisma` edit؛ حسابات الـ outstanding الحالية تستخدم الـ columns المتاحة أصلاً (`PurchaseInvoice.total`).
+- لا RBAC changes — لا permissions جديدة، لا roles جديدة، لا guards جديدة؛ `@RequirePermissions('reports.read')` فقط، الـ permission الوحيد لـ reports.
+- لا deployment — لا Docker Compose orchestration change، لا Cloudflare Pages، لا hosted deploy، لا hosted identity، لا e2e للـ frontend؛ الـ backend e2e regression (113/113 PASS) فقط للتأكد أن الـ invariants سليمة على الـ same dataset.
+
+### Hard prohibitions honored (Phase 9E)
+
+- لا skills مُشغَّلة أو مُستدعاة في الـ loop الكامل (9E-B-1 → 9E-D-2).
+- لا cloudflare / workers / wrangler / OAuth / external auth / hosted deploy / hosted identity.
+- لا `$queryRaw` / raw SQL — كل الـ DB calls عبر `prisma.purchaseInvoice.findMany` فقط مع limited `select` (المطلوب للـ grouping على `supplierId` عبر الـ small relation table، لا JOIN raw).
+- لا payments module / settlement tracking / payment reconciliation — الـ `PurchaseInvoice` يحوي `total` فقط، ولا API replace الـ outstanding بـ `(total - paidAmount)` لأن الـ schema لا يحوي الـ latter أصلاً.
+- لا posting تلقائي للـ outstanding payables إلى الـ journal.
+- لا trial balance ولا قوائم مالية (دخل / ميزانية / VAT / ZATCA).
+- لا e2e tests للـ frontend (Jest/Playwright في الـ Next.js client) — الـ backend `nest build` / `jest e2e` فقط يجب أن يمر.
+- لا README/e2e/RBAC/schema/docker/Dockerfile/docker-compose/seed/Prisma modifications — كل ملف في الـ scope المُصرَّح به فقط:
+  - 9E-B-1 + 9E-B-2 → `backend/src/reports/{reports.service.ts, reports.controller.ts}`
+  - 9E-B-3 → `backend/test/reports.e2e-spec.ts`
+  - 9E-C-code → `frontend/src/lib/api.ts` و `frontend/src/app/reports/page.tsx`
+  - 9E-D-2 → `README.md` فقط (هذا الـ commit).
+- لا `git add .` ولا `git add -A` — كل الـ commits الـ 4 في phase-9e يستخدمون `git add <file>...` صراحةً (نفس الـ discipline الـ introduced في Phase 6A و 7B و 8B و 9B).
+- لا cf-byok-deploy / designer-handoff / gsk-hosted-deploy / gsk-hosted-identity skill activation.
+
+### Backend e2e regression invariant (Phase 9E)
+
+- `pnpm --filter @erp/backend test:e2e` ⇒ **113 passed / 113 total** (Post 9E-B-3، ثابت على 9E-D-1 و 9E-D-2):
+  - `test/app.e2e-spec.ts` (16–17 s startup + smoke-e2e health/JWT).
+  - `test/reports.e2e-spec.ts` (≈ 19 s، يحوي الآن `it('4j) ap-aging data (Phase 9E-B-3) has the AP aging contract shape` + `it('5) ap-aging` query smoke entry).
+  - 2 test suites passing، 113 tests passing، 0 failing، 0 flake بعد الـ re-run الـ sole على `it('5)` في الـ first Phase 9E-B-3 invocation بسبب socket-pool race على الـ 12 simultaneous admin-agent `Promise.all` calls — غير bug حقيقيّ، الـ second run كان clean ولا حاجة لـ rebuild.
+
+### Frontend build invariant (Phase 9E)
+
+- `pnpm --filter @erp/frontend build` ⇒ Next.js 14.2.35 compiled SUCCESS.
+- Route table يبقى 13 routes ثابتة، `/reports = 7.28 kB / 107 kB First Load JS` (بالضبط +0.26 kB vs Phase 9C-code، بدون drift بعد 9E-C-code).
+- لا `-warn` ولا `-error` على الـ build log.
+
+### Recommendation
+
+**Phase 9E (AP Aging — Outstanding-only buckets) انتهت** على مستوى:
+
+- `9E-B-1` (skeleton: controller endpoint + DTO lock + PLANNED shape + asOfDate server-computed) و `9E-B-2` (calculations: RECEIVED hard-lock + 3-leg OR-group date filter + `effectiveApAgingDate = receivedAt ?? dueDate ?? purchaseDate` + JS bucket math + `apSafeOutstanding = max(0, total)` + per-supplier rows) و `9E-B-3` (smoke tests: ROUTES 401/403 + READY shape + query smoke بدون `supplierId` filter) — backend.
+- `9E-C-code` (frontend wiring: wrapper + 6 types mirror بدون `paid` field + مكوّن `<ApAgingSection>` بدون عمود `paid` + JSX section) — frontend.
+- `9E-D-1` (verification: working tree clean، HEAD = `ba0b014`، scope limited to README-only، backend build PASS، backend e2e PASS = 113/113، frontend build PASS) و `9E-D-2` (README closure: هذا الـ commit).
+
+كل الـ computed values (`totals.invoiceCount`, `totals.outstanding`, `buckets[5]`, `bySupplier.rows[]`) تأتي من الـ Prisma.Decimal arithmetic في الـ backend عبر JS — لا Number حسابي في أي math path. الـ permissions واحدة (`reports.read`) لـ 10 endpoints الآن، والـ tenant isolation من JWT فقط، والـ outstanding هو الـ full `total` بدون `paidAmount` subtraction لأن الـ schema لا يحوي الـ column.
+
+**الحدود الـ strict لـ Phase 9E**:
+
+- لا `payments` module — لا كتابة على `Payment` model (الـ absent أصلاً من الـ lineup الـ up-to-Phase-8).
+- لا `reconciliation` — لا matching بين الـ outstanding والـ bank statements.
+- لا `AP payment settlement` tracking — الـ outstanding يبقى الـ full `total` حتى Phase 10B.
+- لا customer/partner drill-down statements (لا /partners/:id/account-statement route).
+- لا cash flow forecasting من الـ aging data.
+- لا PDF / Excel / SVG export للـ aging report.
+- لا charts ولا visualizations (لا recharts ولا Chart.js ولا D3).
+- لا multi-currency — `'SAR'` literal فقط (تمامًا مثل Phase 9).
+- لا email/notification trigger based on overdue thresholds.
+- لا mutation API على `PurchaseInvoice.receivedAt` (read-only aggregation layer تمامًا مثل Phase 9).
+
+كل واحد من هذه الـ 9 بنود هو **مرحلة منفصلة قادمة محتملة** (بحجمها الخاص)، ولا يجب جمعها:
+
+- إمّا **AR Payments + Settlement Tracking** (10A) — API لتسجيل الدفع + reconciliation logic على الـ AR side.
+- أو **AP Payments + Settlement Tracking** (10B) — مرآة الـ 10A لكن لـ `PurchaseInvoice`، الـ schema يحصل فيها على `paidAmount` + الـ mutation APIs + الـ reconciliation الـ suitable للـ receivedAt timeline.
+- أو **Customer/Supplier Statements** (11A — frontend drill-down per partner).
+- أو **AR / AP ↔ GL Integration** (12A — auto-posting outstanding receivables/payables على invoice issue/receive).
+- أو **Notifications** (13A — email/SMS على الـ overdue thresholds).
+- أو **AP Aging Drill-down** (داخل الـ 9E: ممكن extension في phase لاحقة لعرض الـ `supplierId` → قائمة الـ invoices الـ underlying، لكن ليس في الـ scope الـ current).
+- أو **Multi-currency layer** (14A — لو multi-currency صار أولوية؛ الآن خارج الـ نطاق).
+
+وكل مرحلة يجب أن تكون **single-domain** فقط. ولا deployment بأمر المستودع هذا — فقط local Docker Compose. ولا hosted deploy / hosted identity في هذه المرحلة (ولا في المراحل القادمة إلا بموافقة صريحة).
+
+→ Phase 9E closure verified. Phase 9E-D-2 (README update) sealed.
