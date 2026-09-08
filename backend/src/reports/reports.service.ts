@@ -117,7 +117,8 @@ export type ReportName =
   | 'accounting-summary'
   | 'ar-summary'
   | 'ap-summary'
-  | 'ar-aging';
+  | 'ar-aging'
+  | 'ap-aging';
 
 export interface PlannedReportResponse {
   report: ReportName;
@@ -236,6 +237,82 @@ export interface ArAgingPlannedResponse {
 export type ArAgingResponseOrPlanned =
   | ArAgingResponse
   | ArAgingPlannedResponse;
+
+// --------------------------------------------------------------------
+// AP Aging (Phase 9E-B-1 skeleton only)
+//
+//   * Skeleton only in 9E-B-1: full implementation lands in 9E-B-2.
+//   * Mirrors `ArAgingBucketKey` (same 5 buckets: current / 1-30 /
+//     31-60 / 61-90 / +90).
+//   * `bySupplier` not `byCustomer` — `PurchaseInvoice` is on the
+//     `supplierId` axis.
+//   * `PurchaseInvoice.paidAmount` does NOT exist (verified in
+//     `backend/prisma/schema.prisma`, `model PurchaseInvoice`
+//     lines 507-545: the column was intentionally OMITTED in
+//     7B-3 / 8B-2 — AP has no payment/settlement table yet).
+//     Therefore `outstanding = total` always on this side; the
+//     `safeOutstanding` helper from AR is NOT imported here.
+//     Computed in 9E-B-2.
+//   * Hard-locked `status` is `'RECEIVED'` (mirrors AR's lock to
+//     `'ISSUED'`); the DTO's `status` query param is accepted but
+//     not surfaced in the response for 9E-B-1.
+//   * `dateField` is `'receivedAt'`; fallback chain is
+//     `receivedAt ?? dueDate ?? createdAt` — implemented in 9E-B-2.
+// ----------------------------------------------------------------------
+
+export type ApAgingBucketKey = 'current' | '1-30' | '31-60' | '61-90' | '+90';
+
+export interface ApAgingFilters {
+  fromDate: string | null;
+  toDate: string | null;
+  supplierId: string | null;
+  status: string | null;
+  asOfDate: string;
+}
+
+export interface ApAgingBucket {
+  invoiceCount: number;
+  outstanding: string;
+}
+
+export interface ApAgingSupplierRow {
+  supplierId: string;
+  supplierCode: string | null;
+  supplierName: string | null;
+  total: string;
+  outstanding: string;
+  buckets: Record<ApAgingBucketKey, ApAgingBucket>;
+}
+
+export interface ApAgingBySupplier {
+  rows: ApAgingSupplierRow[];
+}
+
+export interface ApAgingData {
+  currency: 'SAR';
+  dateField: 'receivedAt';
+  statusFilter: 'RECEIVED';
+  buckets: Record<ApAgingBucketKey, ApAgingBucket>;
+  totals: { invoiceCount: number; outstanding: string };
+  bySupplier: ApAgingBySupplier;
+}
+
+export type ApAgingResponse = Omit<ReadyResponse<ApAgingData>, 'filters'> & {
+  filters: ApAgingFilters;
+};
+
+export interface ApAgingPlannedResponse {
+  report: 'ap-aging';
+  status: 'PLANNED';
+  companyId: string;
+  filters: ApAgingFilters;
+  generatedAt: string;
+  data: null;
+}
+
+export type ApAgingResponseOrPlanned =
+  | ApAgingResponse
+  | ApAgingPlannedResponse;
 
 // ---- AR data shapes (Phase 8B-2) ----------------------------------
 //   Backed by SalesInvoice — invoice-level aggregates + status
@@ -2254,5 +2331,64 @@ export class ReportsService {
       return (value as { toFixed: (n: number) => string }).toFixed(4);
     }
     return String(value);
+  }
+
+  // ----------------------------------------------------------------
+  // AP Aging — Phase 9E-B-1 skeleton
+  //
+  //   Status: PLANNED only.
+  //
+  //   * `status: 'RECEIVED'` is hard-locked (mirrors AR's
+  //     ISSUED lock). The DTO's `status` query param is
+  //     accepted but not surfaced in the response shape.
+  //   * `dateField: 'receivedAt'` with fallback chain
+  //     `receivedAt ?? dueDate ?? createdAt`. Fallback
+  //     logic lands in 9E-B-2.
+  //   * `bySupplier.rows[]` per-supplier breakdown — not
+  //     `byCustomer` (PurchaseInvoice has no customerId
+  //     column). Joins to `Partner.code` / `name` via
+  //     `supplierId` in 9E-B-2.
+  //   * `PurchaseInvoice.paidAmount` does NOT exist in the
+  //     Prisma schema (confirmed in 9E-B-1 schema read;
+  //     model lines 507-545, field intentionally OMITTED
+  //     in 7B-3 / 8B-2). Therefore `outstanding = total`
+  //     always on this side.
+  //   * Tenant scope is JWT-only (no `query.companyId`).
+  //   * `asOfDate` is server-computed UTC ISO timestamp
+  //     (matches the Phase 9B-1 contract used by
+  //     `arAging` at lines 2001-2003). NOT read from `q`
+  //     because the DTO does not expose `asOfDate` in
+  //     7B-1/7B-2 — this is the explicit fix for the
+  //     build error raised immediately after 9E-B-1 Edit #3.
+  //
+  //   Full implementation lands in 9E-B-2.
+  // ----------------------------------------------------------------
+  async apAging(
+    companyId: string,
+    q: ReportQueryDto,
+  ): Promise<ApAgingResponseOrPlanned> {
+    // asOfDate — server-computed UTC ISO timestamp (matches
+    // the Phase 9B-1 contract; mirrors `arAging` body at
+    // lines 2001-2003). The DTO does not expose `asOfDate`.
+    const asOf = new Date();
+    const asOfDate = asOf.toISOString();
+
+    const filters: ApAgingFilters = {
+      fromDate: q.fromDate ?? null,
+      toDate: q.toDate ?? null,
+      supplierId: q.supplierId ?? null,
+      status: q.status ?? null,
+      asOfDate,
+    };
+
+    const planned: ApAgingPlannedResponse = {
+      report: 'ap-aging',
+      status: 'PLANNED',
+      companyId,
+      filters,
+      generatedAt: new Date().toISOString(),
+      data: null,
+    };
+    return planned;
   }
 }
