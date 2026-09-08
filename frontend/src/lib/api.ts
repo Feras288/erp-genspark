@@ -521,6 +521,21 @@ export const api = {
   // `backend/src/reports/reports.service.ts` (Phase 9B-2).
   arAgingReport: (params: ReportQueryParams = {}) =>
     apiRequest<ArAgingReport>(`/reports/ar-aging?${buildReportQuery(params)}`),
+
+  // ===== Phase 9E-C-code: AP Aging =====
+  // Read-only aggregate. Same RBAC surface as AR Aging
+  // (server-side `@RequirePermissions('reports.read')`).
+  // `query.status` is forced to `RECEIVED` server-side
+  // (D4 lock — see 9E-B-1 / 9E-B-2 reports.service.ts notes)
+  // and is therefore not forwarded here. Bucket math
+  // (`current`, `1-30`, `31-60`, `61-90`, `+90`) and the
+  // per-supplier breakdown are computed in
+  // `backend/src/reports/reports.service.ts` (Phase 9E-B-2).
+  // No `supplierId` shortcut on the DTO either — it is
+  // accepted at the boundary but the service also performs
+  // an explicit allowlist via JWT-only companyId lookup.
+  apAgingReport: (params: ReportQueryParams = {}) =>
+    apiRequest<ApAgingReport>(`/reports/ap-aging?${buildReportQuery(params)}`),
 };
 
 // =====================================================
@@ -1281,6 +1296,78 @@ export interface ArAgingCustomerRow {
   outstanding: string;
   buckets: Record<ArAgingBucketKey, ArAgingBucket>;
 }
+
+// ---- ap-aging (Phase 9E-C-code) ----
+//
+// Must mirror `backend/src/reports/reports.service.ts` exports
+//   `ApAgingBucketKey`, `ApAgingBucket`, `ApAgingSupplierRow`,
+//   `ApAgingData`, `ApAgingFilters` (landed in Phase 9E-B-1
+//   / 9E-B-2 in the service.ts).
+// Contract is READY-only on this wrapper (no PLANNED sentry
+// path; the skeleton was Phase 9E-B-1 and full bucket math
+// landed in Phase 9E-B-2). Per Phase 7B-1 RBAC: the backend
+// forces `status: RECEIVED` (D4 lock; mirrors AR's ISSUED
+// lock); client never forwards `query.status` here.
+// `companyId` is JWT-only — never serialised.
+//
+// IMPORTANT: `ApAgingSupplierRow` carries no `paid` field.
+// `PurchaseInvoice.paidAmount` does NOT exist on the Prisma
+// schema (`backend/prisma/schema.prisma` `model PurchaseInvoice`
+// lines 507-545 — the column was intentionally OMITTED in
+// 7B-3 / 8B-2; verified again in Phase 9E-B-1). Therefore
+// `outstanding === total` always on this side, and including
+// `paid` here would either fail type-strictness or tempt a
+// caller to read zero everywhere for a column that is
+// semantically undefined.
+//
+// We deliberately do NOT add fields beyond what the backend
+// contract emits. Adding a new field here without mirror would
+// break strictness on `tsc --noImplicitAny` and the UI grid.
+
+export type ApAgingBucketKey =
+  | 'current'
+  | '1-30'
+  | '31-60'
+  | '61-90'
+  | '+90';
+
+export interface ApAgingFilters {
+  fromDate: string | null;
+  toDate: string | null;
+  supplierId: string | null;
+  status: string | null;
+  asOfDate: string;
+}
+
+export interface ApAgingBucket {
+  invoiceCount: number;
+  outstanding: string;
+}
+
+export interface ApAgingSupplierRow {
+  supplierId: string;
+  supplierCode: string | null;
+  supplierName: string | null;
+  total: string;
+  outstanding: string;
+  buckets: Record<ApAgingBucketKey, ApAgingBucket>;
+}
+
+export interface ApAgingData {
+  currency: 'SAR';
+  dateField: 'receivedAt';
+  statusFilter: 'RECEIVED';
+  buckets: Record<ApAgingBucketKey, ApAgingBucket>;
+  totals: {
+    invoiceCount: number;
+    outstanding: string;
+  };
+  bySupplier: {
+    rows: ApAgingSupplierRow[];
+  };
+}
+
+export type ApAgingReport = ReportEnvelope<ApAgingData>;
 
 export interface ArAgingData {
   currency: 'SAR';

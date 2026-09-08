@@ -35,6 +35,8 @@ import { useAuth } from '@/lib/auth';
 import { api, ApiError, apiRequest } from '@/lib/api';
 import type {
   AccountingSummaryReport,
+  ApAgingBucketKey,
+  ApAgingReport,
   ArAgingBucketKey,
   ArAgingReport,
   InventorySummaryReport,
@@ -60,7 +62,8 @@ type SectionKey =
   | 'accounting'
   | 'ar'
   | 'ap'
-  | 'ar-aging';
+  | 'ar-aging'
+  | 'ap-aging';
 
 type SectionStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 
@@ -1268,6 +1271,199 @@ function ArAgingSection({
   );
 }
 
+// ---- AP Aging bucket labels (Phase 9E-C-code) --------------------
+// Mirrors the AR_AGING_BUCKET_LABEL ring exactly. The AP-side
+// dateField is `receivedAt` (vs AR's `dueDate`) and the per-row
+// breakdown is `bySupplier` (vs AR's `byCustomer`); the 5
+// canonical bucket keys are identical — current / 1-30 /
+// 31-60 / 61-90 / +90 — and so are the Arabic captions.
+const AP_AGING_BUCKET_LABEL: Record<ApAgingBucketKey, string> = {
+  current: 'حالي (≤ 0 يوم)',
+  '1-30': '1 — 30 يوم',
+  '31-60': '31 — 60 يوم',
+  '61-90': '61 — 90 يوم',
+  '+90': '+90 يوم',
+};
+const AP_AGING_BUCKET_ORDER: readonly ApAgingBucketKey[] = [
+  'current',
+  '1-30',
+  '31-60',
+  '61-90',
+  '+90',
+];
+
+// ---- AP Aging section renderer (Phase 9E-C-code) ---------------
+//
+// Mirrors the AR Aging section above with the AP-side
+// adaptations documented on the backend (`reports.service.ts`
+// Phase 9E-B-2):
+//   * Top-level StatTiles: totals.invoiceCount,
+//     totals.outstanding, statusFilter='RECEIVED' (server-
+//     locked, mirrors AR's ISSUED lock), dateField=
+//     'receivedAt', currency='SAR'. We DO echo the backend-
+//     locked `RECEIVED` filter so the user knows that
+//     query.status is forced server-side (D4 lock).
+//   * 5 bucket table: rows in `current → 1-30 → 31-60 → 61-90
+//     → +90` order, with `invoiceCount` + `outstanding`.
+//   * bySupplier.rows top table: supplierId/Code/Name +
+//     total + outstanding (Decimal @db.Decimal(18,4)
+//     strings). NO `paid` column — `PurchaseInvoice.paidAmount`
+//     does NOT exist on the Prisma schema, so `outstanding`
+//     equals `total` for every supplier row. Cap at 30.
+//
+// We deliberately render ONLY fields from the ApAgingData
+// contract. Backend does the math (Prisma.Decimal in JS);
+// frontend is read-only.
+function ApAgingSection({
+  state,
+  currency,
+  statusFilterLabel,
+}: {
+  state: SectionState;
+  currency: string;
+  statusFilterLabel: string;
+}) {
+  if (state.status === 'idle') {
+    return (
+      <SectionHeader
+        title="تقادم الذمم الدائنة (AP Aging)"
+        status="idle"
+        generatedAt={null}
+      />
+    );
+  }
+  if (state.status === 'loading') {
+    return (
+      <SectionHeader
+        title="تقادم الذمم الدائنة (AP Aging)"
+        status="loading"
+        generatedAt={null}
+      />
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <div>
+        <SectionHeader
+          title="تقادم الذمم الدائنة (AP Aging)"
+          status="error"
+          generatedAt={null}
+        />
+        <ErrorBanner message={`تعذّر تحميل التقرير: ${state.error}`} />
+      </div>
+    );
+  }
+  if (state.status === 'empty' || !state.body) {
+    return (
+      <SectionHeader
+        title="تقادم الذمم الدائنة (AP Aging)"
+        status="empty"
+        generatedAt={null}
+      />
+    );
+  }
+  const r = state.body as ApAgingReport['data'];
+  return (
+    <div>
+      <SectionHeader
+        title="تقادم الذمم الدائنة (AP Aging)"
+        status="ok"
+        generatedAt={null}
+      />
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-3">
+        <StatTile label="إجمالي الفواتير" value={fmtInt(r.totals.invoiceCount)} />
+        <StatTile
+          label="إجمالي المتبقي (outstanding)"
+          value={`${fmtMoney(r.totals.outstanding)} ${currency}`}
+        />
+        <StatTile
+          label="فلتر الحالة (مقفل من الخادم)"
+          value={statusFilterLabel}
+          dir="rtl"
+        />
+        <StatTile
+          label="حقل التاريخ"
+          value="تاريخ الاستلام (receivedAt)"
+          dir="rtl"
+        />
+        <StatTile label="العملة" value={r.currency} dir="ltr" />
+      </div>
+      <p className="text-[11px] text-slate-400 mb-3">
+        فواتير المشتريات المستلمة فقط (RECEIVED) مع outstanding موجب.
+        الفترة الحالية تعني daysPastDue ≤ 0 — أي الفاتورة لم تتأخر بعد.
+        مرجع التاريخ الأساسي receivedAt، وعند غيابه يُستخدم dueDate ثم
+        purchaseDate (قياسي لكل صف). عمود `paidAmount` غير موجود في
+        المخطط (PurchaseInvoice.paidAmount = ‎)؛ يَتبقى outstanding ≡ total.
+      </p>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1">
+        التوزيع حسب فترات التقادم
+      </h3>
+      <div className="overflow-x-auto mb-4">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">الفترة</th>
+              <th className="text-start py-1 px-2">عدد الفواتير</th>
+              <th className="text-start py-1 px-2">المتبقي</th>
+            </tr>
+          </thead>
+          <tbody>
+            {AP_AGING_BUCKET_ORDER.map((bk) => (
+              <tr key={bk} className="border-b border-slate-100">
+                <td className="py-1 px-2" dir="rtl">
+                  {AP_AGING_BUCKET_LABEL[bk]}
+                </td>
+                <td className="py-1 px-2" dir="ltr">
+                  {fmtInt(r.buckets[bk]?.invoiceCount ?? 0)}
+                </td>
+                <td className="py-1 px-2" dir="ltr">
+                  {fmtMoney(r.buckets[bk]?.outstanding ?? null)} {currency}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1 mt-2">
+        التوزيع حسب المورّد (حد أقصى 30)
+      </h3>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">المورّد</th>
+              <th className="text-start py-1 px-2">الإجمالي</th>
+              <th className="text-start py-1 px-2">المتبقي</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!r.bySupplier.rows || r.bySupplier.rows.length === 0 ? (
+              <EmptyRow cols={3} message="لا توجد بيانات مورّدين." />
+            ) : (
+              r.bySupplier.rows.slice(0, 30).map((row) => (
+                <tr key={row.supplierId} className="border-b border-slate-100">
+                  <td className="py-1 px-2" dir="rtl">
+                    <div>{row.supplierName ?? '—'}</div>
+                    {row.supplierCode && (
+                      <div className="text-[10px] text-slate-500" dir="ltr">
+                        {row.supplierCode}
+                      </div>
+                    )}
+                  </td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(row.total)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(row.outstanding)} {currency}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function ApSection({
   state,
   currency,
@@ -1421,6 +1617,7 @@ export default function ReportsPage() {
     ar: emptySectionState(),
     ap: emptySectionState(),
     'ar-aging': emptySectionState(),
+    'ap-aging': emptySectionState(),
   });
 
   // ---- Filters ---------------------------------------------------
@@ -1484,6 +1681,9 @@ export default function ReportsPage() {
           case 'ar-aging':
             body = (await api.arAgingReport(q)).data;
             break;
+          case 'ap-aging':
+            body = (await api.apAgingReport(q)).data;
+            break;
         }
         setSection({ status: 'ok', error: null, body });
       } catch (e) {
@@ -1502,7 +1702,7 @@ export default function ReportsPage() {
   const reloadAll = useCallback(async () => {
     if (!canRead) return;
     await Promise.all(
-      (['sales', 'pos', 'purchases', 'inventory', 'stock-movements', 'accounting', 'ar', 'ap', 'ar-aging'] as SectionKey[]).map(
+      (['sales', 'pos', 'purchases', 'inventory', 'stock-movements', 'accounting', 'ar', 'ap', 'ar-aging', 'ap-aging'] as SectionKey[]).map(
         (k) => loadOne(k),
       ),
     );
@@ -1758,6 +1958,14 @@ export default function ReportsPage() {
             state={sections['ar-aging']}
             currency="SAR"
             statusFilterLabel={AR_SALES_STATUS.ISSUED}
+          />
+        </section>
+
+        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">
+          <ApAgingSection
+            state={sections['ap-aging']}
+            currency="SAR"
+            statusFilterLabel={AR_PURCHASE_STATUS.RECEIVED}
           />
         </section>
 
