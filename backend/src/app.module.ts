@@ -9,6 +9,12 @@
 //             land in Phase 4B-2 and 4B-3).
 // Phase 5: Purchases Core (DRAFT create/update/delete, receive, cancel).
 // Phase 6: Accounting Core (Chart of Accounts + Manual Journal Entries only).
+// Phase 7B-1: Reports Core backend skeleton (6 read-only endpoints,
+//             `status: 'PLANNED'` payloads, no queries, no
+//             aggregations, no seed change — real numbers land in
+//             Phase 7B-2+). No ZATCA, no VAT, no Trial Balance,
+//             no Balance Sheet, no P&L, no AR/AP, no payments,
+//             no reconciliation, no automated posting.
 // =====================================================
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
@@ -28,6 +34,7 @@ import { SalesModule } from './sales/sales.module';
 import { PosModule } from './pos/pos.module';
 import { PurchasesModule } from './purchases/purchases.module';
 import { AccountingModule } from './accounting/accounting.module';
+import { ReportsModule } from './reports/reports.module';
 
 @Module({
   imports: [
@@ -62,6 +69,13 @@ import { AccountingModule } from './accounting/accounting.module';
     // No reports, no ZATCA, no automated posting, no AR/AP, no payments,
     // no cost accounting, no payroll, no SaaS billing, no returns/debit/credit notes.
     AccountingModule,
+    // Phase 7B-1 — Reports Core backend skeleton only.
+    // 6 read-only endpoints; `status: 'PLANNED'` payloads;
+    // no aggregations, no seed change, no Prisma schema
+    // change. Reuses the already-seeded `reports.read`.
+    // No ZATCA, no VAT, no TB/BS/P&L, no AR/AP, no payments,
+    // no reconciliation, no automated posting, no PDF/Excel.
+    ReportsModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.
