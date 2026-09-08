@@ -2071,3 +2071,152 @@ Time:        19.4 s
 - أو **Multi-currency layer** (13A — لو multi-currency صار أولوية؛ الآن خارج النطاق).
 
 وكل مرحلة يجب أن تكون **single-domain** فقط. ولا deployment بأمر المستودع هذا — فقط local Docker Compose. ولا hosted deploy / hosted identity في هذه المرحلة (ولا في المراحل القادمة إلا بموافقة صريحة).
+
+## Phase 9: AR Aging — Outstanding-only buckets (no payments, no settlement)
+
+### Family
+
+- `9B-1`: backend skeleton — endpoint registration + DTO lock.
+- `9B-2`: backend calculations — ISSUED hard-lock + JS bucket math + per-customer rows.
+- `9B-3`: backend e2e smoke — ROUTES 401/403 + READY shape + query smoke.
+- `9C-code`: frontend wiring — Next.js API helper + types mirror + reports page sub-section.
+- `9D-1`: final verification only — no commits, no edits, no pushes; e2e regression check.
+- `9D-2`: README update and final closure (هذا الـ commit).
+
+### Conventional Commits على `main`
+
+```
+d494ea6 feat(phase-9): wire AR aging into reports frontend    ← Phase 9C-code
+bce5dd8 test(phase-9): add AR aging backend e2e smoke         ← Phase 9B-3
+c85a59d feat(phase-9): add AR aging calculations              ← Phase 9B-2
+fa9404a feat(phase-9): add AR aging skeleton                  ← Phase 9B-1
+```
+
+### Backend additions
+
+- Endpoint جديد: `GET /api/reports/ar-aging` مُقيَّد بـ `@RequirePermissions('reports.read')` تمامًا مثل الـ 8 endpoints السابقة.
+- `companyId` من `@CurrentUser() me.companyId` فقط — **لا** يقبل من الـ query ولا الـ body.
+- DTO lock: `ReportQueryDto` بدون `companyId`؛ status مقفل على `ISSUED` داخل الـ `where` ويُتجاهل `query.status` عمداً (D4 lock).
+- `WHERE` clause: `companyId = JWT + status = ISSUED + OR(dueDate ∈ [fromDate, toDate], dueDate null + issueDate ∈ [fromDate, toDate])`.
+- `findMany({ take: 5001 })` كحماية: لو عدد الـ invoices الـ returned > 5000، يُرمى `BadRequestException`.
+- Bucket math في JS/TypeScript (لا raw SQL، لا `$queryRaw`):
+  - `effectiveAgingDate = dueDate ?? issueDate` — لكل صف على حدة.
+  - `daysPastDue = max(0, ceil((asOfDate - effectiveDate) / 1 day))`.
+  - 5 buckets: `current` (≤0)، `1-30` (1..30)، `31-60` (31..60)، `61-90` (61..90)، `+90` (+infinity).
+  - `outstanding = max(0, total − paidAmount)`؛ الـ Prisma.Decimal arithmetic حصراً، `Number()` الحسابي **ممنوع**.
+  - `paidAmount = null → 0`؛ rows ذات `outstanding ≤ 0` تُحذف.
+- Per-customer breakdown: تجميع الـ rows على `customerId` — الـ null customerId يُجمَّع تحت `'__no_customer__'` placeholder ثم يُفلتر من `byCustomer.rows` (لا يظهر في الـ UI).
+- الـ serialization: `Prisma.Decimal @db.Decimal(18,4)` عبر `decimalToString` على كل حقل مالي في الـ serialization.
+
+### Backend data contract (`ArAgingResponse`)
+
+```ts
+type ArAgingBucketKey = 'current' | '1-30' | '31-60' | '61-90' | '+90';
+
+type ArAgingData = {
+  currency: 'SAR';
+  dateField: 'dueDate';
+  statusFilter: 'ISSUED';
+  buckets: Record<ArAgingBucketKey, { invoiceCount: number; outstanding: string }>;
+  totals: { invoiceCount: number; outstanding: string };
+  byCustomer: { rows: ArAgingCustomerRow[] };
+};
+
+type ArAgingResponse = Omit<ReadyResponse<ArAgingData>, 'filters'> & {
+  filters: { fromDate; toDate; customerId; status; asOfDate };
+};
+```
+
+### Frontend additions
+
+- `frontend/src/lib/api.ts`:
+  - Wrapper جديد واحد: `arAgingReport: (params: ReportQueryParams = {}) => apiRequest<ArAgingReport>(...)` — نفس النمط الـ 6 wrappers الموجودة (sales/pos/purchases/inventory/stockMovements/accounting).
+  - 6 types جديدة mirror: `ArAgingBucketKey`, `ArAgingFilters`, `ArAgingBucket`, `ArAgingCustomerRow`, `ArAgingData`, `ArAgingReport`.
+  - لا تعديل على arSummary/apSummary wrappers (مربوطان Phase 8C-code).
+
+- `frontend/src/app/reports/page.tsx`:
+  - استيراد `ArAgingBucketKey` و `ArAgingReport`.
+  - `'ar-aging'` في `SectionKey` union + `sections` state initializer.
+  - `case 'ar-aging'` في `loadOne` switch (يستخدم `api.arAgingReport(q)`).
+  - `'ar-aging'` في `reloadAll` array — parallel fire.
+  - ثابتا `AR_AGING_BUCKET_LABEL` و `AR_AGING_BUCKET_ORDER` (5 مفاتيح بأسماء عربية، typing مُحَكَّم: `Record<ArAgingBucketKey, string>` و `readonly ArAgingBucketKey[]`).
+  - مكوّن `<ArAgingSection>` كامل (≈ 170 سطر): 6 StatTiles + جدول 5 buckets + جدول `byCustomer.rows` (أوائل 30 صف).
+  - JSX `<section>` للقسم AR Aging بعد `<ApSection>` وقبل `<StockMovementsSection>`.
+
+### AR Aging Per-Component Data-Shape Table (frontend ↔ backend contract)
+
+| Tile / Row | مصدر Backend | عرض Frontend |
+|------------|---------------|---------------|
+| `totals.invoiceCount` | `ArAgingData.totals.invoiceCount` | ✅ `StatTile` "إجمالي الفواتير" |
+| `totals.outstanding` | `ArAgingData.totals.outstanding` | ✅ `StatTile` "إجمالي المتبقي (outstanding)" |
+| `filters.asOfDate` | `ArAgingFilters.asOfDate` (ISO) | ✅ `StatTile` "تاريخ التقرير (asOfDate)" |
+| `statusFilter = 'ISSUED'` | `ArAgingData.statusFilter` | ✅ `StatTile` "فلتر الحالة (مقفل من الخادم)" |
+| `dateField = 'dueDate'` | `ArAgingData.dateField` | ✅ `StatTile` "حقل التاريخ" → "تاريخ الاستحقاق (dueDate)" |
+| `currency = 'SAR'` | `ArAgingData.currency` | ✅ `StatTile` "العملة" |
+| `buckets[5]` × `{invoiceCount, outstanding}` | `ArAgingData.buckets` | ✅ جدول 5 صفوف (current, 1-30, 31-60, 61-90, +90) × (2 cols) |
+| `byCustomer.rows[]` × `{customerId, Code, Name, total, paid, outstanding, buckets}` | `ArAgingData.byCustomer.rows` | ✅ جدول 4 cols (Name, total, paid, outstanding) — slide max 30 |
+
+### Security / tenancy (unchanged from Phase 1+2+3+4+5+6+7+8)
+
+- `companyId` من `@CurrentUser() me.companyId` فقط — **لا** يقبل من الـ query ولا الـ body.
+- `@UseGuards(JwtAuthGuard, PermissionsGuard)` global على `ReportsController` يغطي الـ endpoint الجديد تلقائياً.
+- `@RequirePermissions('reports.read')` على `arAging` exactly مثل الـ 8 methods الأخرى.
+- `status = ISSUED` hard-locked داخل الـ `where` — حتى لو الـ client مرّر `query.status` لن يصل إلى الـ DB.
+- `customerId` filter اختياري — لو مُحدد، الـ JOIN ضمناً يحقق أن الـ customer ينتمي للـ `companyId` نفسها.
+- `Prisma.Decimal` arithmetic في الـ service (`total − paidAmount`)؛ `Number()` في أي math path الحسابي **ممنوع**.
+- لا `companyId` من الـ URL أو الـ form body.
+- لا tokens في `localStorage` / `sessionStorage`.
+- لا `asOfDate` في الـ input — يُحسب من الخادم (`new Date().toISOString()`)، frontend يعرضه فقط.
+
+### Hard prohibitions honored (Phase 9)
+
+- لا skills مُشغَّلة أو مُستدعاة في الـ loop الكامل (9B-1 → 9D-2).
+- لا cloudflare / workers / wrangler / OAuth / external auth / hosted deploy / hosted identity.
+- لا `$queryRaw` / raw SQL — كل الـ DB calls عبر `prisma.salesInvoice.findMany` فقط مع limited `select/include`.
+- لا payments module / settlement tracking / payment reconciliation — `paidAmount` يُقرأ فقط من `SalesInvoice.paidAmount` لتقليل الحساب، لا إنشاء ولا تعديل.
+- لا aging batches للـ AP (الـ supplier receivables) — `apAging` خارج هذه الـ phase.
+- لا posting تلقائي للـ outstanding receivables إلى الـ journal.
+- لا trial balance ولا قوائم مالية (دخل / ميزانية / VAT / ZATCA).
+- لا e2e tests للـ frontend (Jest/Playwright في الـ Next.js client) — الـ backend tsc build فقط يجب أن يمر.
+- لا README/e2e/RBAC/schema/docker/Dockerfile/docker-compose modifications — كل ملف في الـ scope المُصرَّح به فقط:
+  - 9B-1 + 9B-2 → `backend/src/reports/{reports.service.ts, reports.controller.ts}`
+  - 9B-3 → `backend/test/reports.e2e-spec.ts`
+  - 9C-code → `frontend/src/lib/api.ts` و `frontend/src/app/reports/page.tsx`
+  - 9D-2 → `README.md` فقط (هذا الـ commit).
+- لا `git add .` ولا `git add -A` — كل الـ commits الـ 4 في phase-9 يستخدمون `git add <file>...` صراحةً.
+- لا `cf-byok-deploy` / `designer-handoff` / `gsk-hosted-deploy` / `gsk-hosted-identity` skill activation.
+
+### Recommendation
+
+**Phase 9 (AR Aging — Outstanding-only buckets) انتهت** على مستوى:
+
+- `9B-1` (skeleton: controller endpoint + DTO lock) و `9B-2` (calculations: ISSUED hard-lock + JS bucket math + per-customer rows) و `9B-3` (smoke tests: ROUTES 401/403 + READY shape + query smoke) — backend.
+- `9C-code` (frontend wiring: wrapper + types mirror + مكوّن `<ArAgingSection>` + JSX section) — frontend.
+- `9D-1` (verification: working tree clean, HEAD = `d494ea6`, scope limited to 2 files, e2e regression unchanged) و `9D-2` (README closure: هذا الـ commit).
+
+كل الـ computed values (totals.invoiceCount, totals.outstanding, buckets[5], byCustomer.rows[]) تأتي من الـ Prisma.Decimal arithmetic في الـ backend عبر JS — لا Number حسابي في أي math path. الـ permissions واحدة (`reports.read`) لـ 9 endpoints الآن، والـ tenant isolation من JWT فقط.
+
+**الحدود الـ strict لـ Phase 9**:
+
+- لا `paidAmount` write — القراءة فقط لتقليل الحساب، لا API لـ "تسجيل دفعة" ولا "تعديل دفعة".
+- لا aging batches للـ AP — `apAging` خارج هذه الـ phase (ولو الـ backend data model يحوي `PurchaseInvoice.receivedAt`).
+- لا customer drill-down statements (لا /customers/:id/account-statement route).
+- لا cash flow forecasting من الـ aging data.
+- لا PDF / Excel / SVG export للـ aging report.
+- لا charts ولا visualizations (لا recharts ولا Chart.js ولا D3).
+- لا multi-currency — `'SAR'` literal فقط.
+- لا email/notification trigger based on overdue thresholds.
+
+كل واحد من هذه الـ 7 بنود هو **مرحلة منفصلة قادمة محتملة** (بحجمها الخاص)، ولا يجب جمعها:
+
+- إمّا **AP Aging + Outstanding** (9E) — مرآة Phase 9 لكن لـ `PurchaseInvoice` بدل `SalesInvoice`.
+- أو **AR Payments + Settlement Tracking** (10A) — API لتسجيل الدفع + reconciliation logic.
+- أو **AP Payments + Settlement Tracking** (10B).
+- أو **Customer/Supplier Statements** (11A — frontend drill-down per partner).
+- أو **AR / AP ↔ GL Integration** (12A — auto-posting outstanding receivables/payables on invoice issue/receive).
+- أو **Notifications** (13A — email/SMS على الـ overdue thresholds).
+- أو **Multi-currency layer** (14A — لو multi-currency صار أولوية؛ الآن خارج الـ نطاق).
+
+وكل مرحلة يجب أن تكون **single-domain** فقط. ولا deployment بأمر المستودع هذا — فقط local Docker Compose. ولا hosted deploy / hosted identity في هذه المرحلة (ولا في المراحل القادمة إلا بموافقة صريحة).
+
+→ Phase 9 closure verified. Phase 9D-2 (README update) sealed.
