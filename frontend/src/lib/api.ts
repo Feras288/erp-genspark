@@ -511,6 +511,16 @@ export const api = {
 
   accountingSummary: (params: ReportQueryParams = {}) =>
     apiRequest<AccountingSummaryReport>(`/reports/accounting-summary?${buildReportQuery(params)}`),
+
+  // ===== Phase 9C-code: AR Aging =====
+  // Read-only aggregate. Gated by `reports.read` server-side
+  // (NestJS `@RequirePermissions('reports.read')`). `query.status`
+  // is forced to `ISSUED` server-side (D4 lock) and is therefore
+  // not forwarded here. Bucket math (`current`, `1-30`, `31-60`,
+  // `61-90`, `+90`) and per-customer breakdown are computed in
+  // `backend/src/reports/reports.service.ts` (Phase 9B-2).
+  arAgingReport: (params: ReportQueryParams = {}) =>
+    apiRequest<ArAgingReport>(`/reports/ar-aging?${buildReportQuery(params)}`),
 };
 
 // =====================================================
@@ -1225,3 +1235,65 @@ export interface AccountingSummaryData {
 }
 
 export type AccountingSummaryReport = ReportEnvelope<AccountingSummaryData>;
+
+// ---- ar-aging (Phase 9C-code) ----
+//
+// Must mirror `backend/src/reports/reports.service.ts` exports
+//   `ArAgingBucketKey`, `ArAgingBucket`, `ArAgingCustomerRow`,
+//   `ArAgingByCustomer`, `ArAgingData`, `ArAgingFilters`,
+//   `ArAgingResponse` (lines ~167-238).
+// Contract is READY-only on this wrapper (no PLANNED sentry
+// path; skeleton was Phase 9B-1 and full math landed in
+// Phase 9B-2). Per Phase 7B-1 RBAC: the backend forces
+// `status: ISSUED` (D4 lock); client never forwards
+// `query.status`. `companyId` is JWT-only — never serialised.
+//
+// We deliberately do NOT add fields beyond what the backend
+// contract emits. Adding a new field here without mirror would
+// break strictness on `tsc --noImplicitAny` and the UI grid.
+
+export type ArAgingBucketKey =
+  | 'current'
+  | '1-30'
+  | '31-60'
+  | '61-90'
+  | '+90';
+
+export interface ArAgingFilters {
+  fromDate: string | null;
+  toDate: string | null;
+  customerId: string | null;
+  status: string | null;
+  asOfDate: string;
+}
+
+export interface ArAgingBucket {
+  invoiceCount: number;
+  outstanding: string;
+}
+
+export interface ArAgingCustomerRow {
+  customerId: string;
+  customerCode: string | null;
+  customerName: string | null;
+  total: string;
+  paid: string;
+  outstanding: string;
+  buckets: Record<ArAgingBucketKey, ArAgingBucket>;
+}
+
+export interface ArAgingData {
+  currency: 'SAR';
+  dateField: 'dueDate';
+  statusFilter: 'ISSUED';
+  buckets: Record<ArAgingBucketKey, ArAgingBucket>;
+  totals: {
+    invoiceCount: number;
+    outstanding: string;
+  };
+  byCustomer: {
+    rows: ArAgingCustomerRow[];
+  };
+}
+
+export type ArAgingReport = ReportEnvelope<ArAgingData>;

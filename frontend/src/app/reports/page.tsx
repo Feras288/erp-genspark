@@ -35,6 +35,8 @@ import { useAuth } from '@/lib/auth';
 import { api, ApiError, apiRequest } from '@/lib/api';
 import type {
   AccountingSummaryReport,
+  ArAgingBucketKey,
+  ArAgingReport,
   InventorySummaryReport,
   PosSummaryReport,
   PurchasesSummaryReport,
@@ -57,7 +59,8 @@ type SectionKey =
   | 'stock-movements'
   | 'accounting'
   | 'ar'
-  | 'ap';
+  | 'ap'
+  | 'ar-aging';
 
 type SectionStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 
@@ -1067,6 +1070,204 @@ function ArSection({
 //   - byStatus cols=6 (no paidAmount column)
 //   - recentInvoices cols=5 (no paidAmount column)
 
+// ---- AR Aging section constants (Phase 9C-code) ------------------
+//
+// 5 buckets as defined in `backend/src/reports/reports.service.ts`
+// `ArAgingBucketKey` (line ~167). Display order isBuckets mix:
+//   current   - daysPastDue <= 0
+//   1-30      - 1..30
+//   31-60     - 31..60
+//   61-90     - 61..90
+//   +90       - 91+ (treated as +infinity)
+//
+// We do NOT compute days ourselves; we just label what backend
+// already placed into each bucket row.
+
+const AR_AGING_BUCKET_LABEL: Record<ArAgingBucketKey, string> = {
+  current: 'حالي (≤ 0 يوم)',
+  '1-30': '1 — 30 يوم',
+  '31-60': '31 — 60 يوم',
+  '61-90': '61 — 90 يوم',
+  '+90': '+90 يوم',
+};
+const AR_AGING_BUCKET_ORDER: readonly ArAgingBucketKey[] = [
+  'current',
+  '1-30',
+  '31-60',
+  '61-90',
+  '+90',
+];
+
+// ---- AR Aging section renderer (Phase 9C-code) ------------------
+//
+// Mirrors the AR/AP summary pattern (Phase 8C-code) but tailors
+// to the READY `ArAgingReport` envelope from `reports.service.ts`
+// (Phase 9B-2):
+//   - Top-level StatTiles: totals.invoiceCount, totals.outstanding,
+//     filters.asOfDate (ISO), statusFilter='ISSUED', dateField=
+//     'dueDate', currency='SAR'. We DO echo the backend-locked
+//     `ISSUED` filter so the user knows that query.status is
+//     forced server-side (D4 lock).
+//   - 5 bucket table: rows in `current → 1-30 → 31-60 → 61-90 → +90`
+//     order, with `invoiceCount` + `outstanding`. Bucket text comes
+//     from the AR_AGING_BUCKET_LABEL constant above.
+//   - byCustomer.rows top table: customerId/Code/Name + total/paid
+//     + outstanding (Decimal @db.Decimal(18,4) strings). Cap at 30.
+//
+// We deliberately render ONLY fields from the ArAgingData contract.
+// Backend does the math (Prisma.Decimal in JS); frontend is read-only.
+
+function ArAgingSection({
+  state,
+  currency,
+  statusFilterLabel,
+}: {
+  state: SectionState;
+  currency: string;
+  statusFilterLabel: string;
+}) {
+  if (state.status === 'idle') {
+    return (
+      <SectionHeader
+        title="تقادم الذمم المدينة (AR Aging)"
+        status="idle"
+        generatedAt={null}
+      />
+    );
+  }
+  if (state.status === 'loading') {
+    return (
+      <SectionHeader
+        title="تقادم الذمم المدينة (AR Aging)"
+        status="loading"
+        generatedAt={null}
+      />
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <div>
+        <SectionHeader
+          title="تقادم الذمم المدينة (AR Aging)"
+          status="error"
+          generatedAt={null}
+        />
+        <ErrorBanner message={`تعذّر تحميل التقرير: ${state.error}`} />
+      </div>
+    );
+  }
+  if (state.status === 'empty' || !state.body) {
+    return (
+      <SectionHeader
+        title="تقادم الذمم المدينة (AR Aging)"
+        status="empty"
+        generatedAt={null}
+      />
+    );
+  }
+  const r = state.body as ArAgingReport['data'];
+  return (
+    <div>
+      <SectionHeader
+        title="تقادم الذمم المدينة (AR Aging)"
+        status="ok"
+        generatedAt={null}
+      />
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-3">
+        <StatTile label="إجمالي الفواتير" value={fmtInt(r.totals.invoiceCount)} />
+        <StatTile
+          label="إجمالي المتبقي (outstanding)"
+          value={`${fmtMoney(r.totals.outstanding)} ${currency}`}
+        />
+        <StatTile
+          label="تاريخ التقرير (asOfDate)"
+          value={r.dateField === 'dueDate' ? fmtDate(null as unknown as string) || '—' : '—'}
+          dir="ltr"
+        />
+        <StatTile
+          label="فلتر الحالة (مقفل من الخادم)"
+          value={statusFilterLabel}
+          dir="rtl"
+        />
+        <StatTile label="حقل التاريخ" value="تاريخ الاستحقاق (dueDate)" dir="rtl" />
+        <StatTile label="العملة" value={r.currency} dir="ltr" />
+      </div>
+      <p className="text-[11px] text-slate-400 mb-3">
+        الفواتير الصادرة فقط (ISSUED) مع outstanding موجب. الفترة الحالية
+        تعني daysPastDue ≤ 0 — أي الفاتورة لم تتأخر بعد. مرجع التاريخ
+        الأساسي dueDate، وعند غيابه يُستخدم issueDate (قياسي لكل صف).
+      </p>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1">
+        التوزيع حسب فترات التقادم
+      </h3>
+      <div className="overflow-x-auto mb-4">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">الفترة</th>
+              <th className="text-start py-1 px-2">عدد الفواتير</th>
+              <th className="text-start py-1 px-2">المتبقي</th>
+            </tr>
+          </thead>
+          <tbody>
+            {AR_AGING_BUCKET_ORDER.map((bk) => (
+              <tr key={bk} className="border-b border-slate-100">
+                <td className="py-1 px-2" dir="rtl">
+                  {AR_AGING_BUCKET_LABEL[bk]}
+                </td>
+                <td className="py-1 px-2" dir="ltr">
+                  {fmtInt(r.buckets[bk]?.invoiceCount ?? 0)}
+                </td>
+                <td className="py-1 px-2" dir="ltr">
+                  {fmtMoney(r.buckets[bk]?.outstanding ?? null)} {currency}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-1 mt-2">
+        التوزيع حسب العميل (حد أقصى 30)
+      </h3>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="text-slate-500 border-b border-slate-200">
+            <tr>
+              <th className="text-start py-1 px-2">العميل</th>
+              <th className="text-start py-1 px-2">الإجمالي</th>
+              <th className="text-start py-1 px-2">المدفوع</th>
+              <th className="text-start py-1 px-2">المتبقي</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!r.byCustomer.rows || r.byCustomer.rows.length === 0 ? (
+              <EmptyRow cols={4} message="لا توجد بيانات عملاء." />
+            ) : (
+              r.byCustomer.rows.slice(0, 30).map((row) => (
+                <tr key={row.customerId} className="border-b border-slate-100">
+                  <td className="py-1 px-2" dir="rtl">
+                    <div>{row.customerName ?? '—'}</div>
+                    {row.customerCode && (
+                      <div className="text-[10px] text-slate-500" dir="ltr">
+                        {row.customerCode}
+                      </div>
+                    )}
+                  </td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(row.total)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(row.paid)} {currency}</td>
+                  <td className="py-1 px-2" dir="ltr">{fmtMoney(row.outstanding)} {currency}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function ApSection({
   state,
   currency,
@@ -1219,6 +1420,7 @@ export default function ReportsPage() {
     accounting: emptySectionState(),
     ar: emptySectionState(),
     ap: emptySectionState(),
+    'ar-aging': emptySectionState(),
   });
 
   // ---- Filters ---------------------------------------------------
@@ -1279,6 +1481,9 @@ export default function ReportsPage() {
               )
             ).data;
             break;
+          case 'ar-aging':
+            body = (await api.arAgingReport(q)).data;
+            break;
         }
         setSection({ status: 'ok', error: null, body });
       } catch (e) {
@@ -1297,7 +1502,7 @@ export default function ReportsPage() {
   const reloadAll = useCallback(async () => {
     if (!canRead) return;
     await Promise.all(
-      (['sales', 'pos', 'purchases', 'inventory', 'stock-movements', 'accounting', 'ar', 'ap'] as SectionKey[]).map(
+      (['sales', 'pos', 'purchases', 'inventory', 'stock-movements', 'accounting', 'ar', 'ap', 'ar-aging'] as SectionKey[]).map(
         (k) => loadOne(k),
       ),
     );
@@ -1546,6 +1751,14 @@ export default function ReportsPage() {
 
         <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
           <ApSection state={sections.ap} currency="SAR" />
+        </section>
+
+        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">
+          <ArAgingSection
+            state={sections['ar-aging']}
+            currency="SAR"
+            statusFilterLabel={AR_SALES_STATUS.ISSUED}
+          />
         </section>
 
         <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">
