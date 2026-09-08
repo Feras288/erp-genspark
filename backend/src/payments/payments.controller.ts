@@ -1,7 +1,7 @@
 // =====================================================
 // Phase 10A: AR Payments + Settlement Tracking.
 //
-// Phase 10A-B-1: PaymentsController — skeleton endpoints.
+// Phase 10A-B-2: PaymentsController — wires settlement endpoints.
 //
 //   Mounted under /api/sales-invoices/:invoiceId/payments via the
 //   global /api prefix set in main.ts.
@@ -9,40 +9,52 @@
 //   Routes:
 //     GET /api/sales-invoices/:invoiceId/payments
 //        - Permission: ar_payments.read
-//        - Response:   [] skeleton (Phase 10A-B-1 contract).
-//                      Real listing lands in Phase 10A-B-2.
+//        - tenant scope: companyId from JWT only (Phase 7B-1 contract).
+//        - Optional fromDate / toDate query: filter paidAt range.
+//        - Excludes soft-deleted payments (deletedAt IS NULL).
+//        - Orders by paidAt DESC, createdAt DESC.
 //     POST /api/sales-invoices/:invoiceId/payments
 //        - Permission: ar_payments.write
-//        - Body:       CreatePaymentDto (full DTO validation enforces
-//                      field shape even though logic is not yet wired).
-//        - Response:   501 NotImplementedException in Phase 10A-B-1.
+//        - tenant scope: companyId from JWT only.
+//        - Idempotency-Key (DTO body field, idempotencyKey):
+//            if a matching active Payment exists for
+//            (companyId, salesInvoiceId, idempotencyKey, deletedAt null),
+//            it returns that existing row without inserting.
+//        - SalesInvoice must exist, belong to JWT.companyId,
+//          not soft-deleted, status = ISSUED (T-2 lock).
+//        - Partial payments allowed. existingPaid = SUM(Payment.amount).
+//        - outstanding = max(0, invoice.total − existingPaid).
+//        - Overpayment guard (S-2): dto.amount > outstanding → 409.
+//        - On insert: SalesInvoice.paidAmount writeback (M-A bridge,
+//          keeps Phase 9 arAging invariant `max(0,total-paidAmount)`
+//          intact — no reports.service.ts edit required).
+//        - SalesInvoice.status is NOT changed (T-2 lock).
+//        - Idempotency-Key header (RFC-style) is intentionally NOT
+//          read; the DTO body field is the canonical source.
 //
 // RBAC:
-//   * JwtAuthGuard + PermissionsGuard at controller level.
+//   * JwtAuthGuard + PermissionsGuard at controller level (Phase 1 contract).
 //   * PermissionsGuard reads @RequirePermissions metadata per route.
 //
 // Tenancy:
-//   * companyId is sourced exclusively from JWT via
-//     @CurrentUser(). DTOs do not expose companyId.
-//   * invoiceId comes from URL path; tenant isolation is enforced at
-//     the DB layer in 10A-B-2 (SalesInvoice.companyId must equal
-//     JTW.companyId). 10A-B-1 returns [] so the cross-tenant test
-//     is owned by Phase 10A-B-3 smoke + 10A-B-2 logic.
+//   * companyId sourced exclusively from @CurrentUser() (JWT).
+//   * invoiceId from URL path; tenant isolation enforced in service
+//     layer + DB layer (SalesInvoice.companyId must match JWT).
+//   * DTO does not expose companyId.
 //
-// Strict (Phase 10A-B-1):
-//   * No settlement calculations.
-//   * No PAID / PARTIALLY_PAID enum (deferred — T-2 lock).
-//   * No AR-Aging source change.
-//   * No AP payments (Phase 10B).
-//   * No GL / bank reconciliation / drill-down.
-//   * No frontend.
+// Strict (Phase 10A-B-2):
+//   * No PAID / PARTIALLY_PAID enum extension (T-2 lock).
+//   * No AR-Aging source change (paidAmount writeback keeps invariant).
+//   * No AP payments (10B future).
+//   * No GL / bank reconciliation / drill-down statements.
+//   * No regression on Phase 9 reports — same back-compat contract.
+//   * No frontend / no schema change / no e2e edits in this commit.
 // =====================================================
 import {
   Body,
   Controller,
   Get,
   HttpCode,
-  NotImplementedException,
   Param,
   Post,
   Query,
@@ -56,7 +68,7 @@ import { RequirePermissions } from '../auth/decorators/require-permissions.decor
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../common/types/auth.types';
 
-import { PaymentsService } from './payments.service';
+import { PaymentResponseRow, PaymentsService } from './payments.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { PaymentsQueryDto } from './dto/payments-query.dto';
 
@@ -70,33 +82,39 @@ export class PaymentsController {
   @Get()
   @RequirePermissions('ar_payments.read')
   list(
-    @CurrentUser() _me: AuthenticatedUser,
-    @Param('invoiceId') _invoiceId: string,
-    @Query() _q: PaymentsQueryDto,
-  ): Promise<unknown[]> {
-    // Phase 10A-B-1 contract: returns [] skeleton. Real listing
-    // (with companyId / deletedAt / invoiceId filters) lands in
-    // Phase 10A-B-2 settlement calculations, mirroring the
-    // Phase 9 (`reports.service.ts` arAging) shape discipline.
-    return this.svc.list();
+    @CurrentUser() me: AuthenticatedUser,
+    @Param('invoiceId') invoiceId: string,
+    @Query() q: PaymentsQueryDto,
+  ): Promise<PaymentResponseRow[]> {
+    // Phase 10A-B-2 contract:
+    //   * tenant-scoped: companyId sourced from JWT (me.companyId).
+    //   * 404 if invoice does not belong to me.companyId
+    //     (defensive — never leaks cross-tenant existence).
+    //   * Real listing. Phase 9 arAging invariants not touched here.
+    return this.svc.list(me.companyId, invoiceId, q);
   }
 
   @Post()
   @HttpCode(201)
   @RequirePermissions('ar_payments.write')
   register(
-    @CurrentUser() _me: AuthenticatedUser,
-    @Param('invoiceId') _invoiceId: string,
-    @Body() _body: CreatePaymentDto,
-  ): Promise<never> {
-    // Phase 10A-B-1 contract: DTO validated (class-validator runs
-    // before reaching this handler), then 501 NotImplemented so
-    // the route is closed but the surface is wired.
-    // 10A-B-2 will implement: idempotency-key short-circuit,
-    // companyId/JWT scope, SalesInvoice lookup + total/paidAmount
-    // re-read inside a Prisma transaction, two-null-FK CHECK
-    // enforced by DB, register + writeback paidAmount on
-    // SalesInvoice, append-only AuditLog row.
-    return this.svc.register();
+    @CurrentUser() me: AuthenticatedUser,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: CreatePaymentDto,
+  ): Promise<PaymentResponseRow> {
+    // Phase 10A-B-2 contract:
+    //   * tenant-scoped: companyId from JWT (me.companyId).
+    //   * Idempotency-Key via DTO body field (idempotencyKey):
+    //       - if a matching active row exists (same companyId +
+    //         salesInvoiceId + idempotencyKey + deletedAt null), the
+    //         service returns it without creating a new row.
+    //   * SalesInvoice must exist + same companyId + not deleted +
+    //     status = ISSUED (T-2 lock: DRAFT/CANCELLED rejected).
+    //   * Partial payments allowed. overpayment guard (S-2) ⇒ 409.
+    //   * Prisma $transaction (atomic):
+    //         read invoice → SUM existing payments → overpayment guard
+    //         → INSERT Payment → UPDATE SalesInvoice.paidAmount.
+    //   * Returns the response row (newly inserted OR idempotency hit).
+    return this.svc.register(me, invoiceId, body);
   }
 }
