@@ -2408,3 +2408,156 @@ type ApAgingResponse = Omit<ReadyResponse<ApAgingData>, 'filters'> & {
 وكل مرحلة يجب أن تكون **single-domain** فقط. ولا deployment بأمر المستودع هذا — فقط local Docker Compose. ولا hosted deploy / hosted identity في هذه المرحلة (ولا في المراحل القادمة إلا بموافقة صريحة).
 
 → Phase 9E closure verified. Phase 9E-D-2 (README update) sealed.
+
+## Phase 10A: AR Payments + Settlement Tracking
+
+AR Payments هي طبقة **settlement** الـ على الـ `SalesInvoice` side في الـ AR side — تسجيل الـ payments الـ customers على الـ invoices الـ issued، مع idempotency short-circuit + overpayment guard + writeback على `SalesInvoice.paidAmount` (بدون تغيير الـ `status`).
+
+API جديد scoped على `:salesInvoiceId` (لا endpoint عام على الـ Payments resource مباشرةً — الـ polymorphic SSO-style routing يُغطَّى في phase لاحقة لـ AP side).
+
+### Commits الـ 4 في phase-10a
+
+```
+274b465 feat(phase-10a): wire AR payments into sales frontend      ← Phase 10A-C-code
+9cd61c2 test(phase-10a): add AR payments e2e smoke                  ← Phase 10A-B-3
+0e218e3 feat(phase-10a): add AR payments settlement logic            ← Phase 10A-B-2
+38a5af3 feat(phase-10a): add AR payments skeleton                    ← Phase 10A-B-1
+```
+
+### Schema additions (Phase 10A-B-1 → 10A-B-2)
+
+- **Payment model** في `backend/prisma/schema.prisma`:
+  - `id` (cuid) + `companyId` (FK Company, Cascade).
+  - `paymentMethod: PaymentMethod` enum (`CASH` | `CARD` | `TRANSFER` | `OTHER`).
+  - `amount: Decimal @db.Decimal(18, 4)` — `Prisma.Decimal` arithmetic في الـ service عبر `decimalToString`.
+  - `paidAt: DateTime` (default `now()`).
+  - `reference: String?` (optional receipt/cheque id من الـ frontend).
+  - `notes: String?` (optional free text).
+  - **Polymorphic FK pair** (exactly one invariant مُطبَّق عبر CHECK في الـ migration SQL — Prisma لا تستطيع التعبير عن polymorphic FK + CHECK في declaration واحدة):
+    - `salesInvoiceId: String?` (FK → `sales_invoices.id`، `onDelete: SetNull`).
+    - `purchaseInvoiceId: String?` (FK → `purchase_invoices.id`، `onDelete: SetNull`).
+    - `invoiceType: PaymentInvoiceType` enum (`SALES` | `PURCHASE`).
+  - `status: PaymentStatus @default(POSTED)` enum (`POSTED` | `CANCELLED`).
+  - `idempotencyKey: String?` (optional client-supplied key — Phase 10A-B-2).
+  - `cancelledAt: DateTime?` + `cancelledById: String?` (soft cancellation path).
+  - `deletedAt: DateTime?` (soft delete reversible).
+  - Audit fields: `createdAt` / `updatedAt` / `createdById` / `updatedById`.
+  - Indexes: `@@index([companyId, status])`، `@@index([companyId, paidAt])`، `@@index([companyId, deletedAt])`، `@@index([companyId, invoiceType])`، `@@index([salesInvoiceId])`، `@@index([purchaseInvoiceId])`.
+  - `@@map("payments")`.
+
+- **Migration**: `20260908215449_phase10a_payments` — يضيف `payments` table + الـ indexes + الـ CHECK constraint الـ polymorphic (exactly one of salesInvoiceId/purchaseInvoiceId non-null).
+- **SalesInvoice backwrite (Phase 10A-B-2)**: $transaction writes back على `sales_invoices.paidAmount` لكل POST ناجح؛ الـ outstanding = `max(0, total - COALESCE(paidAmount, 0))` يُستخدم كـ guard.
+
+### Permissions (RBAC — Phase 10A-B-1)
+
+- `ar_payments.read` — مطلوب لـ `GET /api/sales-invoices/:invoiceId/payments`.
+- `ar_payments.write` — مطلوب لـ `POST /api/sales-invoices/:invoiceId/payments`.
+- مفصولتين عن الـ existing catalog، ولا يُضاف أي permission إضافي.
+- Server enforcement عبر `@RequirePermissions(...)` decorator + `PermissionsGuard` (الـ existing — لا guard جديد).
+- Client-side mirror عبر `useAuth().hasPermission('ar_payments.read' | 'ar_payments.write')` يقرأ من الـ `state.user.permissions` JWT claim — نفس الـ split الـ موجود في الـ prior phases.
+
+### Endpoints (Phase 10A-B-2)
+
+```
+GET  /api/sales-invoices/:invoiceId/payments
+POST /api/sales-invoices/:invoiceId/payments
+```
+
+كلاهما tenant-scoped (`companyId` من الـ JWT فقط — لا companyId من الـ URL أو الـ body)، polymorphic guarded على `invoiceType = SALES` فقط في الـ Phase 10A (الـ AP coverage = Phase 10B المنفصلة).
+
+#### GET behavior
+
+- يعرض قائمة الـ payments لـ `:invoiceId` (الـ `salesInvoiceId` polymorphic alias في الـ response).
+- Query filters: `fromDate` (yyyy-mm-dd) و `toDate` (yyyy-mm-dd) — يطبَّق على `paidAt` فقط.
+- Sort: `paidAt DESC`، ثم `createdAt DESC` داخل الـ ties.
+- Tenant isolation: `companyId` من الـ JWT فقط عبر `where.companyId = companyId`.
+- Response: array من الـ polymorphic `PaymentResponseRow` mapped عبر `toResponseRow()` — الـ `id`، `invoiceId` (= salesInvoiceId alias)، `invoiceType` enum، `amount` (string — Decimal-as-string) ، `paymentMethod` enum، `paidAt` ISO string، `reference | null`، `notes | null`، `status` enum، `idempotencyKey | null`، `createdAt` ISO string.
+- Status guard: يجب على الـ invoice يكون issued / partially-settled (لا يُمنع الـ GET لدفعات الـ cancelled invoices، الـ soft-delete filter على الـ Payment-level فقط).
+
+#### POST behavior
+
+- **Partial payments مسموحة**: `amount` request لا يجب أن يغطي الـ outstanding كاملاً في الـ call واحدة — multiple POST calls متتالية مسموحة طالما كل واحدة ≤ `outstanding`.
+- **Idempotency-Key**: optional، string بطول 8..128 (الـ DTO validator `class-validator@IsString + @Length(8, 128)`). الـ service يعمل short-circuit **before the transaction**: لو في payment active (deletedAt == null) بنفس الـ `(companyId, salesInvoiceId, idempotencyKey)`, يرجعه كما هو بدل إنشاء row جديد — كسر الـ strict-serializability الـ specific للـ retry idempotency — network retry لن يُسجّل مرتين.
+- **Overpayment guard**: لو `requested.greaterThan(outstanding)` ⇒ throw `ConflictException` بـ **HTTP 409** والـ message localized raw (يتعرض كما هو في الـ frontend Arabic+English banner).
+- مجمَّع في `prisma.$transaction`:
+  1. قفل الـ target invoice (`SELECT … WHERE id = invoiceId AND companyId = companyId AND deletedAt IS NULL FOR UPDATE`-equivalent عبر الـ Prisma tx isolation).
+  2. إنشاء الـ payment row.
+  3. Writeback على `sales_invoices.paidAmount` = `previousPaidAmount + requestedAmount` (tolerant لـ concurrent partials — rigorously ordered).
+- **SalesInvoice.status لا يتغيّر**: الـ `status` الـ enum (`DRAFT | ISSUED | CANCELLED`) الـ three-state-locked من Phase 4F-3 يبقى كما هو — الـ phase 10A لا تُدخل `PAID` ولا `PARTIALLY_PAID`. الـ clients يقرأون الـ "settlement نسبة" عبر `outstanding / total` فقط.
+- Audit fields populated (`createdById` من الـ JWT).
+
+### Frontend (Phase 10A-C-code)
+
+- File changed: `frontend/src/lib/api.ts` فقط + `frontend/src/app/sales/page.tsx` فقط — لا route جديد، لا component جديد، لا dependency جديدة.
+- **Backend HTTP client (`api.ts`)**:
+  - `listArPayments(invoiceId, params?: { fromDate?; toDate? })` → `GET`.
+  - `createArPayment(invoiceId, data: CreateArPaymentInput)` → `POST`.
+  - Types: `ArPayment`، `CreateArPaymentInput`، `ArPaymentInvoiceTypeKey`، `ArPaymentStatusKey` — تطابق الـ polymorphic backend response shape بالكامل.
+- **Sales page (`/sales`)**:
+  - Imports: `ArPayment, CreateArPaymentInput, ArPaymentStatusKey, PaymentMethod` (الجديد فقط).
+  - Permission gates: `canReadArPayments = hasPermission('ar_payments.read')`، `canWriteArPayments = hasPermission('ar_payments.write')` — JWT-claim driven.
+  - State hooks: `openPaymentsInvoiceId`، `paymentsByInvoice`، `paymentsLoadingByInvoice`، `paymentsErrByInvoice`، `paymentFormByInvoice`، `paymentSubmittingByInvoice`، `paymentSuccessByInvoice`.
+  - Helpers: `loadArPayments(invoiceId)`، `onTogglePayments(invoiceId)`، `setPaymentForm(invoiceId, patch)`، `onSubmitPayment(e, invoiceId, inv)`.
+  - Per-row UX (inline expander، لا modal، لا sub-route):
+    - الـ actions cell يعرض زر `المدفوععات (N)` إذا `ISSUED && canReadArPayments` (تعداد الـ payments المحفوظ في الـ state cache يمكن أن يكون 0 قبل الـ first toggle).
+    - عند الـ toggleفتـح: sub-table تحوي amount + paymentMethod + paidAt + reference + status + localized status pills (`مُرحَّل` / `ملغى`) — فيهم loading / error / empty-state banners.
+    - إذا `canWriteArPayments`: render-payment form مع amount + paymentMethod `<select>` (CASH / CARD / TRANSFER / OTHER) + paidAt date input + reference + notes textarea + submit.
+    - كل submit محاولة يولّد `crypto.randomUUID()` client-side للـ Idempotency-Key — يُسجَّل تلقائياً بدون حقل مرئي (الـ server short-circuits على الـ duplicate).
+    - Submit mapping:
+      - 200/201 → reload الـ cached list + reset form + success banner.
+      - **409** → "تجاوز السقف" + الـ raw server message في الـ banner.
+      - **403** → "لا تملك صلاحية تسجيل المدفوعات".
+      - **401** → "انتهت الجلسة".
+      - **400** → "بيانات غير صحيحة".
+      - أي error آخر → generic message ثابت بدون crash.
+
+### Verification invariant (Phase 10A-D-1)
+
+- `pnpm --filter @erp/backend build` ⇒ `nest build` exit 0.
+- `pnpm --filter @erp/backend test:e2e` ⇒ **Tests: 121 passed, 121 total** (كل 4 الـ AR payments smoke tests في `describe('Phase 10A-B-3')` بعد الـ 8 الـ Phase 1 smoke الـ + الـ 6 reports الـ 7B-6 + الـ AP aging الـ 9E-B-3):
+  - `it('1a) GET list 200 على ISSUED invoice w/ read perm')` ⇒ status 200 + array مع row واحد على الأقل.
+  - `it('1b) GET 403 بـ cashier JWT (no ar_payments.read)` ⇒ status 403.
+  - `it('2a) POST 200/201 w/ write perm → row landed, idempotencyKey matched')` ⇒ status 200/201 + response shape + DB row created.
+  - `it('2b) POST 409 overpayment (requested.greaterThan(outstanding))` ⇒ status 409.
+  - `it('2c) POST idempotency short-circuit (duplicate idempotencyKey)` ⇒ status 200/201 + الـ existing row وليس row جديد.
+  - `it('3a) POST 404 على invoice غير موجود` ⇒ status 404.
+- `pnpm --filter @erp/frontend build` ⇒ Next.js 14.2.35 compiled SUCCESS، 15/15 static pages generated، route `/sales = 6.51 kB / 106 kB First Load JS` (+0.04 kB vs Phase 9E-C-code).
+- HEAD عند الـ Phase 10A-D-1: `274b4651d15ecb853a676bf8faa7751f5076af50` (لا drift).
+
+### Out of scope (Phase 10A — explicit)
+
+- **لا AP payments** — الـ PurchaseInvoice side يُغطَّى في Phase 10B المنفصلة (الـ polymorphic `purchaseInvoiceId` column موجود في الـ schema ولكن لا endpoint ولا permission ولا controller ولا frontend wiring في Phase 10A).
+- **لا bank reconciliation** — لا matching بين الـ payment rows والـ bank statements ولا import statements ولا manual reconciliation UI.
+- **لا GL posting** — لا auto-posting للـ payments على الـ journal — الـ Payment row خارج الـ lineup الـ Phase 6 accounting module.
+- **لا PAID / PARTIALLY_PAID status enum** — الـ `SalesInvoice.status` يبقى الـ three-state-locked من Phase 4F-3 (`DRAFT | ISSUED | CANCELLED`). الـ "settlement نسبة" يُحسب client-side عبر `outstanding / total` فقط، ولا يُضاف enum value جديد.
+- **لا customer statements** — لا endpoint `/api/partners/:id/account-statement` ولا drill-down route على الـ customer side ولا aggregated rows في الـ Phase 10A.
+- **لا deployment** — ولا Cloudflare Pages ولا hosted deploy ولا hosted identity ولا Docker Compose orchestration change. Local Docker Compose + local NestJS + local Next.js فقط.
+
+### Hard prohibitions honored (Phase 10A)
+
+- لا skills مُشغَّلة أو مُستدعاة في الـ loop الكامل (10A-B-1 → 10A-D-2).
+- لا cloudflare / workers / wrangler / OAuth / external auth / hosted deploy / hosted identity.
+- لا `git add .` ولا `git add -A` — كل الـ commits الـ 4 في phase-10a يستخدمون `git add <file>...` صراحةً.
+- لا cf-byok-deploy / designer-handoff / gsk-hosted-deploy / gsk-hosted-identity skill activation.
+- لا تغيير على الـ access control: نفس الـ JWT-claim server-side (`@RequirePermissions`) + client-side (`hasPermission`) الـ split؛ لا fallback في الـ app JavaScript.
+- لا extensions لكتلة أخرى: لا AP ولا GL ولا notifications ولا multi-currency ولا charts ولا customer drill-down.
+- لا invoice lifecycle changes — الـ `paidAmount` writeback الـ عبر الـ transaction هو الـ الوحيد الـ mutation على الـ `SalesInvoice`، الـ status يبقى.
+
+### Recommendation
+
+**Phase 10A (AR Payments + Settlement Tracking) انتهت** على مستوى:
+
+- `10A-B-1` (skeleton: `payments.controller.ts` + `create-payment.dto.ts` + `@RequirePermissions('ar_payments.read' | 'ar_payments.write')`) و `10A-B-2` (settlement logic: `payments.service.ts` بـ Prisma `$transaction` + Prisma.Decimal arithmetic + 409 overpayment guard + idempotency short-circuit + writeback على `SalesInvoice.paidAmount` + status unchanged) و `10A-B-3` (smoke tests: 6 tests في الـ `describe('Phase 10A-B-3')` block تغطي GET 200/403 + POST 200/201/409/404 + idempotency duplicate + tenant isolation) — backend.
+- `10A-C-code` (frontend wiring: `api.listArPayments(invoiceId, params?)` + `api.createArPayment(invoiceId, payload)` + 4 AR-payment polymorphic types في `frontend/src/lib/api.ts` + inline expander في `/sales` page مع payments list + register-payment form + `crypto.randomUUID()` للـ Idempotency-Key per submit + 409-styled Arabic overlay + 401/403/400/200 mapping + per-row toggle بدون route جديد) — frontend.
+- `10A-D-1` (verification: working tree clean، HEAD = `274b4651`، scope limited إلى frontend changes فقط، backend build PASS، backend e2e PASS = 121/121، frontend build PASS) و `10A-D-2` (README closure: هذا الـ commit).
+
+كل الـ computed values (`outstanding`، `requested.amount`، partial-sum، writeback `paidAmount`) تأتي من الـ Prisma.Decimal arithmetic في الـ backend عبر JS — لا `Number()` في الـ math path. الـ permissions اثنتان فقط (`ar_payments.read` + `ar_payments.write`)، tenant isolation من JWT فقط، الـ polymorphic invariant مُطبَّق بـ CHECK constraint.
+
+كل الـ 4 commits في phase-10a مستقلة النطاق:
+- `10A-B-1` → `backend/src/payments/{payments.module,payments.controller,dto/create-payment.dto}.ts` + `backend/prisma/schema.prisma` (Payment model) + `backend/prisma/migrations/20260908215449_phase10a_payments/`.
+- `10A-B-2` → `backend/src/payments/payments.service.ts`.
+- `10A-B-3` → `backend/test/reports.e2e-spec.ts` (6 tests داخل الـ `describe('Phase 10A-B-3')`).
+- `10A-C-code` → `frontend/src/lib/api.ts` و `frontend/src/app/sales/page.tsx`.
+- `10A-D-2` → `README.md` فقط (هذا الـ commit).
+
+→ Phase 10A closure verified. Phase 10A-D-2 (README update) sealed.
