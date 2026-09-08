@@ -57,6 +57,7 @@
 import { Injectable } from '@nestjs/common';
 import {
   Prisma,
+  JournalEntryStatus,
   PurchaseInvoiceStatus,
   SalesInvoiceStatus,
   SalesInvoiceType,
@@ -146,6 +147,41 @@ export interface PurchaseSummaryData {
 
 export type PurchaseSummaryResponse = ReadyResponse<PurchaseSummaryData>;
 
+// ---- Accounting summary response types (Phase 7B-5) -------------------
+
+export interface AccountingStatusBreakdown {
+  status: JournalEntryStatus;
+  entryCount: number;
+  totalDebit: string;
+  totalCredit: string;
+}
+
+export interface AccountingRecentEntry {
+  id: string;
+  entryNumber: string;
+  status: JournalEntryStatus;
+  entryDate: string; // ISO 8601
+  description?: string;
+  totalDebit: string;
+  totalCredit: string;
+  postedAt?: string; // ISO 8601
+}
+
+export interface AccountingSummaryData {
+  entryCount: number;
+  lineCount: number;
+  totalDebit: string;
+  totalCredit: string;
+  balanceDifference: string;
+  currency: 'SAR';
+  dateField: 'entryDate';
+  statusFilter: JournalEntryStatus;
+  byStatus: AccountingStatusBreakdown[];
+  recentEntries: AccountingRecentEntry[];
+}
+
+export type AccountingSummaryResponse = ReadyResponse<AccountingSummaryData>;
+
 // ---- Inventory + Stock Movements response types (Phase 7B-4) ----------
 
 export interface InventoryLevelEntry {
@@ -220,6 +256,17 @@ const HEADLINE_STATUS_EXCLUSION: SalesInvoiceStatus[] = [
 
 const HEADLINE_PURCHASE_EXCLUSION: PurchaseInvoiceStatus[] = [
   PurchaseInvoiceStatus.CANCELLED,
+];
+
+// Accounting entries: POSTED is the operational headline
+// (the only status that affects the books). DRAFT and
+// CANCELLED are excluded from headline aggregates unless
+// the caller passes an explicit `status` override. Mirrors
+// the sales / purchase pattern in `buildSalesWhere` and
+// `buildPurchaseWhere`.
+const HEADLINE_JOURNAL_EXCLUSION: JournalEntryStatus[] = [
+  JournalEntryStatus.CANCELLED,
+  JournalEntryStatus.DRAFT,
 ];
 
 @Injectable()
@@ -618,14 +665,120 @@ export class ReportsService {
   async accountingSummary(
     companyId: string,
     query: ReportQueryDto,
-  ): Promise<PlannedReportResponse> {
+  ): Promise<AccountingSummaryResponse> {
+    const where = this.buildAccountingWhere(companyId, query);
+
+    // 1. Headline aggregate on JournalEntry header-level
+    //    server-computed totals (authoritative per schema).
+    const entriesAgg = await this.prisma.journalEntry.aggregate({
+      where,
+      _count: { _all: true },
+      _sum: { totalDebit: true, totalCredit: true },
+    });
+
+    // 2. lineCount via the nested `entry` relation so the
+    //    count honors the same filter (companyId + status +
+    //    date range) applied to the entries. We mirror the
+    //    status filter to the nested relation when the
+    //    caller did not override; otherwise the line count
+    //    would over-count DRAFT/CANCELLED lines that belong
+    //    to entries the headline already hid.
+    const lineWhere: Prisma.JournalEntryLineWhereInput = {
+      companyId,
+      entry: where,
+    };
+    const lineCount = await this.prisma.journalEntryLine.count({
+      where: lineWhere,
+    });
+
+    // 3. byStatus: groupBy on JournalEntry.status, honoring
+    //    the same `where` filter so cancellations/draft
+    //    status composition is visible.
+    const byStatusRaw = await this.prisma.journalEntry.groupBy({
+      by: ['status'],
+      where,
+      _count: { _all: true },
+      _sum: { totalDebit: true, totalCredit: true },
+    });
+    const byStatus: AccountingStatusBreakdown[] = byStatusRaw
+      .sort((a, b) => a.status.localeCompare(b.status))
+      .map((row) => ({
+        status: row.status,
+        entryCount: row._count._all,
+        totalDebit: this.decimalToString(row._sum.totalDebit),
+        totalCredit: this.decimalToString(row._sum.totalCredit),
+      }));
+
+    // 4. recentEntries: at most 20 newest entries by
+    //    entryDate desc.
+    const recentRaw = await this.prisma.journalEntry.findMany({
+      where,
+      orderBy: { entryDate: 'desc' },
+      take: 20,
+      select: {
+        id: true,
+        entryNumber: true,
+        status: true,
+        entryDate: true,
+        description: true,
+        totalDebit: true,
+        totalCredit: true,
+        postedAt: true,
+      },
+    });
+    const recentEntries: AccountingRecentEntry[] = recentRaw.map(
+      (row) => ({
+        id: row.id,
+        entryNumber: row.entryNumber,
+        status: row.status,
+        entryDate: row.entryDate.toISOString(),
+        description: row.description ?? undefined,
+        totalDebit: this.decimalToString(row.totalDebit),
+        totalCredit: this.decimalToString(row.totalCredit),
+        postedAt: row.postedAt ? row.postedAt.toISOString() : undefined,
+      }),
+    );
+
+    // Decimal-safe balance difference: never use Number().
+    // `entriesAgg._sum.totalDebit / totalCredit` are
+    // `Prisma.Decimal | null`; pass them through Prisma's
+    // `Decimal.minus` for proper arbitrary-precision math.
+    const totalDebitDec =
+      entriesAgg._sum.totalDebit ?? new Prisma.Decimal(0);
+    const totalCreditDec =
+      entriesAgg._sum.totalCredit ?? new Prisma.Decimal(0);
+    const balanceDifferenceDec = totalDebitDec.minus(totalCreditDec);
+
+    // Resolve the effective status filter for the
+    // response shape (default = POSTED when caller did
+    // not pass an override).
+    const statusFilter =
+      this.resolveJournalStatus(query) ?? JournalEntryStatus.POSTED;
+
+    const data: AccountingSummaryData = {
+      entryCount: entriesAgg._count._all,
+      lineCount,
+      totalDebit: this.decimalToString(totalDebitDec),
+      totalCredit: this.decimalToString(totalCreditDec),
+      balanceDifference: this.decimalToString(balanceDifferenceDec),
+      currency: 'SAR',
+      dateField: 'entryDate',
+      statusFilter,
+      byStatus,
+      recentEntries,
+    };
+
     return {
       report: 'accounting-summary',
-      status: 'PLANNED',
+      status: 'READY',
       companyId,
-      filters: query,
+      filters: {
+        fromDate: query.fromDate ?? undefined,
+        toDate: query.toDate ?? undefined,
+        status: statusFilter,
+      },
       generatedAt: new Date().toISOString(),
-      data: null,
+      data,
     };
   }
 
@@ -682,6 +835,28 @@ export class ReportsService {
       candidate === PurchaseInvoiceStatus.DRAFT ||
       candidate === PurchaseInvoiceStatus.RECEIVED ||
       candidate === PurchaseInvoiceStatus.CANCELLED
+    ) {
+      return candidate;
+    }
+    return null;
+  }
+
+  /**
+   * Mirror of `resolvePurchaseStatus` for
+   * `JournalEntryStatus`. Returns the validated enum
+   * or null. Null is consumed by `buildAccountingWhere`
+   * via `?? JournalEntryStatus.POSTED` downstream.
+   * Unknown strings are silently ignored.
+   */
+  private resolveJournalStatus(
+    query: ReportQueryDto,
+  ): JournalEntryStatus | null {
+    if (!query.status) return null;
+    const candidate = query.status as JournalEntryStatus;
+    if (
+      candidate === JournalEntryStatus.DRAFT ||
+      candidate === JournalEntryStatus.POSTED ||
+      candidate === JournalEntryStatus.CANCELLED
     ) {
       return candidate;
     }
@@ -822,6 +997,51 @@ export class ReportsService {
       if (query.fromDate) range.gte = new Date(`${query.fromDate}T00:00:00.000Z`);
       if (query.toDate) range.lte = new Date(`${query.toDate}T23:59:59.999Z`);
       where.receivedAt = range;
+    }
+
+    return where;
+  }
+
+  /**
+   * Build the `where` clause for `accountingSummary`:
+   *   companyId +
+   *   status: { notIn: HEADLINE_JOURNAL_EXCLUSION } +
+   *     (optional status override).
+   * No `deletedAt` filter: `JournalEntry` has no
+   * `deletedAt` column per the schema (verified by grep).
+   * Date range:
+   *   - fromDate toDate -> gte / lte on entryDate
+   *     (JournalEntry.entryDate is DateTime,
+   *      non-nullable, @default(now())).
+   * `companyId` source: function parameter only.
+   */
+  private buildAccountingWhere(
+    companyId: string,
+    query: ReportQueryDto,
+  ): Prisma.JournalEntryWhereInput {
+    const where: Prisma.JournalEntryWhereInput = {
+      companyId,
+      status: {
+        notIn: HEADLINE_JOURNAL_EXCLUSION,
+      },
+    };
+
+    const status = this.resolveJournalStatus(query);
+    if (status) {
+      // Explicit caller override: trust it. Aggregate
+      // will reflect only that single status filter —
+      // and `notIn: CANCELLED | DRAFT` is dropped
+      // because the caller asked for an explicit status.
+      where.status = status;
+    }
+
+    if (query.fromDate || query.toDate) {
+      const range: { gte?: Date; lte?: Date } = {};
+      if (query.fromDate)
+        range.gte = new Date(`${query.fromDate}T00:00:00.000Z`);
+      if (query.toDate)
+        range.lte = new Date(`${query.toDate}T23:59:59.999Z`);
+      where.entryDate = range;
     }
 
     return where;
