@@ -62,6 +62,16 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
   // serial per-file invocation.
   let cashierToken: string;
 
+  // Phase 8B-3: a single admin agent created in beforeAll
+  // is reused across all tests below. Phase 7B-6 minted
+  // a fresh admin token via `request(http).post(auth/login)`
+  // for every `it()`, which left the TCP connection pool
+  // fragmented and caused the second AR/AP shape test
+  // (4h) to receive 401 because of socket half-open.
+  // Reusing the same agent keeps a stable session and
+  // a stable Authorization header.
+  let adminAgent: ReturnType<typeof request.agent>;
+
   const ROUTES: Array<{
     path: string;
     report: string;
@@ -79,6 +89,10 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
       report: 'stock-movements-summary',
     },
     { path: 'reports/accounting-summary', report: 'accounting-summary' },
+    // Phase 8B-3 additions: AR + AP modern skeletons →
+    //                      READY (Phase 8B-2).
+    { path: 'reports/ar-summary', report: 'ar-summary' },
+    { path: 'reports/ap-summary', report: 'ap-summary' },
   ];
 
   beforeAll(async () => {
@@ -108,11 +122,17 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
       .send({ email: 'admin@example.sa', password: 'Admin@12345' });
     expect(adminLogin.status).toBe(200);
     const adminToken: string = adminLogin.body.accessToken;
-    const adminAgent = request.agent(http);
+    adminAgent = request.agent(http);
+    // Pre-authenticate the shared adminAgent so that
+    // every subsequent test can simply call
+    // `adminAgent.get(...)` without minting a fresh JWT
+    // per test (else socket pool fragmentation made
+    // Test 4h flaky — fails with 401 in full suite
+    // but passes in isolation).
+    adminAgent.set('Authorization', `Bearer ${adminToken}`);
 
     const roleRes = await adminAgent
       .post(`${API_PREFIX}/rbac/roles`)
-      .set('Authorization', `Bearer ${adminToken}`)
       .send({
         name: 'Cashier-E2E',
         key: 'cashier_e2e',
@@ -122,7 +142,6 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
 
     const userRes = await adminAgent
       .post(`${API_PREFIX}/users`)
-      .set('Authorization', `Bearer ${adminToken}`)
       .send({
         email: 'cashier-e2e@example.sa',
         password: 'Cashier@123',
@@ -163,16 +182,8 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
 
   // ---- 3. Success: admin (with reports.read) → 200 + READY ----
   it('3) admin (with reports.read) gets 200 + READY on every report', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    expect(adminLogin.status).toBe(200);
-    const adminToken: string = adminLogin.body.accessToken;
-
     for (const r of ROUTES) {
-      const res = await request(http)
-        .get(`${API_PREFIX}/${r.path}`)
-        .set('Authorization', `Bearer ${adminToken}`);
+      const res = await adminAgent.get(`${API_PREFIX}/${r.path}`);
       expect(res.status).toBe(200);
       const body = res.body as ReadyBody;
       expect(body.report).toBe(r.report);
@@ -189,14 +200,7 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
 
   // ---- 4. Shape-only assertions per endpoint ----
   it('4a) sales-summary data has the expected fields', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    const adminToken: string = adminLogin.body.accessToken;
-
-    const res = await request(http)
-      .get(`${API_PREFIX}/reports/sales-summary`)
-      .set('Authorization', `Bearer ${adminToken}`);
+    const res = await adminAgent.get(`${API_PREFIX}/reports/sales-summary`);
     expect(res.status).toBe(200);
     const data = (res.body as ReadyBody).data as Record<string, unknown>;
     for (const k of [
@@ -215,14 +219,7 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
   });
 
   it('4b) pos-summary data has paymentMethods breakdown', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    const adminToken: string = adminLogin.body.accessToken;
-
-    const res = await request(http)
-      .get(`${API_PREFIX}/reports/pos-summary`)
-      .set('Authorization', `Bearer ${adminToken}`);
+    const res = await adminAgent.get(`${API_PREFIX}/reports/pos-summary`);
     expect(res.status).toBe(200);
     const data = (res.body as ReadyBody).data as Record<string, unknown>;
     for (const k of [
@@ -242,14 +239,9 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
   });
 
   it('4c) purchases-summary data has totals', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    const adminToken: string = adminLogin.body.accessToken;
-
-    const res = await request(http)
-      .get(`${API_PREFIX}/reports/purchases-summary`)
-      .set('Authorization', `Bearer ${adminToken}`);
+    const res = await adminAgent.get(
+      `${API_PREFIX}/reports/purchases-summary`,
+    );
     expect(res.status).toBe(200);
     const data = (res.body as ReadyBody).data as Record<string, unknown>;
     for (const k of [
@@ -267,14 +259,9 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
   });
 
   it('4d) inventory-summary data has level counts + levels', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    const adminToken: string = adminLogin.body.accessToken;
-
-    const res = await request(http)
-      .get(`${API_PREFIX}/reports/inventory-summary`)
-      .set('Authorization', `Bearer ${adminToken}`);
+    const res = await adminAgent.get(
+      `${API_PREFIX}/reports/inventory-summary`,
+    );
     expect(res.status).toBe(200);
     const data = (res.body as ReadyBody).data as Record<string, unknown>;
     for (const k of [
@@ -290,14 +277,9 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
   });
 
   it('4e) stock-movements-summary data has counts and breakdowns', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    const adminToken: string = adminLogin.body.accessToken;
-
-    const res = await request(http)
-      .get(`${API_PREFIX}/reports/stock-movements-summary`)
-      .set('Authorization', `Bearer ${adminToken}`);
+    const res = await adminAgent.get(
+      `${API_PREFIX}/reports/stock-movements-summary`,
+    );
     expect(res.status).toBe(200);
     const data = (res.body as ReadyBody).data as Record<string, unknown>;
     for (const k of [
@@ -315,14 +297,9 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
   });
 
   it('4f) accounting-summary data has totals + byStatus + recentEntries', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    const adminToken: string = adminLogin.body.accessToken;
-
-    const res = await request(http)
-      .get(`${API_PREFIX}/reports/accounting-summary`)
-      .set('Authorization', `Bearer ${adminToken}`);
+    const res = await adminAgent.get(
+      `${API_PREFIX}/reports/accounting-summary`,
+    );
     expect(res.status).toBe(200);
     const data = (res.body as ReadyBody).data as Record<string, unknown>;
     for (const k of [
@@ -341,45 +318,122 @@ describe('Phase 7B-6: Reports backend (e2e smoke)', () => {
     }
   });
 
+  // Phase 8B-3 additions: AR + AP shape assertions.
+
+  it('4g) ar-summary data (Phase 8B-2) has SalesInvoice-derived shape', async () => {
+    const res = await adminAgent.get(`${API_PREFIX}/reports/ar-summary`);
+    expect(res.status).toBe(200);
+    const body = res.body as ReadyBody;
+    expect(body.report).toBe('ar-summary');
+    expect(body.status).toBe('READY');
+    expect(typeof body.generatedAt).toBe('string');
+    expect(body.filters).toBeDefined();
+    const data = body.data as Record<string, unknown>;
+    for (const k of [
+      'invoiceCount',
+      'subtotal',
+      'vatTotal',
+      'discountTotal',
+      'total',
+      'currency',
+      'dateField',
+      'statusFilter',
+      'byStatus',
+      'recentInvoices',
+    ]) {
+      expect(data).toHaveProperty(k);
+    }
+    expect(typeof data['invoiceCount']).toBe('number');
+    expect(typeof data['subtotal']).toBe('string');
+    expect(typeof data['vatTotal']).toBe('string');
+    expect(typeof data['discountTotal']).toBe('string');
+    expect(typeof data['total']).toBe('string');
+    expect(data['currency']).toBe('SAR');
+    expect(data['dateField']).toBe('issueDate');
+    expect(Array.isArray(data['byStatus'])).toBe(true);
+    expect(Array.isArray(data['recentInvoices'])).toBe(true);
+  });
+
+  it('4h) ap-summary data (Phase 8B-2) has PurchaseInvoice-derived shape', async () => {
+    const res = await adminAgent.get(`${API_PREFIX}/reports/ap-summary`);
+    expect(res.status).toBe(200);
+    const body = res.body as ReadyBody;
+    expect(body.report).toBe('ap-summary');
+    expect(body.status).toBe('READY');
+    expect(typeof body.generatedAt).toBe('string');
+    expect(body.filters).toBeDefined();
+    const data = body.data as Record<string, unknown>;
+    for (const k of [
+      'invoiceCount',
+      'subtotal',
+      'vatTotal',
+      'discountTotal',
+      'total',
+      'currency',
+      'dateField',
+      'statusFilter',
+      'byStatus',
+      'recentInvoices',
+    ]) {
+      expect(data).toHaveProperty(k);
+    }
+    expect(typeof data['invoiceCount']).toBe('number');
+    expect(typeof data['subtotal']).toBe('string');
+    expect(typeof data['vatTotal']).toBe('string');
+    expect(typeof data['discountTotal']).toBe('string');
+    expect(typeof data['total']).toBe('string');
+    expect(data['currency']).toBe('SAR');
+    expect(data['dateField']).toBe('receivedAt');
+    expect(Array.isArray(data['byStatus'])).toBe(true);
+    expect(Array.isArray(data['recentInvoices'])).toBe(true);
+  });
+
   // ---- 5. Query filter smoke: shape preserved on filters ----
   it('5) query filters are accepted and preserve 200 + READY + shape', async () => {
-    const adminLogin = await request(http)
-      .post(`${API_PREFIX}/auth/login`)
-      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
-    const adminToken: string = adminLogin.body.accessToken;
-    const sender = request(http);
-
     const calls: Array<Promise<request.Response>> = [
-      sender
+      adminAgent
         .get(`${API_PREFIX}/reports/sales-summary`)
-        .query({ fromDate: '2026-01-01', toDate: '2026-12-31' })
-        .set('Authorization', `Bearer ${adminToken}`),
-      sender
+        .query({ fromDate: '2026-01-01', toDate: '2026-12-31' }),
+      adminAgent
         .get(`${API_PREFIX}/reports/pos-summary`)
-        .query({ paymentMethod: 'CASH' })
-        .set('Authorization', `Bearer ${adminToken}`),
-      sender
+        .query({ paymentMethod: 'CASH' }),
+      adminAgent
         .get(`${API_PREFIX}/reports/purchases-summary`)
-        .query({ status: 'RECEIVED' })
-        .set('Authorization', `Bearer ${adminToken}`),
-      sender
+        .query({ status: 'RECEIVED' }),
+      adminAgent
         .get(`${API_PREFIX}/reports/inventory-summary`)
         .query({
           productId:
             '00000000-0000-0000-0000-000000000000'.replace(/0/g, '0'),
-        })
-        .set('Authorization', `Bearer ${adminToken}`),
-      sender
+        }),
+      adminAgent
         .get(`${API_PREFIX}/reports/stock-movements-summary`)
         .query({
           warehouseId:
             '00000000-0000-0000-0000-000000000000'.replace(/0/g, '0'),
-        })
-        .set('Authorization', `Bearer ${adminToken}`),
-      sender
+        }),
+      adminAgent
         .get(`${API_PREFIX}/reports/accounting-summary`)
-        .query({ status: 'POSTED' })
-        .set('Authorization', `Bearer ${adminToken}`),
+        .query({ status: 'POSTED' }),
+      // Phase 8B-3 additions: AR + AP query filter smoke.
+      // No `customerId` / `supplierId` filter here because
+      // the report seed does not deterministically expose
+      // any partner id (the existing seed has no reports
+      // fixtures — Phase 7B-6 documented).
+      adminAgent
+        .get(`${API_PREFIX}/reports/ar-summary`)
+        .query({
+          fromDate: '2026-01-01',
+          toDate: '2026-12-31',
+          status: 'ISSUED',
+        }),
+      adminAgent
+        .get(`${API_PREFIX}/reports/ap-summary`)
+        .query({
+          fromDate: '2026-01-01',
+          toDate: '2026-12-31',
+          status: 'RECEIVED',
+        }),
     ];
 
     const results = await Promise.all(calls);
