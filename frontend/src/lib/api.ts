@@ -536,6 +536,52 @@ export const api = {
   // an explicit allowlist via JWT-only companyId lookup.
   apAgingReport: (params: ReportQueryParams = {}) =>
     apiRequest<ApAgingReport>(`/reports/ap-aging?${buildReportQuery(params)}`),
+
+  // ===== Phase 10A-C-code: AR Payments (settlement) =====
+  // Wire surface for the Phase 10A-B-2 backend endpoints:
+  //   GET  /api/sales-invoices/:invoiceId/payments
+  //     - tenant-scoped (JWT-only companyId)
+  //     - SALES-only (salesInvoiceId discriminator)
+  //     - returns `ArPayment[]` ordered paidAt DESC
+  //   POST /api/sales-invoices/:invoiceId/payments
+  //     - tenant-scoped, status=ISSUED gate
+  //     - overpayment guard (409 Conflict) when
+  //       amount > (total - existingPaid)
+  //     - idempotency: optional `idempotencyKey`
+  //       (>= 8 chars). Server short-circuits on a
+  //       duplicate (same key → same payment row)
+  //     - returns `ArPayment` (full response shape)
+  // RBAC is enforced server-side:
+  //   GET  → `ar_payments.read`
+  //   POST → `ar_payments.write`
+  // `companyId` is JWT-only and is NEVER sent in the
+  // body or as a query param. Same as every other
+  // backend endpoint in this client.
+
+  listArPayments: (
+    invoiceId: string,
+    params: {
+      fromDate?: string; // ISO date (yyyy-mm-dd)
+      toDate?: string; // ISO date (yyyy-mm-dd)
+    } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (params.fromDate) q.set('fromDate', params.fromDate);
+    if (params.toDate) q.set('toDate', params.toDate);
+    const suffix = q.toString() ? `?${q.toString()}` : '';
+    return apiRequest<ArPayment[]>(
+      `/sales-invoices/${invoiceId}/payments${suffix}`,
+    );
+  },
+
+  createArPayment: (
+    invoiceId: string,
+    data: CreateArPaymentInput,
+  ) =>
+    apiRequest<ArPayment>(
+      `/sales-invoices/${invoiceId}/payments`,
+      { method: 'POST', body: data },
+    ),
 };
 
 // =====================================================
@@ -1384,3 +1430,53 @@ export interface ArAgingData {
 }
 
 export type ArAgingReport = ReportEnvelope<ArAgingData>;
+
+// =====================================================
+// Phase 10A-C-code: AR Payments (settlement) types.
+//
+// Must mirror backend Phase 10A-B-2 settlement service
+//   (backend/src/payments/payments.service.ts) — the
+//   response shape is `PaymentResponseRow` server-side;
+//   the wire shape is what the UI binds to.
+// Decimal columns serialize to strings (matches
+// `Prisma.Decimal @db.Decimal(18,4)` server-side). The
+// polymorphic FK surfaces as `invoiceId` for SALES rows;
+// `invoiceType` is the discriminator. No client-side
+// coercion to `Number` — keep Decimal-as-string semantics
+// end to end (matches `SalesInvoice.total` typing).
+// =====================================================
+
+export type ArPaymentInvoiceTypeKey = 'SALES' | 'PURCHASE';
+
+export type ArPaymentStatusKey = 'POSTED' | 'CANCELLED';
+
+export interface ArPayment {
+  id: string;
+  // Polymorphic alias of `salesInvoiceId` on SALES rows.
+  // AP payments (Phase 10B) will reuse the same Type with
+  // `invoiceType === 'PURCHASE'` and a `purchaseInvoiceId`
+  // mirror; for Phase 10A this is always SALES.
+  invoiceId: string;
+  invoiceType: ArPaymentInvoiceTypeKey;
+  amount: string;           // Decimal-as-string (e.g. "100.0000")
+  paymentMethod: PaymentMethod;
+  paidAt: string;           // ISO-8601
+  reference: string | null;
+  notes: string | null;
+  status: ArPaymentStatusKey;
+  idempotencyKey: string | null;
+  createdAt: string;        // ISO-8601
+}
+
+export interface CreateArPaymentInput {
+  paymentMethod: PaymentMethod;
+  amount: string;           // matches /^\\d{1,14}(\\.\\d{1,4})?$/
+  paidAt?: string;          // optional ISO-8601
+  reference?: string;       // optional 1..128
+  notes?: string;           // optional <=1024
+  // Server stores unique (invoiceId, idempotencyKey)
+  // within the last 24h; same key on a retry returns the
+  // existing row with 201. Generated client-side via
+  // crypto.randomUUID() per submit attempt.
+  idempotencyKey?: string;
+}

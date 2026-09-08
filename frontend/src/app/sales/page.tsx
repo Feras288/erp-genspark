@@ -15,7 +15,7 @@
 // =====================================================
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 import { api, ApiError } from '@/lib/api';
 import type {
@@ -27,6 +27,9 @@ import type {
   SalesInvoiceType,
   PaymentMethod,
   CreateSalesInvoiceLineInput,
+  ArPayment,
+  CreateArPaymentInput,
+  ArPaymentStatusKey,
 } from '@/lib/api';
 
 interface LineFormState {
@@ -206,6 +209,14 @@ export default function SalesPage() {
   const canDelete = hasPermission('sales.delete');
   const canIssue = hasPermission('sales.issue');
   const canCancel = hasPermission('sales.cancel');
+  // AR payments (Phase 10A-C-code) — server-enforced RBAC
+  //   GET  /sales-invoices/:id/payments  → ar_payments.read
+  //   POST /sales-invoices/:id/payments  → ar_payments.write
+  // The Buttons + form below are gated on these; the
+  // PermissionsGuard on the backend re-checks them on
+  // every request, so a UI-only bypass is harmless.
+  const canReadArPayments = hasPermission('ar_payments.read');
+  const canWriteArPayments = hasPermission('ar_payments.write');
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
@@ -334,6 +345,180 @@ export default function SalesPage() {
     }
   };
 
+  // --------------------------------------------------------------
+  // Phase 10A-C-code: AR Payments expander state + helpers
+  //
+  // Per-row expander (clickable "المدفوعات (N)" button on ISSUED
+  // invoices). State is keyed by `invoiceId` so multiple rows can
+  // be operated independently. The HTTP wire surface is
+  // `api.listArPayments` / `api.createArPayment` (declared in
+  // frontend/src/lib/api.ts — Phase 10A-C-code append). RBAC is
+  // server-enforced; the buttons below are visibility-cloaked
+  // only (a no-perm UI button is harmless since PermissionsGuard
+  // on the backend re-checks every request).
+  //
+  // Strict Phase 10A-C-code scope:
+  //   - GET list → 401/403 → silent skip (don't refetch loops).
+  //   - POST   → 401/403/400/409 overpayment/validation → banner.
+  //   - No GL / no bank reconciliation / no AP / no PAID.PARTIALLY_PAID
+  //     status transition (T-2 lock).
+  //   - No edit to SalesInvoice.status from this UI.
+  // --------------------------------------------------------------
+
+  interface PaymentFormState {
+    amount: string;
+    paymentMethod: PaymentMethod;
+    paidAt: string;        // yyyy-mm-dd (HTML date input)
+    reference: string;
+    notes: string;
+  }
+
+  function emptyPaymentForm(): PaymentFormState {
+    return {
+      amount: '',
+      paymentMethod: 'CASH',
+      paidAt: '',
+      reference: '',
+      notes: '',
+    };
+  }
+
+  const [openPaymentsInvoiceId, setOpenPaymentsInvoiceId] = useState<string | null>(null);
+  const [paymentsByInvoice, setPaymentsByInvoice] = useState<Record<string, ArPayment[]>>({});
+  const [paymentsLoadingByInvoice, setPaymentsLoadingByInvoice] = useState<Record<string, boolean>>({});
+  const [paymentsErrByInvoice, setPaymentsErrByInvoice] = useState<Record<string, string>>({});
+  const [paymentFormByInvoice, setPaymentFormByInvoice] = useState<Record<string, PaymentFormState>>({});
+  const [paymentSubmittingByInvoice, setPaymentSubmittingByInvoice] = useState<Record<string, boolean>>({});
+  const [paymentSuccessByInvoice, setPaymentSuccessByInvoice] = useState<Record<string, boolean>>({});
+
+  const loadArPayments = (invoiceId: string) => {
+    if (!canReadArPayments) return;
+    setPaymentsLoadingByInvoice((m) => ({ ...m, [invoiceId]: true }));
+    setPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: '' }));
+    api
+      .listArPayments(invoiceId)
+      .then((rows) => {
+        setPaymentsByInvoice((m) => ({ ...m, [invoiceId]: rows }));
+        setPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: '' }));
+      })
+      .catch((e) => {
+        const msg =
+          e instanceof ApiError
+            ? e.status === 403
+              ? 'لا تملك صلاحية قراءة المدفوعات.'
+              : e.status === 401
+                ? 'انتهت الجلسة — يرجى إعادة تسجيل الدخول.'
+                : e.message
+            : e instanceof Error
+              ? e.message
+              : 'failed';
+        setPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: msg }));
+      })
+      .finally(() => {
+        setPaymentsLoadingByInvoice((m) => ({ ...m, [invoiceId]: false }));
+      });
+  };
+
+  const onTogglePayments = (invoiceId: string) => {
+    setOpenPaymentsInvoiceId((cur) => {
+      const next = cur === invoiceId ? null : invoiceId;
+      if (next && canReadArPayments && paymentsByInvoice[invoiceId] === undefined) {
+        loadArPayments(invoiceId);
+      }
+      return next;
+    });
+  };
+
+  const setPaymentForm = (invoiceId: string, patch: Partial<PaymentFormState>) => {
+    setPaymentFormByInvoice((m) => ({
+      ...m,
+      [invoiceId]: { ...(m[invoiceId] ?? emptyPaymentForm()), ...patch },
+    }));
+  };
+
+  const onSubmitPayment = async (
+    e: React.FormEvent,
+    invoiceId: string,
+    inv: SalesInvoice,
+  ) => {
+    e.preventDefault();
+    if (!canWriteArPayments) return;
+    const form = paymentFormByInvoice[invoiceId] ?? emptyPaymentForm();
+
+    // ---- client-side guards ----
+    const amount = Number(form.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setPaymentsErrByInvoice((m) => ({
+        ...m,
+        [invoiceId]: 'قيمة المبلغ يجب أن تكون رقماً > 0',
+      }));
+      return;
+    }
+    // Backend enforces status=ISSUED; UI-side mirror so we
+    // don't even emit a doomed request — but the backend is
+    // still the source of truth.
+    if (inv.status !== 'ISSUED') {
+      setPaymentsErrByInvoice((m) => ({
+        ...m,
+        [invoiceId]: 'لا يمكن تسجيل دفعة على فاتورة غير صادرة.',
+      }));
+      return;
+    }
+
+    // ---- wire payload (Decimal/18,4 format) ----
+    const payload: CreateArPaymentInput = {
+      paymentMethod: form.paymentMethod,
+      amount: amount.toFixed(4),
+      ...(form.paidAt ? { paidAt: new Date(form.paidAt + 'T12:00:00Z').toISOString() } : {}),
+      ...(form.reference.trim() ? { reference: form.reference.trim() } : {}),
+      ...(form.notes.trim() ? { notes: form.notes.trim() } : {}),
+      // Per-submit idempotency key (UUIDv4). Same key on
+      // a duplicate POST returns the same row with 201
+      // (server short-circuits before inserting).
+      idempotencyKey:
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `pay-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    };
+
+    setPaymentSubmittingByInvoice((m) => ({ ...m, [invoiceId]: true }));
+    setPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: '' }));
+    setPaymentSuccessByInvoice((m) => ({ ...m, [invoiceId]: false }));
+
+    try {
+      await api.createArPayment(invoiceId, payload);
+      setPaymentFormByInvoice((m) => ({ ...m, [invoiceId]: emptyPaymentForm() }));
+      setPaymentSuccessByInvoice((m) => ({ ...m, [invoiceId]: true }));
+      // Re-load list to show the freshly-registered row.
+      loadArPayments(invoiceId);
+    } catch (err) {
+      let msg: string;
+      if (err instanceof ApiError) {
+        if (err.status === 409) {
+          // Overpayment guard — the message from the backend is
+          // already bilingual-friendly ("Overpayment guard: ...");
+          // surface it verbatim + a localized hint.
+          msg = `تجاوز السقف: ${err.message}`;
+        } else if (err.status === 403) {
+          msg = 'لا تملك صلاحية تسجيل المدفوعات.';
+        } else if (err.status === 401) {
+          msg = 'انتهت الجلسة — يرجى إعادة تسجيل الدخول.';
+        } else if (err.status === 400) {
+          msg = `بيانات غير صحيحة: ${err.message}`;
+        } else {
+          msg = err.message;
+        }
+      } else if (err instanceof Error) {
+        msg = err.message;
+      } else {
+        msg = 'failed';
+      }
+      setPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: msg }));
+    } finally {
+      setPaymentSubmittingByInvoice((m) => ({ ...m, [invoiceId]: false }));
+    }
+  };
+
   // Note used inline for typecheck only (PaymentMethod not surfaced yet on the form,
   // but kept imported so future payment-column wiring is a one-liner).
   void ([] as PaymentMethod[]);
@@ -439,87 +624,308 @@ export default function SalesPage() {
             ) : (
               items.map((inv) => {
                 const isDraft = inv.status === 'DRAFT';
+                const isIssued = inv.status === 'ISSUED';
+                const paymentsOpen = openPaymentsInvoiceId === inv.id;
+                const paymentsForInv = paymentsByInvoice[inv.id];
+                const paymentsLoading = !!paymentsLoadingByInvoice[inv.id];
+                const paymentsErr = paymentsErrByInvoice[inv.id];
+                const paymentForm = paymentFormByInvoice[inv.id];
+                const paymentSubmitting = !!paymentSubmittingByInvoice[inv.id];
+                const paymentSuccess = paymentSuccessByInvoice[inv.id];
                 return (
-                  <tr key={inv.id} className="border-t border-slate-100">
-                    <td className="px-4 py-3 text-slate-800 font-mono" dir="ltr">
-                      {inv.invoiceNumber}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span
-                        className={
-                          'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
-                          (inv.status === 'ISSUED'
-                            ? 'bg-emerald-50 text-emerald-700'
-                            : inv.status === 'CANCELLED'
-                              ? 'bg-rose-50 text-rose-700'
-                              : 'bg-amber-50 text-amber-700')
-                        }
-                      >
-                        {inv.status === 'DRAFT'
-                          ? 'مسودة'
-                          : inv.status === 'ISSUED'
-                            ? 'صادرة'
-                            : 'ملغاة'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-slate-600">
-                      {inv.type === 'POS' ? 'نقطة بيع' : 'عادية'}
-                    </td>
-                    <td className="px-4 py-3 text-slate-700" dir="ltr">
-                      {customerLabel(inv.customerId)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-600" dir="ltr">
-                      {fmtDate(inv.issueDate)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
-                      {fmtMoney(inv.subtotal)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
-                      {fmtMoney(inv.vatTotal)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-900 font-mono font-semibold" dir="ltr">
-                      {fmtMoney(inv.total)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-600" dir="ltr">
-                      {fmtDate(inv.createdAt)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex gap-1 flex-wrap">
-                        {isDraft && canUpdate && (
-                          <button
-                            onClick={() => onEdit(inv)}
-                            className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50"
-                          >
-                            تعديل
-                          </button>
-                        )}
-                        {isDraft && canIssue && (
-                          <button
-                            onClick={() => onIssue(inv.id)}
-                            className="rounded-md border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50"
-                          >
-                            إصدار
-                          </button>
-                        )}
-                        {!inv.notes?.includes('credit note') && inv.status !== 'CANCELLED' && canCancel && (
-                          <button
-                            onClick={() => onCancel(inv.id)}
-                            className="rounded-md border border-amber-300 px-2 py-1 text-xs text-amber-700 hover:bg-amber-50"
-                          >
-                            إلغاء
-                          </button>
-                        )}
-                        {isDraft && canDelete && (
-                          <button
-                            onClick={() => onDelete(inv.id)}
-                            className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
-                          >
-                            حذف
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
+                  <React.Fragment key={inv.id}>
+                    <tr className="border-t border-slate-100">
+                      <td className="px-4 py-3 text-slate-800 font-mono" dir="ltr">
+                        {inv.invoiceNumber}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={
+                            'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
+                            (inv.status === 'ISSUED'
+                              ? 'bg-emerald-50 text-emerald-700'
+                              : inv.status === 'CANCELLED'
+                                ? 'bg-rose-50 text-rose-700'
+                                : 'bg-amber-50 text-amber-700')
+                          }
+                        >
+                          {inv.status === 'DRAFT'
+                            ? 'مسودة'
+                            : inv.status === 'ISSUED'
+                              ? 'صادرة'
+                              : 'ملغاة'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-slate-600">
+                        {inv.type === 'POS' ? 'نقطة بيع' : 'عادية'}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700" dir="ltr">
+                        {customerLabel(inv.customerId)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-600" dir="ltr">
+                        {fmtDate(inv.issueDate)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
+                        {fmtMoney(inv.subtotal)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
+                        {fmtMoney(inv.vatTotal)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-900 font-mono font-semibold" dir="ltr">
+                        {fmtMoney(inv.total)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-600" dir="ltr">
+                        {fmtDate(inv.createdAt)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex gap-1 flex-wrap">
+                          {isDraft && canUpdate && (
+                            <button
+                              onClick={() => onEdit(inv)}
+                              className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50"
+                            >
+                              تعديل
+                            </button>
+                          )}
+                          {isDraft && canIssue && (
+                            <button
+                              onClick={() => onIssue(inv.id)}
+                              className="rounded-md border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50"
+                            >
+                              إصدار
+                            </button>
+                          )}
+                          {!inv.notes?.includes('credit note') && inv.status !== 'CANCELLED' && canCancel && (
+                            <button
+                              onClick={() => onCancel(inv.id)}
+                              className="rounded-md border border-amber-300 px-2 py-1 text-xs text-amber-700 hover:bg-amber-50"
+                            >
+                              إلغاء
+                            </button>
+                          )}
+                          {isDraft && canDelete && (
+                            <button
+                              onClick={() => onDelete(inv.id)}
+                              className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
+                            >
+                              حذف
+                            </button>
+                          )}
+                          {isIssued && canReadArPayments && (
+                            <button
+                              onClick={() => onTogglePayments(inv.id)}
+                              className={
+                                'rounded-md border px-2 py-1 text-xs ' +
+                                (paymentsOpen
+                                  ? 'border-sky-400 bg-sky-50 text-sky-700'
+                                  : 'border-sky-300 text-sky-700 hover:bg-sky-50')
+                              }
+                            >
+                              {paymentsOpen
+                                ? 'إخفاء المدفوععات'
+                                : `المدفوععات (${(paymentsForInv || []).length})`}
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                    {isIssued && paymentsOpen && (
+                      <tr className="bg-slate-50/60">
+                        <td colSpan={10} className="px-4 py-4">
+                          <div className="space-y-3">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-sm font-semibold text-slate-700">
+                                مدفوععات الفاتورة{' '}
+                                <span className="font-mono text-slate-500" dir="ltr">
+                                  {inv.invoiceNumber}
+                                </span>
+                              </h4>
+                              {paymentsLoading && (
+                                <span className="text-xs text-slate-400">...جاري التحميل</span>
+                              )}
+                            </div>
+
+                            {paymentsErr && (
+                              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                                {paymentsErr}
+                              </div>
+                            )}
+
+                            {!paymentsLoading &&
+                              !paymentsErr &&
+                              (paymentsForInv || []).length === 0 && (
+                                <div className="text-xs text-slate-500">
+                                  لا توجد مدفوععات مسجلة لهذه الفاتورة حتى الآن.
+                                </div>
+                              )}
+
+                            {!paymentsLoading && !paymentsErr && (paymentsForInv || []).length > 0 && (
+                              <div className="overflow-x-auto rounded-md border border-slate-200 bg-white">
+                                <table className="min-w-full text-xs">
+                                  <thead className="bg-slate-100 text-slate-600">
+                                    <tr>
+                                      <th className="px-3 py-2 text-right font-medium">المبلغ</th>
+                                      <th className="px-3 py-2 text-right font-medium">طريقة الدفع</th>
+                                      <th className="px-3 py-2 text-right font-medium">تاريخ الدفع</th>
+                                      <th className="px-3 py-2 text-right font-medium">المرجع</th>
+                                      <th className="px-3 py-2 text-right font-medium">الحالة</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {(paymentsForInv || []).map((p) => (
+                                      <tr key={p.id} className="border-t border-slate-100">
+                                        <td className="px-3 py-2 font-mono text-slate-800" dir="ltr">
+                                          {fmtMoney(p.amount)}
+                                        </td>
+                                        <td className="px-3 py-2 text-slate-700">
+                                          {p.paymentMethod === 'CASH'
+                                            ? 'نقدي'
+                                            : p.paymentMethod === 'CARD'
+                                              ? 'بطاقة'
+                                              : p.paymentMethod === 'TRANSFER'
+                                                ? 'تحويل'
+                                                : 'أخرى'}
+                                        </td>
+                                        <td className="px-3 py-2 text-slate-600" dir="ltr">
+                                          {fmtDate(p.paidAt)}
+                                        </td>
+                                        <td className="px-3 py-2 text-slate-600" dir="ltr">
+                                          {p.reference || '—'}
+                                        </td>
+                                        <td className="px-3 py-2">
+                                          <span
+                                            className={
+                                              'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
+                                              (p.status === 'POSTED'
+                                                ? 'bg-emerald-50 text-emerald-700'
+                                                : 'bg-slate-100 text-slate-600')
+                                            }
+                                          >
+                                            {p.status === 'POSTED' ? 'مُرحَّل' : 'ملغى'}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+
+                            {canWriteArPayments && (
+                              <form
+                                onSubmit={(e) => onSubmitPayment(e, inv.id, inv)}
+                                className="grid gap-3 rounded-md border border-slate-200 bg-white p-3 md:grid-cols-2"
+                              >
+                                <div className="md:col-span-2 flex items-center justify-between">
+                                  <h5 className="text-sm font-semibold text-slate-700">
+                                    تسجيل مدفوعة جديدة
+                                  </h5>
+                                  {paymentSuccess && (
+                                    <span className="text-xs text-emerald-700">
+                                      {paymentSuccess}
+                                    </span>
+                                  )}
+                                </div>
+
+                                <label className="text-xs text-slate-600">
+                                  <span className="block mb-1">المبلغ</span>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    dir="ltr"
+                                    value={paymentForm?.amount ?? ''}
+                                    onChange={(e) =>
+                                      setPaymentForm(inv.id, { amount: e.target.value })
+                                    }
+                                    placeholder="0.0000"
+                                    className="w-full rounded-md border border-slate-300 px-2 py-1 font-mono text-sm"
+                                    required
+                                  />
+                                </label>
+
+                                <label className="text-xs text-slate-600">
+                                  <span className="block mb-1">طريقة الدفع</span>
+                                  <select
+                                    value={paymentForm?.paymentMethod ?? 'CASH'}
+                                    onChange={(e) =>
+                                      setPaymentForm(inv.id, {
+                                        paymentMethod: e.target
+                                          .value as PaymentMethod,
+                                      })
+                                    }
+                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                                  >
+                                    <option value="CASH">نقدي</option>
+                                    <option value="CARD">بطاقة</option>
+                                    <option value="TRANSFER">تحويل</option>
+                                    <option value="OTHER">أخرى</option>
+                                  </select>
+                                </label>
+
+                                <label className="text-xs text-slate-600">
+                                  <span className="block mb-1">تاريخ الدفع</span>
+                                  <input
+                                    type="date"
+                                    dir="ltr"
+                                    value={paymentForm?.paidAt ?? ''}
+                                    onChange={(e) =>
+                                      setPaymentForm(inv.id, { paidAt: e.target.value })
+                                    }
+                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                                    required
+                                  />
+                                </label>
+
+                                <label className="text-xs text-slate-600">
+                                  <span className="block mb-1">المرجع</span>
+                                  <input
+                                    type="text"
+                                    dir="ltr"
+                                    value={paymentForm?.reference ?? ''}
+                                    onChange={(e) =>
+                                      setPaymentForm(inv.id, { reference: e.target.value })
+                                    }
+                                    placeholder="receipt / cheque #"
+                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                                  />
+                                </label>
+
+                                <label className="text-xs text-slate-600 md:col-span-2">
+                                  <span className="block mb-1">ملاحظات</span>
+                                  <textarea
+                                    rows={2}
+                                    value={paymentForm?.notes ?? ''}
+                                    onChange={(e) =>
+                                      setPaymentForm(inv.id, { notes: e.target.value })
+                                    }
+                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                                  />
+                                </label>
+
+                                <div className="md:col-span-2 flex items-center justify-between">
+                                  <span className="text-xs text-slate-400" dir="ltr">
+                                    Idempotency-Key يُولَّد تلقائياً لكل محاولة إرسال.
+                                  </span>
+                                  <button
+                                    type="submit"
+                                    disabled={paymentSubmitting}
+                                    className={
+                                      'rounded-md border px-3 py-1 text-xs ' +
+                                      (paymentSubmitting
+                                        ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
+                                        : 'border-sky-300 bg-sky-600 text-white hover:bg-sky-700')
+                                    }
+                                  >
+                                    {paymentSubmitting ? '...جاري التسجيل' : 'تسجيل المدفوعة'}
+                                  </button>
+                                </div>
+                              </form>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
                 );
               })
             )}
