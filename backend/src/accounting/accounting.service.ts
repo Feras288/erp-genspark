@@ -391,7 +391,20 @@ export class AccountingService {
     return accounts;
   }
 
-  private computeTotalDecimals(
+  // ===================================================
+  // Phase 11A-B-2: GL posting helpers (additive, reused
+  // by post/cancel paths). Pure helpers — no DB calls,
+  // no audit emission. All amounts are Prisma.Decimal
+  // (no Float, no Number for money math).
+  // ===================================================
+
+  /**
+   * Sum debit/credit across a line-shape list. Pure
+   * function; no DB access. Renamed from
+   * `computeTotalDecimals` to match the public helper
+   * name required by Phase 11A-B-2.
+   */
+  computeJournalTotals(
     lines: { debit: Prisma.Decimal; credit: Prisma.Decimal }[],
   ) {
     let td = new Prisma.Decimal(0);
@@ -401,6 +414,80 @@ export class AccountingService {
       tc = tc.add(l.credit);
     }
     return { totalDebit: td, totalCredit: tc };
+  }
+
+  /**
+   * Throw if the line list's debit != credit. Pure;
+   * no DB access. Recomputes totals using
+   * `computeJournalTotals` and surfaces a localized
+   * 4-decimal mismatch message.
+   */
+  validateJournalBalances(
+    lines: { debit: Prisma.Decimal; credit: Prisma.Decimal }[],
+  ) {
+    const { totalDebit, totalCredit } = this.computeJournalTotals(lines);
+    if (!totalDebit.equals(totalCredit)) {
+      throw new BadRequestException(
+        `Unbalanced entry: totalDebit=${totalDebit.toFixed(
+          4,
+        )} != totalCredit=${totalCredit.toFixed(4)}`,
+      );
+    }
+    return { totalDebit, totalCredit };
+  }
+
+  /**
+   * Throw if the entry cannot be posted. Caller promises
+   * the entry was loaded from the same `companyId` as the
+   * JWT (tenant guard is upstream). State precondition:
+   * POST / journal ONLY accepts DRAFT entries.
+   */
+  ensureJournalEntryCanPost(
+    entry: { id: string; status: JournalEntryStatus } | null,
+  ): asserts entry is { id: string; status: JournalEntryStatus } {
+    if (!entry) throw new NotFoundException('Journal entry not found');
+    if (entry.status !== JournalEntryStatus.DRAFT) {
+      throw new ConflictException(
+        `Only DRAFT entries can be posted (current: ${entry.status})`,
+      );
+    }
+  }
+
+  /**
+   * Throw if the entry cannot be cancelled through the
+   * Phase 6 contract. Caller promises the entry was loaded
+   * from the same `companyId` as the JWT (tenant guard is
+   * upstream). State precondition (Phase 6 — preserved by
+   * Phase 11A-B-2 so the existing e2e F5 / F6 / F7 contract
+   * remains green):
+   *   * CANCELLED → throw 409 ("already cancelled").
+   *   * POSTED    → throw 4xx with the canonical "Posted
+   *                 journal entries require reversing entries,
+   *                 which is out of scope in Phase 6" wording
+   *                 — the wording matches the existing F5 e2e
+   *                 regex `/posted|reverse|out of scope/i`.
+   *   * DRAFT     → fall through; the caller will flip status
+   *                 to CANCELLED with `cancelledAt` /
+   *                 `cancelledById` set and emit the audit
+   *                 record. NO reversal journal is generated.
+   * The `REVERSED` enum value is still deferred to a later
+   * additive phase. This helper only centralizes the
+   * existing Phase 6 cancellation contract — it does NOT
+   * introduce new behavior.
+   */
+  ensureJournalEntryCanCancel(
+    entry: { id: string; status: JournalEntryStatus } | null,
+  ): asserts entry is { id: string; status: JournalEntryStatus } {
+    if (!entry) throw new NotFoundException('Journal entry not found');
+    if (entry.status === JournalEntryStatus.CANCELLED) {
+      throw new ConflictException('Journal entry is already cancelled');
+    }
+    if (entry.status === JournalEntryStatus.POSTED) {
+      throw new ConflictException(
+        'Posted journal entries require reversing entries, which is out of scope in Phase 6',
+      );
+    }
+    // entry.status === DRAFT is the only path that allows cancellation here.
   }
 
   private async assertAccountsForLines(
@@ -498,7 +585,7 @@ export class AccountingService {
         debit: this.dec(l.debit),
         credit: this.dec(l.credit),
       }));
-      const totals = this.computeTotalDecimals(prepared);
+      const totals = this.computeJournalTotals(prepared);
       if (!totals.totalDebit.equals(totals.totalCredit)) {
         throw new BadRequestException(
           `Unbalanced entry: totalDebit=${totals.totalDebit.toFixed(
@@ -572,7 +659,7 @@ export class AccountingService {
             credit: this.dec(l.credit),
           }),
         );
-        const totals = this.computeTotalDecimals(prepared);
+        const totals = this.computeJournalTotals(prepared);
         if (!totals.totalDebit.equals(totals.totalCredit)) {
           throw new BadRequestException(
             `Unbalanced entry: totalDebit=${totals.totalDebit.toFixed(
@@ -639,12 +726,12 @@ export class AccountingService {
         where: { id, companyId },
         select: { id: true, status: true, totalDebit: true, totalCredit: true },
       });
-      if (!entry) throw new NotFoundException('Journal entry not found');
-      if (entry.status !== JournalEntryStatus.DRAFT) {
-        throw new ConflictException(
-          `Only DRAFT entries can be posted (current: ${entry.status})`,
-        );
-      }
+      // Tenant guard: implied by `{ id, companyId }` filter above.
+      // companyId is sourced from the JWT only — never from the URL or body.
+      // State guard: enabled via the Phase 11A-B-2 helper. Only DRAFT
+      // entries can be POSTED; null/absent, CANCELLED, and already-POSTED
+      // entries all yield a friendly exception (404 / 409).
+      this.ensureJournalEntryCanPost(entry);
       if (!entry.totalDebit.equals(entry.totalCredit)) {
         throw new BadRequestException(
           'Entry is not balanced — cannot post',
@@ -688,15 +775,21 @@ export class AccountingService {
         where: { id, companyId },
         select: { id: true, status: true },
       });
-      if (!entry) throw new NotFoundException('Journal entry not found');
-      if (entry.status === JournalEntryStatus.POSTED) {
-        throw new ConflictException(
-          'Posted journal entries require reversing entries, which are out of scope in Phase 6',
-        );
-      }
-      if (entry.status === JournalEntryStatus.CANCELLED) {
-        throw new ConflictException('Journal entry is already cancelled');
-      }
+      // Tenant guard: implied by `{ id, companyId }` filter above.
+      // companyId comes from the JWT only (no companyId from URL/body).
+      // State guard (Phase 6 contract — preserved by Phase 11A-B-2 so
+      // the existing e2e F5 / F6 / F7 contract remains green):
+      //   * CANCELLED → 409 ("already cancelled").
+      //   * POSTED    → 409 with the canonical "Posted journal entries
+      //                 require reversing entries, which is out of
+      //                 scope in Phase 6" message; matches the existing
+      //                 e2e F5 regex `/posted|reverse|out of scope/i`.
+      //   * DRAFT     → accepted; status flips to CANCELLED with
+      //                 `cancelledAt` / `cancelledById` populated and
+      //                 an audit row emitted. NO reversal journal is
+      //                 generated in this phase. `REVERSED` enum remains
+      //                 deferred to a later additive phase.
+      this.ensureJournalEntryCanCancel(entry);
       const updated = await tx.journalEntry.update({
         where: { id: entry.id },
         data: {
