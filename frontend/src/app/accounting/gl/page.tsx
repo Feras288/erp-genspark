@@ -41,6 +41,7 @@ import type {
   AccountTypeKey,
   GlJournalEntry,
   GlAccount,
+  JournalEntrySourceTypeKey,
   JournalEntryStatusKey,
   NormalBalanceKey,
 } from '@/lib/api';
@@ -89,6 +90,75 @@ function arStatus(s: JournalEntryStatusKey): string {
       return 'مرحّل';
     case 'CANCELLED':
       return 'ملغى';
+  }
+}
+
+function getSourceInfo(entry: GlJournalEntry): {
+  label: string;
+  labelAr: string;
+  sourceId: string | null;
+  badgeClass: string;
+} {
+  let type = entry.sourceType;
+  let sourceId = entry.sourceId ?? null;
+
+  // Fallback heuristic from entryNumber or description if backend didn't include sourceType in select
+  if (!type && entry.entryNumber) {
+    if (entry.entryNumber.startsWith('JE-SI-')) {
+      type = 'SALES_INVOICE';
+      if (!sourceId) sourceId = entry.entryNumber.replace('JE-SI-', '');
+    } else if (entry.entryNumber.startsWith('JE-PI-')) {
+      type = 'PURCHASE_INVOICE';
+      if (!sourceId) sourceId = entry.entryNumber.replace('JE-PI-', '');
+    } else if (entry.entryNumber.startsWith('JE-AR-')) {
+      type = 'AR_PAYMENT';
+      if (!sourceId) sourceId = entry.entryNumber.replace('JE-AR-', '');
+    } else if (entry.entryNumber.startsWith('JE-AP-')) {
+      type = 'AP_PAYMENT';
+      if (!sourceId) sourceId = entry.entryNumber.replace('JE-AP-', '');
+    }
+  }
+
+  if (!sourceId && entry.reference) {
+    sourceId = entry.reference;
+  }
+
+  switch (type) {
+    case 'SALES_INVOICE':
+      return {
+        label: 'Sales Invoice',
+        labelAr: 'فاتورة مبيعات',
+        sourceId,
+        badgeClass: 'bg-blue-50 text-blue-700 border-blue-200',
+      };
+    case 'PURCHASE_INVOICE':
+      return {
+        label: 'Purchase Invoice',
+        labelAr: 'فاتورة مشتريات',
+        sourceId,
+        badgeClass: 'bg-purple-50 text-purple-700 border-purple-200',
+      };
+    case 'AR_PAYMENT':
+      return {
+        label: 'AR Payment',
+        labelAr: 'سند قبض',
+        sourceId,
+        badgeClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      };
+    case 'AP_PAYMENT':
+      return {
+        label: 'AP Payment',
+        labelAr: 'سند صرف',
+        sourceId,
+        badgeClass: 'bg-amber-50 text-amber-700 border-amber-200',
+      };
+    default:
+      return {
+        label: 'Manual Journal',
+        labelAr: 'قيد يدوي',
+        sourceId: null,
+        badgeClass: 'bg-slate-50 text-slate-600 border-slate-200',
+      };
   }
 }
 
@@ -369,6 +439,8 @@ export default function GlReadOnlyPage() {
                     <thead className="text-xs text-slate-500 border-b border-slate-200">
                       <tr>
                         <th className="text-start py-2 px-2">رقم القيد</th>
+                        <th className="text-start py-2 px-2">نوع المصدر</th>
+                        <th className="text-start py-2 px-2">معرّف المصدر</th>
                         <th className="text-start py-2 px-2">التاريخ</th>
                         <th className="text-start py-2 px-2">الوصف</th>
                         <th className="text-start py-2 px-2">الحالة</th>
@@ -377,36 +449,54 @@ export default function GlReadOnlyPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {journal.map((e) => (
-                        <tr key={e.id} className="border-b border-slate-100">
-                          <td className="py-2 px-2 font-mono" dir="ltr">
-                            {e.entryNumber}
-                          </td>
-                          <td className="py-2 px-2 text-xs" dir="ltr">
-                            {fmtDate(e.entryDate)}
-                          </td>
-                          <td className="py-2 px-2 text-xs">
-                            {e.description ?? '—'}
-                          </td>
-                          <td className="py-2 px-2 text-xs">
-                            {e.status === 'DRAFT' && (
-                              <span className="text-amber-700">{arStatus('DRAFT')}</span>
-                            )}
-                            {e.status === 'POSTED' && (
-                              <span className="text-emerald-700">{arStatus('POSTED')}</span>
-                            )}
-                            {e.status === 'CANCELLED' && (
-                              <span className="text-rose-700">{arStatus('CANCELLED')}</span>
-                            )}
-                          </td>
-                          <td className="py-2 px-2" dir="ltr">
-                            {fmtMoney(e.totalDebit)}
-                          </td>
-                          <td className="py-2 px-2" dir="ltr">
-                            {fmtMoney(e.totalCredit)}
-                          </td>
-                        </tr>
-                      ))}
+                      {journal.map((e) => {
+                        const src = getSourceInfo(e);
+                        return (
+                          <tr key={e.id} className="border-b border-slate-100 hover:bg-slate-50/50">
+                            <td className="py-2 px-2 font-mono text-xs whitespace-nowrap" dir="ltr">
+                              {e.entryNumber}
+                            </td>
+                            <td className="py-2 px-2 text-xs whitespace-nowrap">
+                              <span
+                                className={`inline-flex items-center gap-1 rounded px-2 py-0.5 border text-[11px] font-medium ${src.badgeClass}`}
+                              >
+                                <span>{src.labelAr}</span>
+                                <span className="text-[10px] opacity-75">({src.label})</span>
+                              </span>
+                            </td>
+                            <td
+                              className="py-2 px-2 font-mono text-[11px] text-slate-600 max-w-[120px] truncate"
+                              dir="ltr"
+                              title={src.sourceId ?? undefined}
+                            >
+                              {src.sourceId ?? '—'}
+                            </td>
+                            <td className="py-2 px-2 text-xs whitespace-nowrap" dir="ltr">
+                              {fmtDate(e.entryDate)}
+                            </td>
+                            <td className="py-2 px-2 text-xs max-w-[160px] truncate" title={e.description ?? undefined}>
+                              {e.description ?? '—'}
+                            </td>
+                            <td className="py-2 px-2 text-xs whitespace-nowrap">
+                              {e.status === 'DRAFT' && (
+                                <span className="text-amber-700">{arStatus('DRAFT')}</span>
+                              )}
+                              {e.status === 'POSTED' && (
+                                <span className="text-emerald-700">{arStatus('POSTED')}</span>
+                              )}
+                              {e.status === 'CANCELLED' && (
+                                <span className="text-rose-700">{arStatus('CANCELLED')}</span>
+                              )}
+                            </td>
+                            <td className="py-2 px-2 whitespace-nowrap" dir="ltr">
+                              {fmtMoney(e.totalDebit)}
+                            </td>
+                            <td className="py-2 px-2 whitespace-nowrap" dir="ltr">
+                              {fmtMoney(e.totalCredit)}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -441,9 +531,8 @@ export default function GlReadOnlyPage() {
       </div>
 
       <p className="mt-6 text-xs text-slate-400">
-        Phase 11A-C-code — view-only. لا توجد قيود آلية من المبيعات أو المشتريات
-        هنا (لا AR / AP / VAT / ZATCA)، ولا ميزانيات مراجعة أو قوائم مالية — هذه
-        خارج النطاق الحالي.
+        Phase 11B-C — view-only. عرض القيود اليومية مع مستندات المصدر (المبيعات،
+        المشتريات، سندات القبض والصرف). لا توجد أزرار إنشاء أو تعديل هنا.
       </p>
     </main>
   );

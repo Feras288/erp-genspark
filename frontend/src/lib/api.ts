@@ -1104,6 +1104,12 @@ export type JournalEntryLine = {
   } | null;
 };
 
+export type JournalEntrySourceTypeKey =
+  | 'SALES_INVOICE'
+  | 'PURCHASE_INVOICE'
+  | 'AR_PAYMENT'
+  | 'AP_PAYMENT';
+
 export type JournalEntry = {
   id: string;
   companyId: string;
@@ -1123,6 +1129,9 @@ export type JournalEntry = {
   updatedById: string | null;
   postedById: string | null;
   cancelledById: string | null;
+  sourceType?: JournalEntrySourceTypeKey | null;
+  sourceId?: string | null;
+  reversalOf?: string | null;
   lines?: JournalEntryLine[];
   _count?: { lines: number };
 };
