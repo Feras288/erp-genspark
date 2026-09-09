@@ -29,6 +29,9 @@ import {
 import { ValidatePeriodCloseDto } from './dto/validate-period-close.dto';
 import { ClosePeriodDto } from './dto/close-period.dto';
 import { ReopenPeriodDto } from './dto/reopen-period.dto';
+import { ValidateFiscalYearCloseDto } from './dto/validate-fiscal-year-close.dto';
+import { CloseFiscalYearDto } from './dto/close-fiscal-year.dto';
+import { ReopenFiscalYearDto } from './dto/reopen-fiscal-year.dto';
 
 @ApiTags('Accounting - Period Close')
 @ApiBearerAuth()
@@ -100,4 +103,33 @@ export class PeriodCloseController {
   ) {
     return this.svc.reopenPeriod(me.companyId, me.id, id, dto);
   }
+
+  @Post('fiscal-years/validate')
+  @RequirePermissions('period_close.read')
+  validateFiscalYear(
+    @CurrentUser() me: AuthenticatedUser,
+    @Body() dto: ValidateFiscalYearCloseDto,
+  ) {
+    return this.svc.validateFiscalYear(me.companyId, dto);
+  }
+
+  @Post('fiscal-years/close')
+  @RequirePermissions('period_close.close')
+  closeFiscalYear(
+    @CurrentUser() me: AuthenticatedUser,
+    @Body() dto: CloseFiscalYearDto,
+  ) {
+    return this.svc.closeFiscalYear(me.companyId, me.id, dto);
+  }
+
+  @Post('fiscal-years/:id/reopen')
+  @RequirePermissions('period_close.reopen')
+  reopenFiscalYear(
+    @CurrentUser() me: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: ReopenFiscalYearDto,
+  ) {
+    return this.svc.reopenFiscalYear(me.companyId, me.id, id, dto);
+  }
 }
+

@@ -184,3 +184,92 @@ export interface ReopenPeriodResponse {
     };
   };
 }
+
+// =====================================================
+// Phase 14A-B-6: Fiscal Year Close Types
+// =====================================================
+
+export type FiscalYearCloseCheckCode =
+  | 'FISCAL_YEAR_RANGE_VALID'
+  | 'NO_EXISTING_CLOSED_FISCAL_YEAR_OVERLAP'
+  | 'ALL_PERIODS_CLOSED'
+  | 'NO_DRAFT_JOURNALS_IN_YEAR'
+  | 'POSTED_JOURNALS_BALANCED_IN_YEAR'
+  | 'YEAR_TRIAL_BALANCE_BALANCED'
+  | 'RETAINED_EARNINGS_POSTING_SKIPPED';
+
+export interface FiscalYearCloseValidationCheck {
+  code: FiscalYearCloseCheckCode;
+  status: PeriodCloseCheckStatus;
+  blocking: boolean;
+  message: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface FiscalYearValidationData {
+  fiscalYear: number;
+  fiscalYearStart: string;
+  fiscalYearEnd: string;
+  canClose: boolean;
+  blockingFailures: number;
+  warnings: string[];
+  checks: FiscalYearCloseValidationCheck[];
+  totals: {
+    postedDebitTotal: string;
+    postedCreditTotal: string;
+  };
+  retainedEarnings: {
+    postingCreated: boolean;
+    reason: string;
+  };
+}
+
+export interface FiscalYearValidationResponse {
+  status: 'ok';
+  companyId: string;
+  data: FiscalYearValidationData;
+}
+
+export interface CloseFiscalYearResponse {
+  status: 'ok';
+  companyId: string;
+  data: {
+    fiscalYearClose: {
+      id: string;
+      fiscalYear: number;
+      fiscalYearStart: string;
+      fiscalYearEnd: string;
+      status: PeriodCloseStatus;
+      closedAt: string | null;
+      closedById: string | null;
+      retainedEarningsJournalEntryId: string | null;
+      notes: string | null;
+    };
+    validation: {
+      canClose: boolean;
+      blockingFailures: number;
+    };
+    retainedEarnings: {
+      postingCreated: boolean;
+      reason: string;
+    };
+  };
+}
+
+export interface ReopenFiscalYearResponse {
+  status: 'ok';
+  companyId: string;
+  data: {
+    fiscalYearClose: {
+      id: string;
+      fiscalYear: number;
+      fiscalYearStart: string;
+      fiscalYearEnd: string;
+      status: PeriodCloseStatus;
+      reopenedAt: string | null;
+      reopenedById: string | null;
+      reopenReason: string | null;
+    };
+  };
+}
+
