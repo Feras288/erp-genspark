@@ -3191,3 +3191,150 @@ function ensureJournalEntryCanCancel(entry: JournalEntry | null): asserts entry 
 - ❌ **أي تعديلات على الـ schema أو إضافة صلاحيات جديدة في الـ RBAC**.
 - ❌ **أي تغييرات في النشر السحابي أو البنية التحتية (Docker / Cloudflare)**.
 
+---
+
+## Phase 13A: Bank Reconciliation
+
+> تم تنفيذ المرحلة 13A بالكامل مع **207/207 e2e tests passing** عبر جميع مجموعات الاختبارات، وبناء نظيف تماماً للـ backend والـ frontend. توفر هذه المرحلة نظام تسوية ومطابقة بنكية متكامل يدعم استيراد كشوف الحسابات بصيغة CSV، كشف التكرار على مستوى الملف والسطور، محرك اقتراحات المطابقة الذكي، سير عمل المطابقة اليدوية وإلغاء المطابقة (Soft-unmatch)، تقارير العمليات غير المطابقة والملخص العام، ومساحة عمل تفاعلية في الواجهة الأمامية عبر المسار `/accounting/reconciliation`، مع الحفاظ التام على ثوابت المحاسبة وعدم المساس بقيود اليومية.
+
+### Completed Commits (Phase 13A)
+
+- `e99a848` — `docs(phase-13a): add reconciliation architecture plan`
+- `5752e49` — `docs(phase-13a): clarify reconciliation unmatch semantics`
+- `5934524` — `feat(phase-13a): add reconciliation models and permissions`
+- `b9eae18` — `feat(phase-13a): add bank accounts reconciliation skeleton`
+- `5f715d5` — `feat(phase-13a): implement bank statement csv import parser`
+- `97994d8` — `feat(phase-13a): implement reconciliation matching suggestions`
+- `322261f` — `feat(phase-13a): implement manual reconciliation workflow`
+- `e7a13ae` — `feat(phase-13a): add reconciliation reports`
+- `d862d3c` — `feat(phase-13a): add reconciliation frontend workspace`
+
+---
+
+### 1. Scope (النطاق المحقق)
+1. **Manual bank statement CSV import**: رفع واستيراد كشوف الحسابات البنكية يدوياً بصيغة CSV.
+2. **Bank account CRUD**: إدارة الحسابات البنكية للشركة (إنشاء، استعراض، تعديل، وحذف ناعم) مع ربط اختياري بحساب الأستاذ العام للأصول (GL Asset Account).
+3. **Duplicate file and duplicate transaction detection**: منع تكرار استيراد نفس الكشف البنكي بالاعتماد على بصمة الملف، ومنع تكرار الحركات البنكية عبر بصمة السطر الفريدة (Row Fingerprint).
+4. **Matching suggestions engine**: محرك اقتراحات حتمي يطابق الحركات البنكية مع مدفوعات النظام (AR/AP) بناءً على نقاط الثقة والتطابق.
+5. **Manual match and soft-unmatch workflow**: سير عمل للمطابقة اليدوية مع إمكانية إلغاء المطابقة الآمن (Soft-unmatch) وتتبع المستخدم ووقت الإلغاء.
+6. **Reconciliation reports**: تقرير العمليات غير المطابقة (Unmatched Report) وتقرير الملخص العام والفروقات والتنبيهات (Summary Report).
+7. **Frontend workspace**: مساحة عمل متكاملة للمطابقة البنكية على `/accounting/reconciliation`.
+8. **No automatic GL postings**: عدم إنشاء أي قيود محاسبية أو تسويات دفتيرية تلقائية.
+
+---
+
+### 2. Data Model (نموذج البيانات)
+تم إدخال النماذج التالية في مخطط Prisma (`schema.prisma`):
+- **`BankAccount`**: بيانات الحساب البنكي (الاسم، الآيبان الفريد، العملة، الرصيد الافتتاحي والحالي، وحساب الأستاذ المرتبط `glAccountId`).
+- **`BankStatement`**: سجل كشف الحساب المستورد، يحمل بصمة SHA-256 للملف في `fileHash` لضمان عدم استيراد الملف مرتين داخل الشركة (`@@unique([companyId, fileHash])`).
+- **`BankTransaction`**: حركات كشف الحساب البنكي الفردية (وارد `INFLOW` / صادر `OUTFLOW`) مع بصمة فريدة `fingerprint` مشتقة من التاريخ، النوع، المبلغ، والمرجع لمنع تكرار إدخال الحركة (`@@unique([bankAccountId, fingerprint])`).
+- **`ReconciliationMatch`**: يربط حركة بنكية واحدة (`bankTransactionId`) بدفعة واحدة مسجلة في النظام (`paymentId`).
+  - **Active-only uniqueness**: فهارس جزئية فريدة (`active_bank_tx_match` و `active_payment_match`) لضمان عدم وجود أكثر من مطابقة نشطة لنفس الحركة أو الدفعة في وقت واحد (`where: unmatchedAt IS NULL`).
+  - **Soft-unmatch**: إلغاء المطابقة يتم برمجياً بتسجيل `unmatchedAt` و `unmatchedById` وإعادة الحركة البنكية إلى حالة `UNMATCHED` دون حذف سجل المطابقة ودون تعديل أي قيد محاسبي.
+- **Tenant Isolation**: جميع النماذج معزولة تماماً ومقيدة بالشركة عبر حقل `companyId` المشتق من الـ JWT فقط.
+
+---
+
+### 3. APIs (واجهات برمجة التطبيقات)
+مسارات التسوية البنكية المتاحة تحت البادئة `/api/reconciliation`:
+
+#### أ. الحسابات البنكية (Bank Accounts):
+- `GET /api/reconciliation/bank-accounts`: استعراض الحسابات البنكية النشطة للشركة.
+- `POST /api/reconciliation/bank-accounts`: إنشاء حساب بنكي جديد مع التحقق من تفرد الآيبان وصحة حساب الأستاذ العام.
+- `PATCH /api/reconciliation/bank-accounts/:id`: تحديث بيانات الحساب البنكي.
+- `DELETE /api/reconciliation/bank-accounts/:id`: حذف ناعم للحساب البنكي.
+
+#### ب. استيراد كشوف الحسابات (CSV Import):
+- `POST /api/reconciliation/statements/import-csv`: رفع كشف حساب بنكي بصيغة `multipart/form-data` مع التحقق من بصمة الملف وبصمات الحركات ومعالجة المكرر والمتخطى.
+
+#### ج. محرك الاقتراحات (Matching Suggestions):
+- `GET /api/reconciliation/suggestions`: احتساب اقتراحات المطابقة بين الحركات البنكية والمدفوعات المرحّلة غير المطابقة استناداً إلى `minScore` وفلاتر التاريخ.
+
+#### د. المطابقة اليدوية وإلغاء المطابقة (Manual Workflow):
+- `POST /api/reconciliation/matches`: إنشاء مطابقة يدوية بين حركة بنكية ودفعة مرحّلة متوافقة وتغيير حالة الحركة البنكية إلى `MATCHED`.
+- `DELETE /api/reconciliation/matches/:id`: إلغاء مطابقة نشطة (Soft-unmatch) وإعادة الحركة البنكية إلى `UNMATCHED`.
+
+#### هـ. تقارير التسوية (Reports):
+- `GET /api/reconciliation/reports/unmatched`: تقرير العمليات غير المطابقة (حركات البنك ومدفوعات النظام) مع الإجماليات.
+- `GET /api/reconciliation/reports/summary`: تقرير الملخص العام (رصيد البنك، رصيد الدفاتر، الفارق، والتحذيرات).
+
+---
+
+### 4. RBAC (الأذونات والصلاحيات)
+أذونات مخصصة لوحدة المطابقة البنكية مدمجة في نظام الصلاحيات ومصفوفة الأدوار:
+- **`reconciliation.read`**: استعراض الحسابات البنكية، كشوف الحسابات، تقارير العمليات غير المطابقة، الملخص العام، واقتراحات المطابقة.
+- **`reconciliation.write`**: إنشاء وتعديل وحذف الحسابات البنكية، وتنفيذ عمليات المطابقة وإلغاء المطابقة.
+- **`reconciliation.import`**: رفع واستيراد كشوف الحسابات البنكية بصيغة CSV.
+
+---
+
+### 5. Accounting Invariants (الثوابت والضوابط المحاسبية)
+تلتزم وحدة التسوية البنكية بالضوابط المحاسبية الصارمة التالية:
+- **عدم إنشاء أي قيود**: لا تقوم عمليات المطابقة أو الاستيراد بإنشاء قيود يومية (`JournalEntry`) أو أسطر قيود (`JournalEntryLine`).
+- **عدم تعديل القيود القائمة**: لا يتم تعديل أي قيد يومية مسجل في دفتر الأستاذ العام نتيجة المطابقة أو إلغائها.
+- **ثبات حالة الدفعات**: تبقى حالة الدفعة `Payment.status` ثابتة عند `POSTED`؛ حالة التسوية مشتقة فقط من وجود مطابقة نشطة في `ReconciliationMatch`.
+- **نطاق التعديل المحدد**: تؤثر المطابقة وإلغاء المطابقة حصراً على سجلات `ReconciliationMatch` وحالة الحركة البنكية `BankTransaction.status` (`UNMATCHED` / `MATCHED`).
+- **خروج التسويات الدفترية عن النطاق**: معالجة العمولات البنكية (Bank Fees)، الفروقات، والتسويات القيدية اليدوية خارج نطاق هذه المرحلة.
+
+---
+
+### 6. CSV Import Behavior (سلوك استيراد كشوف الحسابات)
+- **الرفع اليدوي (Manual CSV Upload)**: رفع ملفات CSV عبر نموذج الواجهة أو واجهة الـ API.
+- **حجم الملف (File Size Limit)**: حد أقصى لحجم الملف يقارب 5 ميجابايت (`5 * 1024 * 1024` بايت).
+- **مرونة عناوين الأعمدة (Flexible Column Aliases)**: دعم تلقائي لتسميات الأعمدة باللغتين العربية والإنجليزية (مثل: Date, تاريخ, Inflow, Outflow, Debit, Credit, Amount, Reference, Description).
+- **توحيد التواريخ (UTC Date Normalization)**: تحليل وتوحيد مختلف صيغ التواريخ المصرفية (`YYYY-MM-DD`, `DD/MM/YYYY`, `MM/DD/YYYY`, إلخ) وتخزينها بتوقيت UTC.
+- **الدقة الرقمية (Prisma.Decimal)**: تحليل المبالغ النقدية وتنقيتها بدقة عبر `Prisma.Decimal`، وتخزينها بتنسيق عشري دقيق `(18,4)`.
+- **تجاهل السطور الصفرية**: يتم استبعاد وتخطي أي سطر بمبلغ صفري تلقائياً.
+- **كشف التكرار على مستوى الملف (File-level SHA-256)**: حساب هاش `SHA-256` لمحتوى الملف ورفض استيراد الملف المكرر للشركة برمز خطأ `409 Conflict`.
+- **كشف التكرار على مستوى الحركات (Row-level Fingerprint)**: حساب بصمة تجزئة فريدة لكل حركة بنكية من بياناتها الأساسية، وتخطي الحركات المكررة مع إدراج الحركات الجديدة فقط داخل معاملة ذرية واحدة (`$transaction`).
+
+---
+
+### 7. Matching Behavior & Scoring (سلوك محرك المطابقة ونظام النقاط)
+- **توافق الاتجاه**:
+  - الحركات الواردة (`INFLOW`) تتوافق فقط مع مقبوضات المبيعات والعملاء (`AR_PAYMENT` / `SALES`).
+  - الحركات الصادرة (`OUTFLOW`) تتوافق فقط مع مدفوعات المشتريات والموردين (`AP_PAYMENT` / `PURCHASE`).
+- **نظام احتساب النقاط الحتمي (Deterministic Scoring Weights)**:
+  - **تطابق المبلغ (Amount)**: حتى 60 نقطة (تطابق تام = 60).
+  - **تقارب التاريخ (Date Proximity)**: حتى 25 نقطة (نفس اليوم = 25، خلال يومين = 20، خلال 5 أيام = 15، خلال 10 أيام = 10، خلال 30 يوماً = 5).
+  - **تشابه المرجع والوصف (Reference / Description Similarity)**: حتى 15 نقطة (تطابق رقم الفاتورة أو المرجع أو الوصف = 15).
+- **التصنيف**:
+  - تطابق تام (`EXACT`): عند بلوغ 100 نقطة.
+  - تطابق مقترح (`SUGGESTED`): عند تجاوز الحد الأدنى المحدد `minScore` (افتراضياً 80 نقطة فأكثر).
+
+---
+
+### 8. Frontend Interface (الواجهة الأمامية للمطابقة)
+مسار الصفحة: `/accounting/reconciliation`
+- **محدد الحساب البنكي (Bank Account Selector)**: اختيار الحساب البنكي مع عرض بيانات الآيبان والعملة والرصيد وحساب الأستاذ المرتبط.
+- **شريط مؤشرات الأداء (KPI Summary Banner)**: عرض رصيد كشف البنك، رصيد الدفاتر، فارق المطابقة، وعدد العمليات المعلقة والتنبيهات.
+- **لوحة استيراد الملفات (CSV Import Panel)**: نموذج رفع كشوف الحسابات بصيغة CSV، مع معالجة خطأ الملف المكرر (409) وعرض إحصائيات الاستيراد (السطور المستوردة، المتخطاة، والمكررة، وإجمالي الوارد والصادر، وبصمة الملف).
+- **جدول الاقتراحات الذكية (Suggested Matches Section)**: استعراض التطابقات المقترحة مع شارات الثقة وتفاصيل الدفعة وزر المطابقة السريعة.
+- **تقرير العمليات غير المطابقة (Unmatched Section)**: جدولان مستقلان لحركات البنك المعلقة ومدفوعات النظام المعلقة مع إجماليات المبالغ.
+- **التحكم بالصلاحيات**:
+  - زر المطابقة محمي ومقيد بصلاحية `reconciliation.write`.
+  - لوحة الاستيراد مقيدة بصلاحية `reconciliation.import` مع إشعار القراءة فقط عند غيابها.
+
+---
+
+### 9. Verification Summary (سجل التحقق المعتمد)
+- **Prisma Client Generate**: **PASS** (`Prisma Client v5.22.0`).
+- **Backend Build (`pnpm --filter @erp/backend build`)**: **PASS** (NestJS compiled successfully).
+- **Backend E2E Tests (`pnpm --filter @erp/backend test:e2e`)**: **PASS = 207/207 tests** عبر مجموعتي الاختبار (`reports.e2e-spec.ts` و `app.e2e-spec.ts`).
+- **Frontend Build (`pnpm --filter @erp/frontend build`)**: **PASS** (Next.js compiled with 18 static routes including `○ /accounting/reconciliation`).
+- **حالة شجرة العمل (Working Tree)**: نظيفة ومستقرة تماماً خلال التحقق النهائي في المرحلة 13A-D-1.
+
+---
+
+### 10. Out of Scope (خارج النطاق ومؤجل للمراحل القادمة)
+- ❌ **واجهات البنوك المفتوحة (Open Banking APIs)**.
+- ❌ **التغذية البنكية الحية والمباشرة (Real-time Bank Feeds)**.
+- ❌ **الترحيل الآلي للرسوم والعمولات البنكية (Automated Fee Posting)**.
+- ❌ **المطابقة متعددة الأطراف (Many-to-Many Matching)**: المطابقة الحالية 1:1 فقط.
+- ❌ **التسوية متعددة العملات (Multi-Currency Settlement)**.
+- ❌ **المطابقة التنبؤية بالذكاء الاصطناعي (AI Matching)**.
+- ❌ **تصدير التقارير إلى PDF أو Excel**.
+- ❌ **أي تعديلات على إعدادات النشر السحابي أو البنية التحتية (Deployment changes)**.
+- ❌ **أي تعديلات على الفوترة الضريبية أو الربط مع هيئة الزكاة والضريبة والجمارك (Tax/ZATCA changes)**.
+
+
