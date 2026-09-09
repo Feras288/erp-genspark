@@ -52,14 +52,29 @@
 //   * No GL / bank reconciliation / drill-down.
 //   * No frontend / no schema change.
 // =====================================================
+//
+// ----------------------------------------------------=-------------
+// Phase 10B-B-2: AP PaymentsService — settlement.
+//   Symmetric to 10A. Uses polymorphic Payment with
+//   invoiceType=PURCHASE. Same idempotency / overpayment / tx shape.
+//   Deltas from AR (commit decisions):
+//     * NO PurchaseInvoice.paidAmount column → NO writeback.
+//     * NO PurchaseInvoice.status mutation (RECEIVED stays RECEIVED).
+//     * NO new status enum (no PAID/PARTIALLY_PAID equivalent).
+// =====================================================
 import {
   BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
-  NotImplementedException,
 } from '@nestjs/common';
-import { Prisma, PaymentMethod, PaymentStatus, SalesInvoiceStatus } from '@prisma/client';
+import {
+  Prisma,
+  PaymentMethod,
+  PaymentStatus,
+  PurchaseInvoiceStatus,
+  SalesInvoiceStatus,
+} from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 
 import type { AuthenticatedUser } from '../common/types/auth.types';
@@ -73,14 +88,15 @@ import type { PaymentsQueryDto } from './dto/payments-query.dto';
 //   amount, paymentMethod, paidAt, reference, notes, status,
 //   idempotencyKey, createdAt.
 //
-// `invoiceId` is the polymorphic surface (salesInvoiceId OR
-// purchaseInvoiceId). 10A-B-2 only emits Sales, so we always return
-// the salesInvoiceId. 10B will symmetrically inverse the polarity.
+// Phase 10B-B-2: invoiceType widened to 'SALES' | 'PURCHASE'; the
+//   polymorphic invoiceId surfaces salesInvoiceId OR purchaseInvoiceId.
+//   The schema's CHECK constraint from Phase 10A-B-1 guarantees
+//   exactly-one-FK, so the mapper branches on invoiceType.
 // ---------------------------------------------------------------------
 export interface PaymentResponseRow {
   id: string;
-  invoiceId: string; // salesInvoiceId in 10A-B-2
-  invoiceType: 'SALES';
+  invoiceId: string; // salesInvoiceId OR purchaseInvoiceId (per invoiceType)
+  invoiceType: 'SALES' | 'PURCHASE';
   amount: string; // Decimal serialized to string
   paymentMethod: PaymentMethod;
   paidAt: Date;
@@ -307,13 +323,16 @@ export class PaymentsService {
   // Internal — Decimal / Date / polymorphic-invoiceId mapper.
   // -------------------------------------------------------------------
   private toResponseRow(p: RawPayment): PaymentResponseRow {
-    // 10A-B-2 only emits SALES — salesInvoiceId is always populated.
-    // The CHECK constraint from Phase 10A-B-1's migration guarantees this.
-    const invoiceId = p.salesInvoiceId ?? '';
+    // Phase 10A-B-2 + Phase 10B-B-2: polymorphic — exactly-one-FK
+    // guaranteed by CHECK constraint from Phase 10A-B-1's migration.
+    // Branch on invoiceType to surface the right FK as invoiceId.
+    const invoiceType = p.invoiceType;
+    const invoiceId =
+      invoiceType === 'PURCHASE' ? (p.purchaseInvoiceId ?? '') : (p.salesInvoiceId ?? '');
     return {
       id: p.id,
       invoiceId,
-      invoiceType: 'SALES',
+      invoiceType,
       amount: p.amount.toString(),
       paymentMethod: p.paymentMethod,
       paidAt: p.paidAt,
@@ -325,24 +344,163 @@ export class PaymentsService {
     };
   }
 
-  // --- Phase 10B-B-1: AP payments skeleton (Read+Write stubs) ---
+  // --- Phase 10B-B-2: AP payments settlement (Read+Write) --- mirror of AR ---
+  //   Symfony of PaymentsService.list anchored on purchaseInvoiceId.
+  //   See contract block at top of file.
   async listPurchasePayments(
     companyId: string,
     invoiceId: string,
-    _q: PaymentsQueryDto,
+    q: PaymentsQueryDto,
   ): Promise<PaymentResponseRow[]> {
-    if (!companyId) throw new BadRequestException('companyId (jwt) is required');
-    if (!invoiceId) throw new BadRequestException('invoiceId is required');
-    void invoiceId;
-    return [];
+    if (!companyId || typeof companyId !== 'string') {
+      throw new BadRequestException('companyId (jwt) is required');
+    }
+    if (!invoiceId || typeof invoiceId !== 'string') {
+      throw new BadRequestException('invoiceId is required');
+    }
+
+    // Validate the invoice lives in this tenant before any payment read.
+    const invoice = await this.prisma.purchaseInvoice.findFirst({
+      where: { id: invoiceId, companyId, deletedAt: null },
+      select: { id: true, companyId: true, status: true, deletedAt: true },
+    });
+    if (!invoice) {
+      throw new NotFoundException(
+        `Purchase invoice ${invoiceId} not found in tenant ${companyId}`,
+      );
+    }
+
+    const where: Prisma.PaymentWhereInput = {
+      companyId,
+      purchaseInvoiceId: invoiceId,
+      deletedAt: null,
+    };
+
+    const from = (q.fromDate ?? '').trim() || undefined;
+    const to = (q.toDate ?? '').trim() || undefined;
+    if (from || to) {
+      where.paidAt = {};
+      if (from) (where.paidAt as Prisma.DateTimeFilter).gte = new Date(`${from}T00:00:00.000Z`);
+      if (to) (where.paidAt as Prisma.DateTimeFilter).lte = new Date(`${to}T23:59:59.999Z`);
+    }
+
+    const rows = await this.prisma.payment.findMany({
+      where,
+      orderBy: [{ paidAt: 'desc' }, { createdAt: 'desc' }],
+      select: PAYMENT_SELECT,
+    });
+
+    return rows.map((p) => this.toResponseRow(p));
   }
+
   async registerPurchasePayment(
     me: AuthenticatedUser,
     invoiceId: string,
-    _dto: CreatePaymentDto,
+    dto: CreatePaymentDto,
   ): Promise<PaymentResponseRow> {
-    if (!me?.companyId) throw new BadRequestException('companyId (jwt) is required');
-    void invoiceId;
-    throw new NotImplementedException('AP payment registration arrives in Phase 10B-B-2');
+    const companyId = me.companyId;
+    if (!companyId || typeof companyId !== 'string') {
+      throw new BadRequestException('companyId (jwt) is required');
+    }
+
+    // Idempotency short-circuit (parallel to AR path).
+    if (dto.idempotencyKey && dto.idempotencyKey.length >= 8) {
+      const existing = await this.prisma.payment.findFirst({
+        where: {
+          companyId,
+          purchaseInvoiceId: invoiceId,
+          idempotencyKey: dto.idempotencyKey,
+          deletedAt: null,
+        },
+        select: PAYMENT_SELECT,
+      });
+      if (existing) {
+        return this.toResponseRow(existing);
+      }
+    }
+
+    const created = await this.prisma.$transaction(async (tx) => {
+      // 1. PurchaseInvoice lookup — must exist + tenant + not soft-deleted.
+      //    Status gate: RECEIVED only (commit decision: DRAFT/CANCELLED → 409).
+      const invoice = await tx.purchaseInvoice.findFirst({
+        where: { id: invoiceId, companyId, deletedAt: null },
+        select: {
+          id: true,
+          companyId: true,
+          status: true,
+          total: true,
+          deletedAt: true,
+        },
+      });
+      if (!invoice) {
+        throw new NotFoundException(
+          `Purchase invoice ${invoiceId} not found in tenant ${companyId}`,
+        );
+      }
+      if (invoice.status !== PurchaseInvoiceStatus.RECEIVED) {
+        throw new ConflictException(
+          `Cannot register payment: Purchase invoice ${invoiceId} status is ${invoice.status}; expected RECEIVED.`,
+        );
+      }
+
+      // 2. existingPaid = SUM(Payment.amount) WHERE invoice+tenant+not-deleted.
+      const agg = await tx.payment.aggregate({
+        where: {
+          companyId,
+          purchaseInvoiceId: invoiceId,
+          deletedAt: null,
+        },
+        _sum: { amount: true },
+      });
+      const existingPaid: Prisma.Decimal = agg._sum.amount ?? new Prisma.Decimal(0);
+
+      // 3. outstanding = max(0, invoice.total − existingPaid).
+      const total: Prisma.Decimal = new Prisma.Decimal(invoice.total.toString());
+      const outstanding: Prisma.Decimal = Prisma.Decimal.max(
+        new Prisma.Decimal(0),
+        total.minus(existingPaid),
+      );
+
+      const requested = new Prisma.Decimal(dto.amount);
+      if (requested.greaterThan(outstanding)) {
+        throw new ConflictException(
+          `Overpayment guard: requested ${requested.toString()} > outstanding ${outstanding.toString()} on Purchase invoice ${invoiceId}.`,
+        );
+      }
+
+      // 4. INSERT Payment — invoiceType=PURCHASE, purchaseInvoiceId=explicit,
+      //    salesInvoiceId=null. Exactly-one-FK CHECK enforced at DB level.
+      const payment = await tx.payment.create({
+        data: {
+          companyId,
+          paymentMethod: dto.paymentMethod,
+          amount: requested,
+          paidAt: dto.paidAt ? new Date(dto.paidAt) : new Date(),
+          reference: dto.reference ?? null,
+          notes: dto.notes ?? null,
+          salesInvoiceId: null,
+          purchaseInvoiceId: invoiceId,
+          invoiceType: 'PURCHASE',
+          status: 'POSTED',
+          idempotencyKey: dto.idempotencyKey ?? null,
+          createdById: me.id ?? null,
+          updatedById: me.id ?? null,
+        },
+        select: PAYMENT_SELECT,
+      });
+
+      // 5. COMMIT DECISION (Phase 10B-architect-1):
+      //      - NO PurchaseInvoice.paidAmount writeback (no such column).
+      //      - NO PurchaseInvoice.status mutation (RECEIVED stays RECEIVED).
+      //    AP settlement is registered purely via this Payment row, and
+      //    any future AP-Aging computation will sum Payment rows directly
+      //    (parallel to the AR writeback cache, but without the column).
+      //    Intentionally divergent from AR; documented in the contract
+      //    block at top of file.
+
+      return payment;
+    });
+
+    return this.toResponseRow(created);
   }
 }
