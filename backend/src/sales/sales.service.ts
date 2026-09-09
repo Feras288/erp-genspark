@@ -27,6 +27,8 @@ import {
   NotImplementedException,
 } from '@nestjs/common';
 import {
+  AuditCategory,
+  AuditSeverity,
   Prisma,
   SalesInvoiceStatus,
   SalesInvoiceType,
@@ -34,6 +36,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { CreateSalesInvoiceLineDto, CreateSalesInvoiceDto } from './dto/create-sales-invoice.dto';
 import { UpdateSalesInvoiceDto } from './dto/update-sales-invoice.dto';
 import { SalesInvoiceQueryDto } from './dto/sales-invoice-query.dto';
@@ -142,6 +145,7 @@ export class SalesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly auditLogsService: AuditLogsService,
   ) {}
 
   // -------------------- list / get --------------------
@@ -433,6 +437,31 @@ export class SalesService {
         } as Prisma.SalesInvoiceUncheckedCreateInput,
         select: INVOICE_WITH_LINES,
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: actorUserId ?? null,
+          category: AuditCategory.SALES,
+          event: 'SALES_INVOICE_CREATED',
+          action: 'CREATE',
+          severity: AuditSeverity.INFO,
+          entityType: 'SalesInvoice',
+          entityId: header.id,
+          metadata: {
+            invoiceNumber: header.invoiceNumber,
+            customerId: header.customerId ?? null,
+            issueDate: header.issueDate
+              ? (header.issueDate instanceof Date
+                  ? header.issueDate.toISOString()
+                  : String(header.issueDate))
+              : null,
+            totalAmount: header.total != null ? header.total.toString() : null,
+            status: header.status,
+          },
+        },
+        tx,
+      );
 
       return header;
     });
@@ -780,7 +809,7 @@ export class SalesService {
         select: INVOICE_WITH_LINES,
       });
 
-      await postSalesInvoiceIssued(tx, {
+      const postedJournal = await postSalesInvoiceIssued(tx, {
         companyId,
         userId: actorUserId,
         invoice: {
@@ -792,6 +821,30 @@ export class SalesService {
           total: updated.total,
         },
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: actorUserId ?? null,
+          category: AuditCategory.SALES,
+          event: 'SALES_INVOICE_ISSUED',
+          action: 'ISSUE',
+          severity: AuditSeverity.INFO,
+          entityType: 'SalesInvoice',
+          entityId: updated.id,
+          metadata: {
+            invoiceNumber: updated.invoiceNumber,
+            issueDate: updated.issueDate
+              ? (updated.issueDate instanceof Date
+                  ? updated.issueDate.toISOString()
+                  : String(updated.issueDate))
+              : null,
+            journalEntryId: postedJournal?.id ?? null,
+            status: updated.status,
+          },
+        },
+        tx,
+      );
 
       return { invoice: updated, productLineCount, serviceLineCount, movements: movements.length };
     });
@@ -873,6 +926,26 @@ export class SalesService {
         invoiceNumber: updated.invoiceNumber,
         status: updated.status,
         reason: dto.reason ?? null,
+      },
+    });
+
+    await this.auditLogsService.logSuccess({
+      companyId,
+      actorUserId: actorUserId ?? null,
+      category: AuditCategory.SALES,
+      event: 'SALES_INVOICE_CANCELLED',
+      action: 'CANCEL',
+      severity: AuditSeverity.WARNING,
+      entityType: 'SalesInvoice',
+      entityId: updated.id,
+      metadata: {
+        invoiceNumber: updated.invoiceNumber,
+        reason: dto.reason ?? null,
+        cancelledAt: updated.cancelledAt
+          ? (updated.cancelledAt instanceof Date
+              ? updated.cancelledAt.toISOString()
+              : String(updated.cancelledAt))
+          : null,
       },
     });
 

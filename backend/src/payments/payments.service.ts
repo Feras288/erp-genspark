@@ -69,6 +69,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AuditCategory,
+  AuditSeverity,
   Prisma,
   PaymentMethod,
   PaymentStatus,
@@ -76,6 +78,7 @@ import {
   SalesInvoiceStatus,
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
+import { AuditLogsService } from '../audit-logs/audit-logs.service';
 
 import type { AuthenticatedUser } from '../common/types/auth.types';
 import type { CreatePaymentDto } from './dto/create-payment.dto';
@@ -138,7 +141,10 @@ type RawPayment = Prisma.PaymentGetPayload<{ select: typeof PAYMENT_SELECT }>;
 
 @Injectable()
 export class PaymentsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditLogsService: AuditLogsService,
+  ) {}
 
   // -------------------------------------------------------------------
   // GET — list payments for a Sales invoice, tenant-scoped by JWT.
@@ -241,6 +247,7 @@ export class PaymentsService {
         select: {
           id: true,
           companyId: true,
+          customerId: true,
           status: true,
           total: true,
           paidAmount: true,
@@ -325,7 +332,7 @@ export class PaymentsService {
       //    linked by sourceType=AR_PAYMENT / sourceId=payment.id.
       //    Unique (companyId, sourceType, sourceId) makes retries
       //    idempotent. Same $transaction as payment insert.
-      await postArPaymentPosted(tx, {
+      const postedJournal = await postArPaymentPosted(tx, {
         companyId,
         userId: me.id,
         payment: {
@@ -336,6 +343,32 @@ export class PaymentsService {
           reference: payment.reference,
         },
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: me.id ?? null,
+          category: AuditCategory.PAYMENTS,
+          event: 'AR_PAYMENT_POSTED',
+          action: 'POST_AR_PAYMENT',
+          severity: AuditSeverity.INFO,
+          entityType: 'Payment',
+          entityId: payment.id,
+          metadata: {
+            paymentId: payment.id,
+            invoiceId,
+            invoiceType: 'SALES',
+            amount: payment.amount.toString(),
+            paidAt:
+              payment.paidAt instanceof Date
+                ? payment.paidAt.toISOString()
+                : String(payment.paidAt),
+            journalEntryId: postedJournal?.id ?? null,
+            customerId: invoice.customerId ?? null,
+          },
+        },
+        tx,
+      );
 
       return payment;
     });
@@ -451,6 +484,7 @@ export class PaymentsService {
         select: {
           id: true,
           companyId: true,
+          supplierId: true,
           status: true,
           total: true,
           deletedAt: true,
@@ -529,7 +563,7 @@ export class PaymentsService {
       //    linked by sourceType=AP_PAYMENT / sourceId=payment.id.
       //    Unique (companyId, sourceType, sourceId) makes retries
       //    idempotent. Same $transaction as payment insert.
-      await postApPaymentPosted(tx, {
+      const postedJournal = await postApPaymentPosted(tx, {
         companyId,
         userId: me.id,
         payment: {
@@ -540,6 +574,32 @@ export class PaymentsService {
           reference: payment.reference,
         },
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: me.id ?? null,
+          category: AuditCategory.PAYMENTS,
+          event: 'AP_PAYMENT_POSTED',
+          action: 'POST_AP_PAYMENT',
+          severity: AuditSeverity.INFO,
+          entityType: 'Payment',
+          entityId: payment.id,
+          metadata: {
+            paymentId: payment.id,
+            invoiceId,
+            invoiceType: 'PURCHASE',
+            amount: payment.amount.toString(),
+            paidAt:
+              payment.paidAt instanceof Date
+                ? payment.paidAt.toISOString()
+                : String(payment.paidAt),
+            journalEntryId: postedJournal?.id ?? null,
+            supplierId: invoice.supplierId ?? null,
+          },
+        },
+        tx,
+      );
 
       return payment;
     });

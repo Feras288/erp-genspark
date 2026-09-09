@@ -9,9 +9,18 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AccountType, BankTransactionType, JournalEntryStatus, MatchType, Prisma } from '@prisma/client';
+import {
+  AccountType,
+  AuditCategory,
+  AuditSeverity,
+  BankTransactionType,
+  JournalEntryStatus,
+  MatchType,
+  Prisma,
+} from '@prisma/client';
 import * as crypto from 'crypto';
 import { PrismaService } from '../database/prisma.service';
+import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { CreateBankAccountDto } from './dto/create-bank-account.dto';
 import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 import { ImportStatementCsvDto } from './dto/import-statement-csv.dto';
@@ -64,7 +73,10 @@ function parseDateEndUtc(dateStr?: string | null): Date | null {
 
 @Injectable()
 export class ReconciliationService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditLogsService: AuditLogsService,
+  ) {}
 
   /**
    * List all active, non-deleted bank accounts for the tenant company.
@@ -89,7 +101,11 @@ export class ReconciliationService {
   /**
    * Create a new bank account scoped to companyId.
    */
-  async createBankAccount(companyId: string, dto: CreateBankAccountDto) {
+  async createBankAccount(
+    companyId: string,
+    dto: CreateBankAccountDto,
+    actorUserId?: string | null,
+  ) {
     // Check IBAN uniqueness within company for non-deleted accounts
     const existing = await this.prisma.bankAccount.findFirst({
       where: {
@@ -154,6 +170,23 @@ export class ReconciliationService {
       include: BANK_ACCOUNT_INCLUDE,
     });
 
+    await this.auditLogsService.logSuccess({
+      companyId,
+      actorUserId: actorUserId ?? null,
+      category: AuditCategory.RECONCILIATION,
+      event: 'BANK_ACCOUNT_CREATED',
+      action: 'CREATE_BANK_ACCOUNT',
+      severity: AuditSeverity.INFO,
+      entityType: 'BankAccount',
+      entityId: created.id,
+      metadata: {
+        bankName: created.bankName,
+        currency: created.currency,
+        hasIban: Boolean(created.iban),
+        glAccountId: created.glAccountId || null,
+      },
+    });
+
     return {
       status: 'ok',
       companyId,
@@ -164,7 +197,12 @@ export class ReconciliationService {
   /**
    * Update an existing bank account.
    */
-  async updateBankAccount(companyId: string, id: string, dto: UpdateBankAccountDto) {
+  async updateBankAccount(
+    companyId: string,
+    id: string,
+    dto: UpdateBankAccountDto,
+    actorUserId?: string | null,
+  ) {
     const existing = await this.prisma.bankAccount.findFirst({
       where: {
         id,
@@ -232,6 +270,26 @@ export class ReconciliationService {
       include: BANK_ACCOUNT_INCLUDE,
     });
 
+    const changedFields = Object.keys(dto).filter(
+      (key) => (dto as any)[key] !== undefined,
+    );
+
+    await this.auditLogsService.logSuccess({
+      companyId,
+      actorUserId: actorUserId ?? null,
+      category: AuditCategory.RECONCILIATION,
+      event: 'BANK_ACCOUNT_UPDATED',
+      action: 'UPDATE_BANK_ACCOUNT',
+      severity: AuditSeverity.INFO,
+      entityType: 'BankAccount',
+      entityId: updated.id,
+      metadata: {
+        changedFields,
+        currency: updated.currency,
+        glAccountId: updated.glAccountId || null,
+      },
+    });
+
     return {
       status: 'ok',
       companyId,
@@ -242,7 +300,11 @@ export class ReconciliationService {
   /**
    * Soft-delete a bank account (set deletedAt and isActive = false).
    */
-  async deleteBankAccount(companyId: string, id: string) {
+  async deleteBankAccount(
+    companyId: string,
+    id: string,
+    actorUserId?: string | null,
+  ) {
     const existing = await this.prisma.bankAccount.findFirst({
       where: {
         id,
@@ -255,11 +317,27 @@ export class ReconciliationService {
       throw new NotFoundException(`Bank account with id "${id}" not found`);
     }
 
+    const deletedAt = new Date();
     await this.prisma.bankAccount.update({
       where: { id },
       data: {
-        deletedAt: new Date(),
+        deletedAt,
         isActive: false,
+      },
+    });
+
+    await this.auditLogsService.logSuccess({
+      companyId,
+      actorUserId: actorUserId ?? null,
+      category: AuditCategory.RECONCILIATION,
+      event: 'BANK_ACCOUNT_DELETED',
+      action: 'DELETE_BANK_ACCOUNT',
+      severity: AuditSeverity.WARNING,
+      entityType: 'BankAccount',
+      entityId: id,
+      metadata: {
+        bankName: existing.bankName,
+        deletedAt: deletedAt.toISOString(),
       },
     });
 
@@ -667,6 +745,25 @@ export class ReconciliationService {
     });
 
     if (existingStatement) {
+      try {
+        await this.auditLogsService.logBlocked({
+          companyId,
+          actorUserId: userId || null,
+          category: AuditCategory.RECONCILIATION,
+          event: 'BANK_STATEMENT_DUPLICATE_REJECTED',
+          action: 'IMPORT_CSV',
+          severity: AuditSeverity.WARNING,
+          entityType: 'BankAccount',
+          entityId: bankAccountId,
+          metadata: {
+            fileHash,
+            bankAccountId,
+          },
+          message: 'Duplicate bank statement rejected: hash already imported',
+        });
+      } catch {
+        // Audit failures must not drive business state
+      }
       throw new ConflictException(
         'This bank statement has already been imported for this company',
       );
@@ -872,6 +969,30 @@ export class ReconciliationService {
 
         const duplicateRows = transactionsToInsert.length - insertResult.count;
 
+        await this.auditLogsService.logSuccess(
+          {
+            companyId,
+            actorUserId: userId || null,
+            category: AuditCategory.RECONCILIATION,
+            event: 'BANK_STATEMENT_IMPORTED',
+            action: 'IMPORT_CSV',
+            severity: AuditSeverity.INFO,
+            entityType: 'BankStatement',
+            entityId: statement.id,
+            metadata: {
+              bankAccountId,
+              statementId: statement.id,
+              fileHash,
+              importedRows: insertResult.count,
+              skippedRows,
+              duplicateRows,
+              totalInflow: totalInflow.toFixed(4),
+              totalOutflow: totalOutflow.toFixed(4),
+            },
+          },
+          tx,
+        );
+
         return {
           statementId: statement.id,
           bankAccountId,
@@ -893,6 +1014,23 @@ export class ReconciliationService {
       };
     } catch (err: any) {
       if (err.code === 'P2002') {
+        try {
+          await this.auditLogsService.logBlocked({
+            companyId,
+            actorUserId: userId || null,
+            category: AuditCategory.RECONCILIATION,
+            event: 'BANK_STATEMENT_DUPLICATE_REJECTED',
+            action: 'IMPORT_CSV',
+            severity: AuditSeverity.WARNING,
+            entityType: 'BankAccount',
+            entityId: bankAccountId,
+            metadata: {
+              fileHash,
+              bankAccountId,
+            },
+            message: 'Duplicate bank statement rejected on unique constraint',
+          });
+        } catch {}
         throw new ConflictException(
           'This bank statement has already been imported for this company',
         );
@@ -1198,6 +1336,27 @@ export class ReconciliationService {
           data: { status: 'MATCHED' },
         });
 
+        await this.auditLogsService.logSuccess(
+          {
+            companyId,
+            actorUserId: userId || null,
+            category: AuditCategory.RECONCILIATION,
+            event: 'RECONCILIATION_MATCH_CREATED',
+            action: 'CREATE_MATCH',
+            severity: AuditSeverity.INFO,
+            entityType: 'ReconciliationMatch',
+            entityId: created.id,
+            metadata: {
+              bankTransactionId: created.bankTransactionId,
+              paymentId: created.paymentId,
+              amount: created.amount.toString(),
+              matchType: created.matchType,
+              confidenceScore: created.confidenceScore,
+            },
+          },
+          tx,
+        );
+
         return created;
       });
 
@@ -1260,6 +1419,25 @@ export class ReconciliationService {
         where: { id: match.bankTransactionId },
         data: { status: 'UNMATCHED' },
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId || null,
+          category: AuditCategory.RECONCILIATION,
+          event: 'RECONCILIATION_MATCH_REMOVED',
+          action: 'REMOVE_MATCH',
+          severity: AuditSeverity.WARNING,
+          entityType: 'ReconciliationMatch',
+          entityId: updated.id,
+          metadata: {
+            bankTransactionId: updated.bankTransactionId,
+            paymentId: updated.paymentId,
+            unmatchedAt: updated.unmatchedAt ? updated.unmatchedAt.toISOString() : null,
+          },
+        },
+        tx,
+      );
 
       return updated;
     });

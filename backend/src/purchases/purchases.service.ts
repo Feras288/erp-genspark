@@ -41,6 +41,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AuditCategory,
+  AuditSeverity,
   Prisma,
   PurchaseInvoiceStatus,
   StockMovementType,
@@ -49,6 +51,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import {
   CreatePurchaseInvoiceLineDto,
   CreatePurchaseInvoiceDto,
@@ -157,6 +160,7 @@ export class PurchasesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly auditLogsService: AuditLogsService,
   ) {}
 
   // -------------------- list / get --------------------
@@ -441,6 +445,31 @@ export class PurchasesService {
         } as Prisma.PurchaseInvoiceUncheckedCreateInput,
         select: INVOICE_WITH_LINES,
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: actorUserId ?? null,
+          category: AuditCategory.PURCHASES,
+          event: 'PURCHASE_INVOICE_CREATED',
+          action: 'CREATE',
+          severity: AuditSeverity.INFO,
+          entityType: 'PurchaseInvoice',
+          entityId: header.id,
+          metadata: {
+            invoiceNumber: header.invoiceNumber,
+            supplierId: header.supplierId ?? null,
+            purchaseDate: header.purchaseDate
+              ? (header.purchaseDate instanceof Date
+                  ? header.purchaseDate.toISOString()
+                  : String(header.purchaseDate))
+              : null,
+            totalAmount: header.total != null ? header.total.toString() : null,
+            status: header.status,
+          },
+        },
+        tx,
+      );
 
       return header;
     });
@@ -800,7 +829,7 @@ export class PurchasesService {
         select: INVOICE_WITH_LINES,
       });
 
-      await postPurchaseInvoiceReceived(tx, {
+      const postedJournal = await postPurchaseInvoiceReceived(tx, {
         companyId,
         userId: actorUserId,
         invoice: {
@@ -812,6 +841,30 @@ export class PurchasesService {
           total: updated.total,
         },
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: actorUserId ?? null,
+          category: AuditCategory.PURCHASES,
+          event: 'PURCHASE_INVOICE_RECEIVED',
+          action: 'RECEIVE',
+          severity: AuditSeverity.INFO,
+          entityType: 'PurchaseInvoice',
+          entityId: updated.id,
+          metadata: {
+            invoiceNumber: updated.invoiceNumber,
+            purchaseDate: updated.purchaseDate
+              ? (updated.purchaseDate instanceof Date
+                  ? updated.purchaseDate.toISOString()
+                  : String(updated.purchaseDate))
+              : null,
+            journalEntryId: postedJournal?.id ?? null,
+            status: updated.status,
+          },
+        },
+        tx,
+      );
 
       return {
         invoice: updated,
@@ -902,6 +955,26 @@ export class PurchasesService {
         invoiceNumber: updated.invoiceNumber,
         status: updated.status,
         reason: dto.reason ?? null,
+      },
+    });
+
+    await this.auditLogsService.logSuccess({
+      companyId,
+      actorUserId: actorUserId ?? null,
+      category: AuditCategory.PURCHASES,
+      event: 'PURCHASE_INVOICE_CANCELLED',
+      action: 'CANCEL',
+      severity: AuditSeverity.WARNING,
+      entityType: 'PurchaseInvoice',
+      entityId: updated.id,
+      metadata: {
+        invoiceNumber: updated.invoiceNumber,
+        reason: dto.reason ?? null,
+        cancelledAt: updated.cancelledAt
+          ? (updated.cancelledAt instanceof Date
+              ? updated.cancelledAt.toISOString()
+              : String(updated.cancelledAt))
+          : null,
       },
     });
 
