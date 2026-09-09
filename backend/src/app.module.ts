@@ -36,6 +36,7 @@ import { PurchasesModule } from './purchases/purchases.module';
 import { AccountingModule } from './accounting/accounting.module';
 import { ReportsModule } from './reports/reports.module';
 import { PaymentsModule } from './payments/payments.module';
+import { ReconciliationModule } from './reconciliation/reconciliation.module';
 
 @Module({
   imports: [
@@ -83,6 +84,8 @@ import { PaymentsModule } from './payments/payments.module';
     //   * RBAC: ar_payments.read (GET) / ar_payments.write (POST).
     //   * JWT-only tenant scope (Phase 7B-1 contract).
     PaymentsModule,
+    // Phase 13A: Bank Reconciliation
+    ReconciliationModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.
