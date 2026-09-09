@@ -5226,6 +5226,146 @@ describe('Phase 12A-B-5: Financial Statements consolidation (e2e)', () => {
       expect(forbidden.status).toBe(403);
     }
   });
+
+  // ===== Phase 13A-B-3: Reconciliation CSV statement import =====
+  describe('Phase 13A-B-3: Bank statement CSV import parser', () => {
+    let reconToken: string;
+    let testBankAccountId: string;
+
+    beforeAll(async () => {
+      const prisma = app.get(PrismaService);
+      // Ensure admin role has reconciliation permissions
+      const reconPerms = await prisma.permission.findMany({
+        where: { key: { in: ['reconciliation.read', 'reconciliation.write', 'reconciliation.import'] } },
+      });
+      const adminUser = await prisma.user.findFirst({
+        where: { email: 'admin@example.sa' },
+        include: { userRoles: true },
+      });
+      if (adminUser && adminUser.userRoles.length > 0) {
+        for (const p of reconPerms) {
+          await prisma.rolePermission.upsert({
+            where: {
+              roleId_permissionId: {
+                roleId: adminUser.userRoles[0].roleId,
+                permissionId: p.id,
+              },
+            },
+            update: {},
+            create: {
+              roleId: adminUser.userRoles[0].roleId,
+              permissionId: p.id,
+            },
+          });
+        }
+      }
+
+      const loginRes = await request(http)
+        .post(`${API_PREFIX}/auth/login`)
+        .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+      reconToken = loginRes.body.accessToken;
+
+      // Create a bank account to import statements into
+      const createAccRes = await request(http)
+        .post(`${API_PREFIX}/reconciliation/bank-accounts`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankName: 'Al Rajhi Bank',
+          accountName: 'Import Testing Account',
+          accountNumber: 'ACC-CSV-001',
+          iban: `SA99887766554433221100${Date.now().toString().slice(-4)}`,
+          currency: 'SAR',
+          openingBalance: '5000.0000',
+        });
+      expect(createAccRes.status).toBe(201);
+      testBankAccountId = createAccRes.body.data.id;
+    });
+
+    it('13A-B-3.1) imports a minimal CSV into BankStatement + BankTransaction rows', async () => {
+      const csvContent = `date,reference,description,debit,credit,balance
+2026-09-01,REF-001,Customer Deposit,,1500.00,6500.00
+2026-09-02,REF-002,Supplier Wire,400.00,,6100.00`;
+
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/statements/import-csv`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .field('bankAccountId', testBankAccountId)
+        .attach('file', Buffer.from(csvContent, 'utf-8'), 'statement_minimal.csv');
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.data.statementId).toBeDefined();
+      expect(res.body.data.bankAccountId).toBe(testBankAccountId);
+      expect(res.body.data.importedRows).toBe(2);
+      expect(res.body.data.skippedRows).toBe(0);
+      expect(res.body.data.totalInflow).toBe('1500.0000');
+      expect(res.body.data.totalOutflow).toBe('400.0000');
+    });
+
+    it('13A-B-3.2) duplicate file import returns 409', async () => {
+      const csvContent = `date,reference,description,debit,credit,balance
+2026-09-01,REF-001,Customer Deposit,,1500.00,6500.00
+2026-09-02,REF-002,Supplier Wire,400.00,,6100.00`;
+
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/statements/import-csv`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .field('bankAccountId', testBankAccountId)
+        .attach('file', Buffer.from(csvContent, 'utf-8'), 'statement_minimal.csv');
+
+      expect(res.status).toBe(409);
+    });
+
+    it('13A-B-3.3) invalid bankAccountId or cross-tenant bankAccountId returns 404/403', async () => {
+      const csvContent = `date,reference,description,debit,credit,balance
+2026-09-03,REF-003,Other Deposit,,200.00,6300.00`;
+
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/statements/import-csv`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .field('bankAccountId', 'non-existent-bank-acc-id')
+        .attach('file', Buffer.from(csvContent, 'utf-8'), 'statement_other.csv');
+
+      expect(res.status).toBe(404);
+    });
+
+    it('13A-B-3.4) zero-amount rows skipped', async () => {
+      const csvContent = `date,reference,description,debit,credit,balance
+2026-09-04,REF-004,Zero Movement,0.00,,6100.00
+2026-09-05,REF-005,Valid Fee,25.00,,6075.00`;
+
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/statements/import-csv`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .field('bankAccountId', testBankAccountId)
+        .attach('file', Buffer.from(csvContent, 'utf-8'), 'statement_zero.csv');
+
+      expect(res.status).toBe(201);
+      expect(res.body.data.importedRows).toBe(1);
+      expect(res.body.data.skippedRows).toBe(1);
+      expect(res.body.data.totalOutflow).toBe('25.0000');
+    });
+
+    it('13A-B-3.5) endpoint requires reconciliation.import', async () => {
+      const csvContent = `date,reference,description,debit,credit,balance
+2026-09-06,REF-006,Unauth test,,100.00,6175.00`;
+
+      // Without token -> 401
+      const unauth = await request(http)
+        .post(`${API_PREFIX}/reconciliation/statements/import-csv`)
+        .field('bankAccountId', testBankAccountId)
+        .attach('file', Buffer.from(csvContent, 'utf-8'), 'statement_unauth.csv');
+      expect(unauth.status).toBe(401);
+
+      // With cashier token (lacks reconciliation.import) -> 403
+      const forbidden = await request(http)
+        .post(`${API_PREFIX}/reconciliation/statements/import-csv`)
+        .set('Authorization', `Bearer ${cashierToken}`)
+        .field('bankAccountId', testBankAccountId)
+        .attach('file', Buffer.from(csvContent, 'utf-8'), 'statement_forbidden.csv');
+      expect(forbidden.status).toBe(403);
+    });
+  });
 });
 
 
