@@ -37,6 +37,7 @@ import { AccountingModule } from './accounting/accounting.module';
 import { ReportsModule } from './reports/reports.module';
 import { PaymentsModule } from './payments/payments.module';
 import { ReconciliationModule } from './reconciliation/reconciliation.module';
+import { AuditLogsModule } from './audit-logs/audit-logs.module';
 
 @Module({
   imports: [
@@ -86,6 +87,8 @@ import { ReconciliationModule } from './reconciliation/reconciliation.module';
     PaymentsModule,
     // Phase 13A: Bank Reconciliation
     ReconciliationModule,
+    // Phase 15A: Centralized Audit Trail & Activity Log
+    AuditLogsModule,
   ],
   providers: [
     // Apply throttling globally. Auth endpoints will override with @Throttle.
