@@ -48,6 +48,10 @@ model Company {
   journalEntries       JournalEntry[]
   journalEntryLines    JournalEntryLine[]
   payments             Payment[]
+  bankAccounts          BankAccount[]
+  bankStatements        BankStatement[]
+  bankTransactions      BankTransaction[]
+  reconciliationMatches ReconciliationMatch[]
 
   @@index([name])
   @@map("companies")
@@ -101,6 +105,9 @@ model User {
   paymentsCreated           Payment[]         @relation("PaymentCreatedBy")
   paymentsUpdated           Payment[]         @relation("PaymentUpdatedBy")
   paymentsCancelled         Payment[]         @relation("PaymentCancelledBy")
+  bankStatementsImported         BankStatement[]       @relation("BankStatementImportedBy")
+  reconciliationMatchesCreated   ReconciliationMatch[] @relation("MatchMatchedBy")
+  reconciliationMatchesUnmatched ReconciliationMatch[] @relation("MatchUnmatchedBy")
 
   @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
@@ -476,6 +483,7 @@ model Payment {
   createdBy       User?            @relation("PaymentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
   updatedBy       User?            @relation("PaymentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
   cancelledBy     User?            @relation("PaymentCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  reconciliationMatches ReconciliationMatch[] @relation("PaymentReconciliationMatches")
 
   @@index([companyId, status])
   @@index([companyId, paidAt])
@@ -720,6 +728,7 @@ model Account {
   updatedBy   User?              @relation("AccountUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
   debitLines  JournalEntryLine[] @relation("JELineDebitAccount")
   creditLines JournalEntryLine[] @relation("JELineCreditAccount")
+  bankAccounts BankAccount[]     @relation("BankAccountGLAccount")
 
   // Partial unique index for code-per-company is added via raw SQL in the
   // migration (Prisma cannot express non-deleted uniques directly).
@@ -804,4 +813,141 @@ model JournalEntryLine {
   @@index([debitAccountId])
   @@index([creditAccountId])
   @@map("journal_entry_lines")
+}
+
+// =====================================================
+// Phase 13A: Bank Reconciliation
+// Bank account registry, statement ingestion, bank transactions,
+// and audit matches to commercial payments.
+// =====================================================
+
+enum StatementStatus {
+  DRAFT
+  RECONCILED
+}
+
+enum BankTransactionType {
+  INFLOW
+  OUTFLOW
+}
+
+enum ReconciliationStatus {
+  UNMATCHED
+  MATCHED
+  EXCLUDED
+}
+
+enum MatchType {
+  EXACT
+  SUGGESTED
+  MANUAL
+}
+
+model BankAccount {
+  id             String    @id @default(cuid())
+  companyId      String
+  bankName       String
+  accountName    String
+  accountNumber  String
+  iban           String
+  currency       String    @default("SAR")
+  glAccountId    String?
+  openingBalance Decimal   @default(0) @db.Decimal(18, 4)
+  currentBalance Decimal   @default(0) @db.Decimal(18, 4)
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  company      Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  glAccount    Account?          @relation("BankAccountGLAccount", fields: [glAccountId], references: [id], onDelete: SetNull)
+  statements   BankStatement[]
+  transactions BankTransaction[]
+
+  @@unique([companyId, iban])
+  @@index([companyId, isActive])
+  @@index([companyId])
+  @@map("bank_accounts")
+}
+
+model BankStatement {
+  id                  String          @id @default(cuid())
+  companyId           String
+  bankAccountId       String
+  statementIdentifier String?
+  startDate           DateTime
+  endDate             DateTime
+  openingBalance      Decimal         @db.Decimal(18, 4)
+  closingBalance      Decimal         @db.Decimal(18, 4)
+  totalInflow         Decimal         @db.Decimal(18, 4)
+  totalOutflow        Decimal         @db.Decimal(18, 4)
+  rawFileName         String?
+  fileHash            String
+  status              StatementStatus @default(DRAFT)
+  importedAt          DateTime        @default(now())
+  importedById        String?
+
+  company      Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount  BankAccount       @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  importedBy   User?             @relation("BankStatementImportedBy", fields: [importedById], references: [id], onDelete: SetNull)
+  transactions BankTransaction[]
+
+  @@unique([companyId, fileHash])
+  @@index([companyId, bankAccountId, startDate, endDate])
+  @@map("bank_statements")
+}
+
+model BankTransaction {
+  id              String               @id @default(cuid())
+  companyId       String
+  bankAccountId   String
+  statementId     String?
+  transactionDate DateTime
+  valueDate       DateTime?
+  type            BankTransactionType
+  amount          Decimal              @db.Decimal(18, 4)
+  balanceAfter    Decimal?             @db.Decimal(18, 4)
+  reference       String?
+  description     String?
+  payerPayee      String?
+  fingerprint     String
+  status          ReconciliationStatus @default(UNMATCHED)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  company     Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount BankAccount           @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  statement   BankStatement?        @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  matches     ReconciliationMatch[]
+
+  @@unique([companyId, bankAccountId, fingerprint])
+  @@index([companyId, bankAccountId, transactionDate])
+  @@index([companyId, status])
+  @@map("bank_transactions")
+}
+
+model ReconciliationMatch {
+  id                String    @id @default(cuid())
+  companyId         String
+  bankTransactionId String
+  paymentId         String
+  amount            Decimal   @db.Decimal(18, 4)
+  matchType         MatchType
+  confidenceScore   Int?
+  notes             String?
+  matchedAt         DateTime  @default(now())
+  matchedById       String?
+  unmatchedAt       DateTime?
+  unmatchedById     String?
+
+  company         Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankTransaction BankTransaction @relation(fields: [bankTransactionId], references: [id], onDelete: Cascade)
+  payment         Payment         @relation("PaymentReconciliationMatches", fields: [paymentId], references: [id], onDelete: Cascade)
+  matchedBy       User?           @relation("MatchMatchedBy", fields: [matchedById], references: [id], onDelete: SetNull)
+  unmatchedBy     User?           @relation("MatchUnmatchedBy", fields: [unmatchedById], references: [id], onDelete: SetNull)
+
+  @@index([companyId, matchedAt])
+  @@index([companyId, bankTransactionId])
+  @@index([companyId, paymentId])
+  @@map("reconciliation_matches")
 }
