@@ -55,6 +55,7 @@ model Company {
   periodCloses          PeriodClose[]
   fiscalYearCloses      FiscalYearClose[]
   periodCloseAuditLogs  PeriodCloseAuditLog[]
+  auditLogs             AuditLog[]
 
   @@index([name])
   @@map("companies")
@@ -116,6 +117,7 @@ model User {
   fiscalYearClosesClosed         FiscalYearClose[]     @relation("FiscalYearCloseClosedBy")
   fiscalYearClosesReopened       FiscalYearClose[]     @relation("FiscalYearCloseReopenedBy")
   periodCloseAuditLogs           PeriodCloseAuditLog[] @relation("PeriodCloseAuditActor")
+  auditLogs                      AuditLog[]            @relation("AuditLogActorUser")
 
   @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
@@ -195,24 +197,7 @@ model RefreshToken {
   @@map("refresh_tokens")
 }
 
-// Append-only audit trail of sensitive operations.
-model AuditLog {
-  id        String   @id @default(cuid())
-  companyId String
-  userId    String?
-  action    String // e.g. "auth.login", "user.create", "invoice.issue"
-  entity    String? // e.g. "User", "SalesInvoice"
-  entityId  String?
-  metadata  Json?
-  ip        String?
-  userAgent String?
-  createdAt DateTime @default(now())
-
-  @@index([companyId, createdAt])
-  @@index([userId])
-  @@index([action])
-  @@map("audit_logs")
-}
+// Early audit log placeholder replaced by Phase 15A centralized AuditLog model below.
 
 // =====================================================
 // Phase 2: master data — Products and Partners only.
@@ -1060,5 +1045,82 @@ model PeriodCloseAuditLog {
   @@index([companyId, fiscalYearCloseId])
   @@index([companyId, action])
   @@map("period_close_audit_logs")
+}
+
+// =====================================================
+// Phase 15A: Centralized Audit Trail & Activity Log
+// =====================================================
+
+enum AuditActorType {
+  USER
+  SYSTEM
+  INTEGRATION
+}
+
+enum AuditSeverity {
+  INFO
+  WARNING
+  ERROR
+  SECURITY
+}
+
+enum AuditStatus {
+  SUCCESS
+  FAILURE
+  BLOCKED
+}
+
+enum AuditCategory {
+  AUTH
+  USER
+  RBAC
+  ACCOUNTING
+  FINANCIAL_REPORTING
+  SALES
+  PURCHASES
+  PAYMENTS
+  RECONCILIATION
+  PERIOD_CLOSE
+  SYSTEM
+}
+
+model AuditLog {
+  id          String         @id @default(cuid())
+  companyId   String?
+  actorUserId String?
+  userId      String?
+  actorType   AuditActorType @default(USER)
+  category    AuditCategory  @default(SYSTEM)
+  event       String         @default("SYSTEM_EVENT")
+  entityType  String?
+  entity      String?
+  entityId    String?
+  action      String?
+  severity    AuditSeverity  @default(INFO)
+  status      AuditStatus    @default(SUCCESS)
+  requestId   String?
+  ipAddress   String?
+  ip          String?
+  userAgent   String?
+  route       String?
+  method      String?
+  before      Json?
+  after       Json?
+  metadata    Json?
+  message     String?
+  createdAt   DateTime       @default(now())
+
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  actorUser User?    @relation("AuditLogActorUser", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, createdAt])
+  @@index([companyId, category, createdAt])
+  @@index([companyId, entityType, entityId])
+  @@index([actorUserId, createdAt])
+  @@index([category, event])
+  @@index([severity, createdAt])
+  @@index([status, createdAt])
+  @@index([requestId])
+  @@map("audit_logs")
 }
 
