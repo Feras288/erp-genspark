@@ -18,7 +18,7 @@
 // =====================================================
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, Fragment } from 'react';
 import { useAuth } from '@/lib/auth';
 import { api, ApiError } from '@/lib/api';
 import type {
@@ -28,6 +28,20 @@ import type {
   PurchaseInvoice,
   PurchaseInvoiceStatus,
   CreatePurchaseInvoiceLineInput,
+} from '@/lib/api';
+// Phase 10B-C-code: AP Payments (settlement) — mirror
+// of AR `ArPayment` shape on the purchases side.
+// Server-enforced RBAC:
+//   GET  /purchase-invoices/:id/payments → ap_payments.read
+//   POST /purchase-invoices/:id/payments → ap_payments.write
+// Status gate (RECEIVED only; DRAFT/CANCELLED rejected by
+// the backend with 409). Decimal columns serialize as
+// strings end to end (no Number coercion in the UI).
+import type {
+  ApPayment,
+  CreateApPaymentInput,
+  ApPaymentListQuery,
+  PaymentMethod,
 } from '@/lib/api';
 
 interface LineFormState {
@@ -46,6 +60,29 @@ interface DraftFormState {
   dueDate: string;
   notes: string;
   lines: LineFormState[];
+}
+
+// Phase 10B-C-code: AP Payments form draft state.
+// Mirror of AR `PaymentFormState` on the sales side; same
+// `paymentMethod` enum + Decimal-as-string amount. Empty
+// defaults match the AR counterpart so the two pages look
+// consistent under the “Register Payment” header.
+interface ApPaymentFormState {
+  paymentMethod: PaymentMethod;
+  amount: string;       // Decimal-as-string (e.g. "100.0000")
+  paidAt: string;       // ISO date input (yyyy-mm-dd) or full ISO
+  reference: string;
+  notes: string;
+}
+
+function emptyApPaymentForm(): ApPaymentFormState {
+  return {
+    paymentMethod: 'CASH',
+    amount: '',
+    paidAt: '',
+    reference: '',
+    notes: '',
+  };
 }
 
 function emptyLine(): LineFormState {
@@ -110,6 +147,30 @@ export default function PurchasesPage() {
   const [formErr, setFormErr] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // Phase 10B-C-code: AP Payments expander state.
+  // Per-invoice maps — pattern mirrors Phase 10A-C-code on the
+  // AR side. Each invoice gets its own lazy fetch on first toggle,
+  // its own error/success banner, and its own form draft.
+  const [openApPaymentsInvoiceId, setOpenApPaymentsInvoiceId] =
+    useState<string | null>(null);
+  const [apPaymentsByInvoice, setApPaymentsByInvoice] = useState<
+    Record<string, ApPayment[]>
+  >({});
+  const [apPaymentsLoadingByInvoice, setApPaymentsLoadingByInvoice] =
+    useState<Record<string, boolean>>({});
+  const [apPaymentsErrByInvoice, setApPaymentsErrByInvoice] = useState<
+    Record<string, string>
+  >({});
+  const [apPaymentFormByInvoice, setApPaymentFormByInvoice] = useState<
+    Record<string, ApPaymentFormState>
+  >({});
+  const [apPaymentSubmittingByInvoice, setApPaymentSubmittingByInvoice] =
+    useState<Record<string, boolean>>({});
+  const [apPaymentSuccessByInvoice, setApPaymentSuccessByInvoice] = useState<
+    Record<string, boolean>
+  >({});
+
 
   // Lookups
   const [products, setProducts] = useState<Product[]>([]);
@@ -202,6 +263,13 @@ export default function PurchasesPage() {
   const canDelete = hasPermission('purchases.delete');
   const canReceive = hasPermission('purchases.receive');
   const canCancel = hasPermission('purchases.cancel');
+
+  // Phase 10B-C-code: AP Payments RBAC mirror of the AR
+  //   buyer page. Server-enforced; the UI simply hides
+  //   the expander button + form when read/write are off.
+  const canReadApPayments = hasPermission('ap_payments.read');
+  const canWriteApPayments = hasPermission('ap_payments.write');
+
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
@@ -296,6 +364,172 @@ export default function PurchasesPage() {
       setSubmitting(false);
     }
   };
+
+  // ====  Phase 10B-C-code : AP Payments (settlement)  ====
+  //  Mirrors the AR-side expander + payment form pattern.
+  //  Server-enforced RBAC:
+  //    GET  → ap_payments.read  (gates the expander toggle + list)
+  //    POST → ap_payments.write (gates the submit button)
+  //  Server-enforced status gate (RECEIVED only). The UI
+  //  hides the trigger when status !== 'RECEIVED'; backend
+  //  still rejects with 409 if a stale tab triggers it.
+  //  Overpayment guard (S-2 mirror): backend returns 409 →
+  //  surface the server message verbatim inside the per-row
+  //  error banner.
+  const loadApPayments = (invoiceId: string) => {
+    if (!canReadApPayments) {
+      setApPaymentsErrByInvoice((m) => ({
+        ...m,
+        [invoiceId]: 'لا تملك صلاحية قراءة المدفوعات.',
+      }));
+      return;
+    }
+    setApPaymentsLoadingByInvoice((m) => ({ ...m, [invoiceId]: true }));
+    setApPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: '' }));
+    api
+      .listApPayments(invoiceId)
+      .then((rows) => {
+        setApPaymentsByInvoice((m) => ({ ...m, [invoiceId]: rows }));
+        setApPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: '' }));
+      })
+      .catch((e) =>
+        setApPaymentsErrByInvoice((m) => ({
+          ...m,
+          [invoiceId]:
+            e instanceof ApiError
+              ? e.message
+              : e instanceof Error
+                ? e.message
+                : 'failed',
+        })),
+      )
+      .finally(() =>
+        setApPaymentsLoadingByInvoice((m) => ({ ...m, [invoiceId]: false })),
+      );
+  };
+
+  const onToggleApPayments = (invoiceId: string) => {
+    setOpenApPaymentsInvoiceId((cur) => {
+      const next = cur === invoiceId ? null : invoiceId;
+      if (next && canReadApPayments && apPaymentsByInvoice[invoiceId] === undefined) {
+        loadApPayments(invoiceId);
+      }
+      return next;
+    });
+  };
+
+  const setApPaymentForm = (
+    invoiceId: string,
+    patch: Partial<ApPaymentFormState>,
+  ) => {
+    setApPaymentFormByInvoice((m) => ({
+      ...m,
+      [invoiceId]: { ...(m[invoiceId] ?? emptyApPaymentForm()), ...patch },
+    }));
+  };
+
+  const onSubmitApPayment = async (
+    e: React.FormEvent,
+    invoiceId: string,
+    inv: PurchaseInvoice,
+  ) => {
+    e.preventDefault();
+    if (!canWriteApPayments) {
+      setApPaymentsErrByInvoice((m) => ({
+        ...m,
+        [invoiceId]: 'لا تملك صلاحية تسجيل المدفوعات.',
+      }));
+      return;
+    }
+    const form = apPaymentFormByInvoice[invoiceId] ?? emptyApPaymentForm();
+
+    // Decimal amount validation — strict 4-fractional-digit
+    // string. The server has a regex /^\d{1,14}(\.\d{1,4})?$/
+    // but we surface client-side numeric checks earlier.
+    const amountStr = (form.amount || '').trim();
+    if (!/^\d+(\.\d{1,4})?$/.test(amountStr)) {
+      setApPaymentsErrByInvoice((m) => ({
+        ...m,
+        [invoiceId]: 'قيمة المبلغ يجب أن تكون رقمًا صحيحًا أو عشريًا (حتى 4 أرقام عشرية).',
+      }));
+      return;
+    }
+    const reqAmt = Number(amountStr);
+    if (!Number.isFinite(reqAmt) || reqAmt <= 0) {
+      setApPaymentsErrByInvoice((m) => ({
+        ...m,
+        [invoiceId]: 'قيمة المبلغ يجب أن تكون > 0.',
+      }));
+      return;
+    }
+
+    setApPaymentSubmittingByInvoice((m) => ({ ...m, [invoiceId]: true }));
+    setApPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: '' }));
+    setApPaymentSuccessByInvoice((m) => ({ ...m, [invoiceId]: false }));
+
+    try {
+      const payload: CreateApPaymentInput = {
+        paymentMethod: form.paymentMethod,
+        // Normalize to 4-fractional digits to match the
+        // backend Decimal @db.Decimal(18,4) wire format.
+        amount: Number.isInteger(reqAmt)
+          ? `${reqAmt}.0000`
+          : reqAmt.toFixed(4),
+        paidAt: form.paidAt ? new Date(form.paidAt).toISOString() : undefined,
+        reference: form.reference.trim() || undefined,
+        notes: form.notes.trim() || undefined,
+        // Server short-circuits on duplicate (invoiceId +
+        // idempotencyKey) → 201 with the existing row.
+        // crypto.randomUUID() is widely available in modern
+        // browsers + node 14.17+; the server treats the key
+        // as opaque, so client choice does not matter.
+        idempotencyKey:
+          typeof crypto !== 'undefined' && 'randomUUID' in crypto
+            ? crypto.randomUUID()
+            : `ap-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      };
+      await api.createApPayment(invoiceId, payload);
+      // Force a refresh of the list after a successful POST.
+      loadApPayments(invoiceId);
+      // Reset the form draft + flash a success banner.
+      setApPaymentFormByInvoice((m) => ({
+        ...m,
+        [invoiceId]: emptyApPaymentForm(),
+      }));
+      setApPaymentSuccessByInvoice((m) => ({ ...m, [invoiceId]: true }));
+    } catch (err) {
+      let msg: string | null = null;
+      if (err instanceof ApiError) msg = err.message;
+      else if (err instanceof Error) msg = err.message;
+      // Common server messages — surface them verbatim if
+      // recognised, otherwise pass through.
+      if (!msg) msg = 'failed';
+      // The backend rolls up its own 401/403/409 messages;
+      // client-side we only normalize the "permission"
+      // case in plain Arabic.
+      if (
+        (err instanceof ApiError && (err.status === 401 || err.status === 403)) ||
+        /permission|forbidden|unauthor/i.test(msg)
+      ) {
+        msg = 'لا تملك صلاحية تسجيل المدفوعات.';
+      }
+      // Overpayment guard (S-2 mirror) — server returns 409
+      // with "Overpayment guard: requested X > outstanding Y…".
+      // Skip the message massage here; pass verbatim.
+      setApPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: msg ?? 'failed' }));
+    } finally {
+      setApPaymentSubmittingByInvoice((m) => ({ ...m, [invoiceId]: false }));
+    }
+  };
+
+  // Note used inline for typecheck only — mirrors AR page.
+  const apPaymentFormMethods: PaymentMethod[] = [
+    'CASH',
+    'CARD',
+    'TRANSFER',
+    'OTHER',
+  ];
+  void apPaymentFormMethods;
 
   // --- Row actions -------------------------------------------------------
   const onReceive = async (id: string) => {
@@ -465,84 +699,303 @@ export default function PurchasesPage() {
             ) : (
               items.map((inv) => {
                 const isDraft = inv.status === 'DRAFT';
+                const apOpen = openApPaymentsInvoiceId === inv.id;
+                const apRows = apPaymentsByInvoice[inv.id] ?? [];
+                const apLoading = !!apPaymentsLoadingByInvoice[inv.id];
+                const apErr = apPaymentsErrByInvoice[inv.id] ?? '';
+                const apForm = apPaymentFormByInvoice[inv.id] ?? emptyApPaymentForm();
+                const apSubmitting = !!apPaymentSubmittingByInvoice[inv.id];
+                const apSuccess = !!apPaymentSuccessByInvoice[inv.id];
                 return (
-                  <tr key={inv.id} className="border-t border-slate-100">
-                    <td className="px-4 py-3 text-slate-800 font-mono" dir="ltr">
-                      {inv.invoiceNumber}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span
-                        className={
-                          'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
-                          (inv.status === 'RECEIVED'
-                            ? 'bg-emerald-50 text-emerald-700'
-                            : inv.status === 'CANCELLED'
-                              ? 'bg-rose-50 text-rose-700'
-                              : 'bg-amber-50 text-amber-700')
-                        }
-                      >
-                        {inv.status === 'DRAFT'
-                          ? 'مسودة'
-                          : inv.status === 'RECEIVED'
-                            ? 'مستلمة'
-                            : 'ملغاة'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-slate-700" dir="ltr">
-                      {supplierLabel(inv.supplierId)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-600" dir="ltr">
-                      {fmtDate(inv.purchaseDate)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
-                      {fmtMoney(inv.subtotal)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
-                      {fmtMoney(inv.vatTotal)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-900 font-mono font-semibold" dir="ltr">
-                      {fmtMoney(inv.total)}
-                    </td>
-                    <td className="px-4 py-3 text-slate-600" dir="ltr">
-                      {fmtDate(inv.createdAt)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex gap-1 flex-wrap">
-                        {isDraft && canUpdate && (
-                          <button
-                            onClick={() => onEdit(inv)}
-                            className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50"
-                          >
-                            تعديل
-                          </button>
-                        )}
-                        {isDraft && canReceive && (
-                          <button
-                            onClick={() => onReceive(inv.id)}
-                            className="rounded-md border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50"
-                          >
-                            استلام
-                          </button>
-                        )}
-                        {isDraft && canCancel && (
-                          <button
-                            onClick={() => onCancel(inv.id)}
-                            className="rounded-md border border-amber-300 px-2 py-1 text-xs text-amber-700 hover:bg-amber-50"
-                          >
-                            إلغاء
-                          </button>
-                        )}
-                        {isDraft && canDelete && (
-                          <button
-                            onClick={() => onDelete(inv.id)}
-                            className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
-                          >
-                            حذف
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
+                  <Fragment key={inv.id}>
+                    <tr className="border-t border-slate-100">
+                      <td className="px-4 py-3 text-slate-800 font-mono" dir="ltr">
+                        {inv.invoiceNumber}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={
+                            'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
+                            (inv.status === 'RECEIVED'
+                              ? 'bg-emerald-50 text-emerald-700'
+                              : inv.status === 'CANCELLED'
+                                ? 'bg-rose-50 text-rose-700'
+                                : 'bg-amber-50 text-amber-700')
+                          }
+                        >
+                          {inv.status === 'DRAFT'
+                            ? 'مسودة'
+                            : inv.status === 'RECEIVED'
+                              ? 'مستلمة'
+                              : 'ملغاة'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-slate-700" dir="ltr">
+                        {supplierLabel(inv.supplierId)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-600" dir="ltr">
+                        {fmtDate(inv.purchaseDate)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
+                        {fmtMoney(inv.subtotal)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
+                        {fmtMoney(inv.vatTotal)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-900 font-mono font-semibold" dir="ltr">
+                        {fmtMoney(inv.total)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-600" dir="ltr">
+                        {fmtDate(inv.createdAt)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex gap-1 flex-wrap">
+                          {isDraft && canUpdate && (
+                            <button
+                              onClick={() => onEdit(inv)}
+                              className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50"
+                            >
+                              تعديل
+                            </button>
+                          )}
+                          {isDraft && canReceive && (
+                            <button
+                              onClick={() => onReceive(inv.id)}
+                              className="rounded-md border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50"
+                            >
+                              استلام
+                            </button>
+                          )}
+                          {isDraft && canCancel && (
+                            <button
+                              onClick={() => onCancel(inv.id)}
+                              className="rounded-md border border-amber-300 px-2 py-1 text-xs text-amber-700 hover:bg-amber-50"
+                            >
+                              إلغاء
+                            </button>
+                          )}
+                          {isDraft && canDelete && (
+                            <button
+                              onClick={() => onDelete(inv.id)}
+                              className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
+                            >
+                              حذف
+                            </button>
+                          )}
+                          {inv.status === 'RECEIVED' && canReadApPayments && (
+                            <button
+                              onClick={() => onToggleApPayments(inv.id)}
+                              className={
+                                'rounded-md border px-2 py-1 text-xs ' +
+                                (apOpen
+                                  ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
+                                  : 'border-slate-300 hover:bg-slate-50')
+                              }
+                              title={
+                                apRows.length
+                                  ? `المدفوعات (${apRows.length})`
+                                  : 'المدفوعات'
+                              }
+                            >
+                              {apOpen
+                                ? 'إخفاء المدفوعات'
+                                : apRows.length
+                                  ? `المدفوعات (${apRows.length})`
+                                  : 'المدفوعات'}
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                    {apOpen && inv.status === 'RECEIVED' && (
+                      <tr className="bg-slate-50">
+                        <td
+                          colSpan={9}
+                          className="px-4 py-4 border-t border-slate-200"
+                        >
+                          {apErr && (
+                            <div className="rounded-md bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700 mb-3">
+                              {apErr}
+                            </div>
+                          )}
+                          {apSuccess && !apErr && (
+                            <div className="rounded-md bg-emerald-50 border border-emerald-200 px-3 py-2 text-sm text-emerald-700 mb-3">
+                              تم تسجيل الدفعة بنجاح.
+                            </div>
+                          )}
+
+                          {/* Existing payments list */}
+                          <div className="rounded-md border border-slate-200 bg-white mb-4">
+                            <div className="px-3 py-2 text-xs font-semibold text-slate-700 border-b border-slate-200">
+                              قائمة المدفوعات
+                            </div>
+                            {apLoading ? (
+                              <div className="px-3 py-3 text-sm text-slate-500">
+                                ...جاري التحميل
+                              </div>
+                            ) : apRows.length === 0 ? (
+                              <div className="px-3 py-3 text-sm text-slate-500">
+                                لا توجد مدفوعات لهذه الفاتورة بعد.
+                              </div>
+                            ) : (
+                              <table className="w-full text-sm">
+                                <thead>
+                                  <tr className="text-slate-500 text-xs">
+                                    <th className="px-3 py-2 text-right font-medium">المبلغ</th>
+                                    <th className="px-3 py-2 text-right font-medium">الطريقة</th>
+                                    <th className="px-3 py-2 text-right font-medium">التاريخ</th>
+                                    <th className="px-3 py-2 text-right font-medium">المرجع</th>
+                                    <th className="px-3 py-2 text-right font-medium">الحالة</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {apRows.map((p) => (
+                                    <tr
+                                      key={p.id}
+                                      className="border-t border-slate-100"
+                                    >
+                                      <td className="px-3 py-2 font-mono" dir="ltr">
+                                        {fmtMoney(p.amount)}
+                                      </td>
+                                      <td className="px-3 py-2">{p.paymentMethod}</td>
+                                      <td className="px-3 py-2 text-slate-600" dir="ltr">
+                                        {fmtDate(p.paidAt)}
+                                      </td>
+                                      <td className="px-3 py-2 text-slate-600" dir="ltr">
+                                        {p.reference ?? '—'}
+                                      </td>
+                                      <td className="px-3 py-2">
+                                        <span
+                                          className={
+                                            'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
+                                            (p.status === 'POSTED'
+                                              ? 'bg-emerald-50 text-emerald-700'
+                                              : 'bg-slate-100 text-slate-600')
+                                          }
+                                        >
+                                          {p.status === 'POSTED' ? 'مُرحّلة' : p.status}
+                                        </span>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            )}
+                          </div>
+
+                          {/* Register payment form */}
+                          {canWriteApPayments && (
+                            <form
+                              onSubmit={(e) => onSubmitApPayment(e, inv.id, inv)}
+                              className="rounded-md border border-slate-200 bg-white p-3"
+                            >
+                              <div className="text-xs font-semibold text-slate-700 mb-3">
+                                تسجيل دفعة جديدة
+                              </div>
+                              <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+                                <label className="text-xs">
+                                  <span className="block text-slate-700 mb-1">
+                                    المبلغ *
+                                  </span>
+                                  <input
+                                    required
+                                    value={apForm.amount}
+                                    onChange={(e) =>
+                                      setApPaymentForm(inv.id, {
+                                        amount: e.target.value,
+                                      })
+                                    }
+                                    placeholder="0.0000"
+                                    className="w-full rounded-md border border-slate-300 px-2 py-2 font-mono"
+                                    dir="ltr"
+                                  />
+                                </label>
+                                <label className="text-xs">
+                                  <span className="block text-slate-700 mb-1">
+                                    طريقة الدفع *
+                                  </span>
+                                  <select
+                                    value={apForm.paymentMethod}
+                                    onChange={(e) =>
+                                      setApPaymentForm(inv.id, {
+                                        paymentMethod: e.target
+                                          .value as PaymentMethod,
+                                      })
+                                    }
+                                    className="w-full rounded-md border border-slate-300 px-2 py-2"
+                                    dir="ltr"
+                                  >
+                                    {apPaymentFormMethods.map((m) => (
+                                      <option key={m} value={m}>
+                                        {m}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <label className="text-xs">
+                                  <span className="block text-slate-700 mb-1">
+                                    التاريخ
+                                  </span>
+                                  <input
+                                    type="date"
+                                    value={apForm.paidAt}
+                                    onChange={(e) =>
+                                      setApPaymentForm(inv.id, {
+                                        paidAt: e.target.value,
+                                      })
+                                    }
+                                    className="w-full rounded-md border border-slate-300 px-2 py-2"
+                                    dir="ltr"
+                                  />
+                                </label>
+                                <label className="text-xs">
+                                  <span className="block text-slate-700 mb-1">
+                                    المرجع
+                                  </span>
+                                  <input
+                                    value={apForm.reference}
+                                    onChange={(e) =>
+                                      setApPaymentForm(inv.id, {
+                                        reference: e.target.value,
+                                      })
+                                    }
+                                    placeholder="INV-..."
+                                    className="w-full rounded-md border border-slate-300 px-2 py-2"
+                                    dir="ltr"
+                                  />
+                                </label>
+                                <label className="text-xs">
+                                  <span className="block text-slate-700 mb-1">
+                                    ملاحظات
+                                  </span>
+                                  <input
+                                    value={apForm.notes}
+                                    onChange={(e) =>
+                                      setApPaymentForm(inv.id, {
+                                        notes: e.target.value,
+                                      })
+                                    }
+                                    placeholder="اختياري"
+                                    className="w-full rounded-md border border-slate-300 px-2 py-2"
+                                    dir="ltr"
+                                  />
+                                </label>
+                              </div>
+                              <div className="flex justify-end mt-3">
+                                <button
+                                  type="submit"
+                                  disabled={apSubmitting}
+                                  className="rounded-md bg-indigo-700 hover:bg-indigo-800 text-white text-sm px-4 py-2 disabled:opacity-40"
+                                >
+                                  {apSubmitting ? '...جاري الحفظ' : 'تسجيل الدفعة'}
+                                </button>
+                              </div>
+                            </form>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })
             )}

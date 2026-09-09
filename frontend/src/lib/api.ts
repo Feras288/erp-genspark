@@ -582,6 +582,57 @@ export const api = {
       `/sales-invoices/${invoiceId}/payments`,
       { method: 'POST', body: data },
     ),
+
+  // ===== Phase 10B-C-code: AP Payments (settlement) =====
+  // Wire surface for the Phase 10B-B-2 backend endpoints:
+  //   GET  /api/purchase-invoices/:invoiceId/payments
+  //     - tenant-scoped (JWT-only companyId)
+  //     - PURCHASE-only (purchaseInvoiceId discriminator)
+  //     - returns `ApPayment[]` ordered paidAt DESC
+  //   POST /api/purchase-invoices/:invoiceId/payments
+  //     - tenant-scoped, status=RECEIVED gate (mirror of
+  //       AR's ISSUED gate; DRAFT/CANCELLED → 409)
+  //     - overpayment guard (409 Conflict) when
+  //       amount > (total - sum of Payment.amount rows)
+  //     - idempotency: optional `idempotencyKey`
+  //       (>= 8 chars). Server short-circuits on a
+  //       duplicate (same key → same payment row)
+  //     - returns `ApPayment` (full response shape)
+  // RBAC is enforced server-side:
+  //   GET  → `ap_payments.read`
+  //   POST → `ap_payments.write`
+  // `companyId` is JWT-only and is NEVER sent in the
+  // body or as a query param. Same as every other
+  // backend endpoint in this client.
+  // The polymorphic shape (`invoiceId` + `invoiceType`)
+  // matches Phase 10A-C-code; the AR row helper types
+  // already accommodate PURCHASE rows in their union
+  // (`ArPaymentInvoiceTypeKey = 'SALES' | 'PURCHASE'`).
+
+  listApPayments: (
+    invoiceId: string,
+    params: {
+      fromDate?: string; // ISO date (yyyy-mm-dd)
+      toDate?: string; // ISO date (yyyy-mm-dd)
+    } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (params.fromDate) q.set('fromDate', params.fromDate);
+    if (params.toDate) q.set('toDate', params.toDate);
+    const suffix = q.toString() ? `?${q.toString()}` : '';
+    return apiRequest<ApPayment[]>(
+      `/purchase-invoices/${invoiceId}/payments${suffix}`,
+    );
+  },
+
+  createApPayment: (
+    invoiceId: string,
+    data: CreateApPaymentInput,
+  ) =>
+    apiRequest<ApPayment>(
+      `/purchase-invoices/${invoiceId}/payments`,
+      { method: 'POST', body: data },
+    ),
 };
 
 // =====================================================
@@ -1479,4 +1530,65 @@ export interface CreateArPaymentInput {
   // existing row with 201. Generated client-side via
   // crypto.randomUUID() per submit attempt.
   idempotencyKey?: string;
+}
+
+// =====================================================
+// Phase 10B-C-code: AP Payments (settlement) types.
+//
+// Mirrors the Phase 10B-B-2 backend (backend/src/payments/
+// payments.service.ts) where:
+//   * `PaymentResponseRow` is widened to invoiceType ∈
+//     {'SALES','PURCHASE'} (Phase 10B-B-2 widened the AR
+//     enum to include PURCHASE rows on the same wire).
+//   * `purchaseInvoiceId` is the polymorphic FK source
+//     for PURCHASE rows; surfaced to clients as
+//     `invoiceId` (same surface as AR rows).
+// Decimal columns serialize to strings (matches
+// `Prisma.Decimal @db.Decimal(18,4)` server-side). The
+// polymorphic FK surfaces as `invoiceId` for PURCHASE rows.
+// No client-side coercion to `Number` — keep Decimal-as-
+// string semantics end to end (matches
+// `PurchaseInvoice.total` typing).
+// =====================================================
+
+export type ApPaymentInvoiceTypeKey = 'PURCHASE';
+export type ApPaymentStatusKey = 'POSTED' | 'CANCELLED';
+
+// ApPayment is structurally identical to ArPayment — both
+// rows share the polymorphic shape (invoiceId + invoiceType
+// discriminator). We keep a separate alias for semantic
+// clarity in imports throughout the purchases page, but
+// the runtime type is THE SAME TypeScript type.
+export type ApPayment = {
+  id: string;
+  // Polymorphic alias of `purchaseInvoiceId` on PURCHASE
+  // rows. For AP smoke this is always PURCHASE.
+  invoiceId: string;
+  invoiceType: ApPaymentInvoiceTypeKey;
+  amount: string;             // Decimal-as-string (e.g. "100.0000")
+  paymentMethod: PaymentMethod;
+  paidAt: string;             // ISO-8601
+  reference: string | null;
+  notes: string | null;
+  status: ApPaymentStatusKey;
+  idempotencyKey: string | null;
+  createdAt: string;          // ISO-8601
+};
+
+export interface CreateApPaymentInput {
+  paymentMethod: PaymentMethod;
+  amount: string;             // matches /^\\d{1,14}(\\.\\d{1,4})?$/
+  paidAt?: string;            // optional ISO-8601
+  reference?: string;         // optional 1..128
+  notes?: string;             // optional <=1024
+  // Server short-circuits on a duplicate (invoiceId,
+  // idempotencyKey) pair, returning the existing row with
+  // 201. Generated client-side via `crypto.randomUUID()` per
+  // submit attempt (>= 8 chars).
+  idempotencyKey?: string;
+}
+
+export interface ApPaymentListQuery {
+  fromDate?: string; // ISO date (yyyy-mm-dd)
+  toDate?: string;   // ISO date (yyyy-mm-dd)
 }
