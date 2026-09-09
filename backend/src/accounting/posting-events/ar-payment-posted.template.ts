@@ -36,6 +36,9 @@ export function buildArPaymentPostedTemplate(
   ];
 
   const totals = assertBalancedLines(lines);
+  const refNote = source.reference ? ` ref ${source.reference}` : '';
+  const description = `AR payment ${source.id}${refNote}${invoiceNote} (${methodLabel})`;
+
   return {
     sourceType: JournalEntrySourceType.AR_PAYMENT,
     sourceId: source.id,
@@ -43,7 +46,7 @@ export function buildArPaymentPostedTemplate(
       JournalEntrySourceType.AR_PAYMENT,
       source.id,
     ),
-    description: `AR payment posted (${methodLabel})`,
+    description,
     memo: methodLabel,
     lines,
     totalDebit: totals.totalDebit,

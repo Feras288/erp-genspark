@@ -80,6 +80,7 @@ import { PrismaService } from '../database/prisma.service';
 import type { AuthenticatedUser } from '../common/types/auth.types';
 import type { CreatePaymentDto } from './dto/create-payment.dto';
 import type { PaymentsQueryDto } from './dto/payments-query.dto';
+import { postArPaymentPosted } from '../accounting/posting-events';
 
 // ---------------------------------------------------------------------
 // Response shape — single source of truth across GET and POST.
@@ -311,6 +312,22 @@ export class PaymentsService {
         where: { id: invoiceId, companyId },
         data: { paidAmount: recomputed, updatedById: me.id ?? null },
         select: { id: true, paidAmount: true },
+      });
+
+      // 6. Auto-post one POSTED JournalEntry (Phase 11B-B-4)
+      //    linked by sourceType=AR_PAYMENT / sourceId=payment.id.
+      //    Unique (companyId, sourceType, sourceId) makes retries
+      //    idempotent. Same $transaction as payment insert.
+      await postArPaymentPosted(tx, {
+        companyId,
+        userId: me.id,
+        payment: {
+          id: payment.id,
+          amount: payment.amount,
+          paymentMethod: payment.paymentMethod,
+          salesInvoiceId: invoiceId,
+          reference: payment.reference,
+        },
       });
 
       return payment;

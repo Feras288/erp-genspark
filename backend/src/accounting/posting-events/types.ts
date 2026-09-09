@@ -48,6 +48,7 @@ export type ArPaymentPostedSource = {
   amount: Prisma.Decimal | string;
   paymentMethod?: string | null;
   salesInvoiceId?: string | null;
+  reference?: string | null;
 };
 
 export type ApPaymentPostedSource = {

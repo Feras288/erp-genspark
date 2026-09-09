@@ -19,7 +19,11 @@ import helmet from 'helmet';
 import { AppModule } from '../src/app.module';
 import { JournalEntrySourceType, Prisma } from '@prisma/client';
 import { PrismaService } from '../src/database/prisma.service';
-import { postPurchaseInvoiceReceived, postSalesInvoiceIssued } from '../src/accounting/posting-events';
+import {
+  postArPaymentPosted,
+  postPurchaseInvoiceReceived,
+  postSalesInvoiceIssued,
+} from '../src/accounting/posting-events';
 
 // Helper: extract the value of `name=...;...` from the first Set-Cookie header.
 function readCookie(setCookieHeader: string | string[] | undefined, name: string): string | undefined {
@@ -3084,3 +3088,331 @@ describe('Phase 11B-B-3: PurchaseInvoice RECEIVED auto-post (e2e smoke)', () => 
     expect(owned?.sourceId).toBe(invoiceId);
   });
 });
+
+// =====================================================
+// Phase 11B-B-4 — Auto-post AR Payment POSTED to GL.
+//
+// One POSTED JournalEntry per (companyId, AR_PAYMENT, payment.id).
+// Dr CASH_OR_BANK = payment.amount
+// Cr AR_CONTROL   = payment.amount
+// Amounts compared as Decimal strings (no Number() posting math).
+// =====================================================
+describe('Phase 11B-B-4: AR Payment POSTED auto-post (e2e smoke)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+  let arToken: string;
+  let noArToken: string;
+  let companyId: string;
+  let arUserId: string;
+  let prisma: PrismaService;
+
+  const unique = Date.now().toString(36);
+  const SKU_SVC = `GL11B-AR-SVC-${unique}`;
+  const PAYMENT_AMOUNT = '75.0000';
+  const PAYMENT_REF = `REF-AR-${unique}`;
+
+  let invoiceId = '';
+  let invoiceNumber = '';
+  let paymentId = '';
+  let journalId = '';
+
+  async function loadSourceJournals() {
+    return prisma.journalEntry.findMany({
+      where: {
+        companyId,
+        sourceType: JournalEntrySourceType.AR_PAYMENT,
+        sourceId: paymentId,
+      },
+      include: { lines: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+    prisma = app.get(PrismaService);
+
+    // 1. Admin login
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+    companyId = login.body.user.companyId;
+    expect(companyId).toBeTruthy();
+
+    // 2. Setup AR payments role and agent with ar_payments.* permissions
+    const arRoleKey = `ar_post_role_${unique}`;
+    const arRole = await prisma.role.create({
+      data: {
+        companyId,
+        key: arRoleKey,
+        name: 'AR Auto-post E2E Role',
+      },
+    });
+
+    const arPerms = await prisma.permission.findMany({
+      where: { key: { in: ['ar_payments.read', 'ar_payments.write'] } },
+    });
+    for (const p of arPerms) {
+      await prisma.rolePermission.create({
+        data: { roleId: arRole.id, permissionId: p.id },
+      });
+    }
+
+    const arUserEmail = `ar-post-${unique}@example.sa`;
+    const createdUser = await request(http)
+      .post(`${API_PREFIX}/users`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        email: arUserEmail,
+        password: 'ArAgent@123',
+        fullName: 'AR Auto-post Agent',
+        roleKeys: [arRoleKey],
+      });
+    expect(createdUser.status).toBe(201);
+
+    const arLogin = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: arUserEmail, password: 'ArAgent@123' });
+    expect(arLogin.status).toBe(200);
+    arToken = arLogin.body.accessToken;
+    arUserId = arLogin.body.user.id;
+
+    // 2b. Setup user without ar_payments.* permissions for 403 check
+    const noArRoleKey = `no_ar_role_${unique}`;
+    await prisma.role.create({
+      data: {
+        companyId,
+        key: noArRoleKey,
+        name: 'No AR Role',
+      },
+    });
+    const noArEmail = `no-ar-${unique}@example.sa`;
+    await request(http)
+      .post(`${API_PREFIX}/users`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        email: noArEmail,
+        password: 'NoAr@12345',
+        fullName: 'No AR User',
+        roleKeys: [noArRoleKey],
+      });
+    const noArLogin = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: noArEmail, password: 'NoAr@12345' });
+    expect(noArLogin.status).toBe(200);
+    noArToken = noArLogin.body.accessToken;
+
+    // 3. Create service product and sales invoice, then issue it
+    const product = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        sku: SKU_SVC,
+        name: 'Phase 11B-B-4 GL service',
+        type: 'SERVICE',
+      });
+    expect(product.status).toBe(201);
+
+    const createdInvoice = await request(http)
+      .post(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        notes: 'Phase 11B-B-4 auto-post fixture',
+        lines: [
+          {
+            productId: product.body.id,
+            quantity: '1.0000',
+            unitPrice: '100.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(createdInvoice.status).toBe(201);
+    invoiceId = createdInvoice.body.id;
+    invoiceNumber = createdInvoice.body.invoiceNumber;
+
+    const issued = await request(http)
+      .post(`${API_PREFIX}/sales/invoices/${invoiceId}/issue`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'issue before payment' });
+    expect(issued.status).toBe(201);
+    expect(issued.body.status).toBe('ISSUED');
+
+    // 4. Register AR Payment as arAgent
+    const paymentRes = await request(http)
+      .post(`${API_PREFIX}/sales-invoices/${invoiceId}/payments`)
+      .set('Authorization', `Bearer ${arToken}`)
+      .send({
+        amount: PAYMENT_AMOUNT,
+        paymentMethod: 'CASH',
+        reference: PAYMENT_REF,
+        idempotencyKey: `idemp-ar-${unique}`,
+      });
+    expect(paymentRes.status).toBe(201);
+    expect(paymentRes.body.id).toBeTruthy();
+    expect(paymentRes.body.status).toBe('POSTED');
+    expect(new Prisma.Decimal(paymentRes.body.amount).toFixed(4)).toBe(
+      PAYMENT_AMOUNT,
+    );
+    paymentId = paymentRes.body.id;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('11B-B-4.1) creating an AR payment creates one POSTED journal entry', async () => {
+    const entries = await loadSourceJournals();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].status).toBe('POSTED');
+    expect(entries[0].postedAt).toBeTruthy();
+    expect(String(entries[0].description ?? '')).toContain(paymentId);
+    expect(String(entries[0].description ?? '')).toContain(PAYMENT_REF);
+    expect(String(entries[0].description ?? '')).toContain(invoiceId);
+    journalId = entries[0].id;
+  });
+
+  it('11B-B-4.2) debit total equals credit total', async () => {
+    const entries = await loadSourceJournals();
+    expect(entries).toHaveLength(1);
+    const entry = entries[0];
+    const td = new Prisma.Decimal(entry.totalDebit);
+    const tc = new Prisma.Decimal(entry.totalCredit);
+    expect(td.equals(tc)).toBe(true);
+    expect(td.toFixed(4)).toBe(PAYMENT_AMOUNT);
+
+    let lineDebit = new Prisma.Decimal(0);
+    let lineCredit = new Prisma.Decimal(0);
+    for (const line of entry.lines) {
+      lineDebit = lineDebit.add(new Prisma.Decimal(line.debit));
+      lineCredit = lineCredit.add(new Prisma.Decimal(line.credit));
+    }
+    expect(lineDebit.equals(lineCredit)).toBe(true);
+    expect(lineDebit.equals(td)).toBe(true);
+
+    const codesBySide: Record<string, { debit: string; credit: string }> = {};
+    for (const line of entry.lines) {
+      const accountId = line.debitAccountId ?? line.creditAccountId;
+      expect(accountId).toBeTruthy();
+      const acc = await prisma.account.findFirst({
+        where: { id: accountId!, companyId },
+        select: { code: true },
+      });
+      expect(acc?.code).toBeTruthy();
+      codesBySide[acc!.code] = {
+        debit: new Prisma.Decimal(line.debit).toFixed(4),
+        credit: new Prisma.Decimal(line.credit).toFixed(4),
+      };
+    }
+    expect(codesBySide.CASH_OR_BANK?.debit).toBe(PAYMENT_AMOUNT);
+    expect(codesBySide.CASH_OR_BANK?.credit).toBe('0.0000');
+    expect(codesBySide.AR_CONTROL?.debit).toBe('0.0000');
+    expect(codesBySide.AR_CONTROL?.credit).toBe(PAYMENT_AMOUNT);
+  });
+
+  it('11B-B-4.3) sourceType/sourceId are set correctly', async () => {
+    const entries = await loadSourceJournals();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].sourceType).toBe(JournalEntrySourceType.AR_PAYMENT);
+    expect(entries[0].sourceId).toBe(paymentId);
+    expect(entries[0].companyId).toBe(companyId);
+  });
+
+  it('11B-B-4.4) idempotent retry does not create duplicate journal entries', async () => {
+    // Retry 1: API HTTP call with same idempotencyKey returns existing payment
+    const retryRes = await request(http)
+      .post(`${API_PREFIX}/sales-invoices/${invoiceId}/payments`)
+      .set('Authorization', `Bearer ${arToken}`)
+      .send({
+        amount: PAYMENT_AMOUNT,
+        paymentMethod: 'CASH',
+        reference: PAYMENT_REF,
+        idempotencyKey: `idemp-ar-${unique}`,
+      });
+    expect([200, 201]).toContain(retryRes.status);
+    expect(retryRes.body.id).toBe(paymentId);
+
+    const afterHttp = await loadSourceJournals();
+    expect(afterHttp).toHaveLength(1);
+
+    // Retry 2: direct handler invocation in a transaction returns reused: true
+    await prisma.$transaction(async (tx) => {
+      const result = await postArPaymentPosted(tx, {
+        companyId,
+        userId: arUserId,
+        payment: {
+          id: paymentId,
+          amount: PAYMENT_AMOUNT,
+          paymentMethod: 'CASH',
+          salesInvoiceId: invoiceId,
+          reference: PAYMENT_REF,
+        },
+      });
+      expect(result.reused).toBe(true);
+      expect(result.id).toBe(journalId);
+    });
+
+    const afterHandler = await loadSourceJournals();
+    expect(afterHandler).toHaveLength(1);
+    expect(afterHandler[0].id).toBe(journalId);
+  });
+
+  it('11B-B-4.5) tenant isolation and auth check remain intact', async () => {
+    expect(journalId).toBeTruthy();
+
+    // 1. Unauthenticated read of journal entry => 401
+    const unauth = await request(http).get(
+      `${API_PREFIX}/accounting/journal/${journalId}`,
+    );
+    expect(unauth.status).toBe(401);
+
+    // 2. Cross-tenant DB read returns null
+    const cross = await prisma.journalEntry.findFirst({
+      where: {
+        id: journalId,
+        companyId: 'not-this-company',
+      },
+      select: { id: true },
+    });
+    expect(cross).toBeNull();
+
+    // 3. User without ar_payments.write cannot post AR payment => 403
+    const forbiddenRes = await request(http)
+      .post(`${API_PREFIX}/sales-invoices/${invoiceId}/payments`)
+      .set('Authorization', `Bearer ${noArToken}`)
+      .send({
+        amount: '10.0000',
+        paymentMethod: 'CASH',
+      });
+    expect(forbiddenRes.status).toBe(403);
+
+    // 4. Owned entry in tenant has correct properties
+    const owned = await prisma.journalEntry.findFirst({
+      where: { id: journalId, companyId },
+      select: { id: true, sourceType: true, sourceId: true },
+    });
+    expect(owned?.id).toBe(journalId);
+    expect(owned?.sourceType).toBe(JournalEntrySourceType.AR_PAYMENT);
+    expect(owned?.sourceId).toBe(paymentId);
+  });
+});
+
