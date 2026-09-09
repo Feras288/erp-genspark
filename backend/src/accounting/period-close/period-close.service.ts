@@ -5,7 +5,12 @@
 // Zero mutations, zero GL posting, zero Number() money arithmetic.
 // =====================================================
 import { Injectable } from '@nestjs/common';
-import { PeriodCloseStatus, Prisma } from '@prisma/client';
+import {
+  JournalEntryStatus,
+  PeriodCloseStatus,
+  Prisma,
+  ReconciliationStatus,
+} from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import {
   GetFiscalYearClosesQueryDto,
@@ -13,31 +18,34 @@ import {
   GetPeriodClosesQueryDto,
   GetPeriodCloseStatusQueryDto,
 } from './dto/period-close-query.dto';
+import { ValidatePeriodCloseDto } from './dto/validate-period-close.dto';
 import {
   FiscalYearCloseListResponse,
   PeriodCloseAuditLogListResponse,
   PeriodCloseListResponse,
   PeriodCloseStatusResponse,
+  PeriodCloseValidationCheck,
+  PeriodCloseValidationResponse,
 } from './types/period-close.types';
 
 function parseDateStartUtc(dateStr?: string | null): Date | null {
   if (!dateStr) return null;
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return null;
-  if (dateStr.length === 10) {
-    return new Date(`${dateStr}T00:00:00.000Z`);
-  }
-  return d;
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return new Date(`${yyyy}-${mm}-${dd}T00:00:00.000Z`);
 }
 
 function parseDateEndUtc(dateStr?: string | null): Date | null {
   if (!dateStr) return null;
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return null;
-  if (dateStr.length === 10) {
-    return new Date(`${dateStr}T23:59:59.999Z`);
-  }
-  return d;
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return new Date(`${yyyy}-${mm}-${dd}T23:59:59.999Z`);
 }
 
 @Injectable()
@@ -273,6 +281,365 @@ export class PeriodCloseService {
           createdAt: log.createdAt.toISOString(),
           actorUser: log.actorUser,
         })),
+      },
+    };
+  }
+
+  /**
+   * 5. POST validate proposed period close (read-only checks).
+   */
+  async validatePeriod(
+    companyId: string,
+    dto: ValidatePeriodCloseDto,
+  ): Promise<PeriodCloseValidationResponse> {
+    const startUtc = parseDateStartUtc(dto.periodStart);
+    const endUtc = parseDateEndUtc(dto.periodEnd);
+
+    const checks: PeriodCloseValidationCheck[] = [];
+    const warnings: string[] = [];
+
+    // 1. DATE_RANGE_VALID
+    const isDateRangeValid = !!startUtc && !!endUtc && startUtc <= endUtc;
+    if (isDateRangeValid) {
+      checks.push({
+        code: 'DATE_RANGE_VALID',
+        status: 'PASS',
+        blocking: true,
+        message: 'Period date range is valid.',
+        metadata: {
+          periodStart: startUtc.toISOString(),
+          periodEnd: endUtc.toISOString(),
+        },
+      });
+    } else {
+      checks.push({
+        code: 'DATE_RANGE_VALID',
+        status: 'FAIL',
+        blocking: true,
+        message:
+          'Invalid date range: periodEnd must be greater than or equal to periodStart.',
+        metadata: {
+          periodStart: dto.periodStart,
+          periodEnd: dto.periodEnd,
+        },
+      });
+    }
+
+    let postedDebitTotal = new Prisma.Decimal('0');
+    let postedCreditTotal = new Prisma.Decimal('0');
+
+    if (isDateRangeValid && startUtc && endUtc) {
+      // 2. NO_EXISTING_CLOSED_OVERLAP
+      const overlappingClosed = await this.prisma.periodClose.findMany({
+        where: {
+          companyId,
+          status: { in: [PeriodCloseStatus.CLOSED, PeriodCloseStatus.CLOSING] },
+          periodStart: { lte: endUtc },
+          periodEnd: { gte: startUtc },
+        },
+        select: {
+          id: true,
+          fiscalYear: true,
+          periodNumber: true,
+          status: true,
+          periodStart: true,
+          periodEnd: true,
+        },
+      });
+
+      if (overlappingClosed.length === 0) {
+        checks.push({
+          code: 'NO_EXISTING_CLOSED_OVERLAP',
+          status: 'PASS',
+          blocking: true,
+          message:
+            'No closed or closing period overlaps the requested date range.',
+          metadata: { count: 0 },
+        });
+      } else {
+        checks.push({
+          code: 'NO_EXISTING_CLOSED_OVERLAP',
+          status: 'FAIL',
+          blocking: true,
+          message: `Found ${overlappingClosed.length} closed or closing period(s) overlapping the requested range.`,
+          metadata: {
+            count: overlappingClosed.length,
+            overlappingPeriods: overlappingClosed.map((p) => ({
+              id: p.id,
+              fiscalYear: p.fiscalYear,
+              periodNumber: p.periodNumber,
+              status: p.status,
+              periodStart: p.periodStart.toISOString(),
+              periodEnd: p.periodEnd.toISOString(),
+            })),
+          },
+        });
+      }
+
+      // 3. NO_DRAFT_JOURNALS
+      const draftCount = await this.prisma.journalEntry.count({
+        where: {
+          companyId,
+          status: JournalEntryStatus.DRAFT,
+          entryDate: {
+            gte: startUtc,
+            lte: endUtc,
+          },
+        },
+      });
+
+      if (draftCount === 0) {
+        checks.push({
+          code: 'NO_DRAFT_JOURNALS',
+          status: 'PASS',
+          blocking: true,
+          message: 'No draft journals found in the period.',
+          metadata: { count: 0 },
+        });
+      } else {
+        checks.push({
+          code: 'NO_DRAFT_JOURNALS',
+          status: 'FAIL',
+          blocking: true,
+          message: `Found ${draftCount} draft journal(s) in the period. All journals must be posted or cancelled before closing.`,
+          metadata: { count: draftCount },
+        });
+      }
+
+      // 4. POSTED_JOURNALS_BALANCED
+      const postedEntries = await this.prisma.journalEntry.findMany({
+        where: {
+          companyId,
+          status: JournalEntryStatus.POSTED,
+          entryDate: {
+            gte: startUtc,
+            lte: endUtc,
+          },
+        },
+        select: {
+          id: true,
+          entryNumber: true,
+          lines: {
+            select: {
+              debit: true,
+              credit: true,
+            },
+          },
+        },
+      });
+
+      const unbalancedJournals: Array<{
+        id: string;
+        entryNumber: string;
+        debitTotal: string;
+        creditTotal: string;
+      }> = [];
+
+      for (const entry of postedEntries) {
+        let lineDebit = new Prisma.Decimal('0');
+        let lineCredit = new Prisma.Decimal('0');
+        for (const line of entry.lines) {
+          lineDebit = lineDebit.add(line.debit);
+          lineCredit = lineCredit.add(line.credit);
+        }
+        if (!lineDebit.equals(lineCredit)) {
+          unbalancedJournals.push({
+            id: entry.id,
+            entryNumber: entry.entryNumber,
+            debitTotal: lineDebit.toFixed(4),
+            creditTotal: lineCredit.toFixed(4),
+          });
+        }
+      }
+
+      if (unbalancedJournals.length === 0) {
+        checks.push({
+          code: 'POSTED_JOURNALS_BALANCED',
+          status: 'PASS',
+          blocking: true,
+          message: `All ${postedEntries.length} posted journal(s) in the period are balanced.`,
+          metadata: {
+            postedJournalsCount: postedEntries.length,
+            unbalancedCount: 0,
+          },
+        });
+      } else {
+        checks.push({
+          code: 'POSTED_JOURNALS_BALANCED',
+          status: 'FAIL',
+          blocking: true,
+          message: `Found ${unbalancedJournals.length} unbalanced posted journal(s) in the period.`,
+          metadata: {
+            postedJournalsCount: postedEntries.length,
+            unbalancedCount: unbalancedJournals.length,
+            unbalancedJournals: unbalancedJournals.slice(0, 10),
+          },
+        });
+      }
+
+      // 5. TRIAL_BALANCE_BALANCED
+      const lineAgg = await this.prisma.journalEntryLine.aggregate({
+        where: {
+          companyId,
+          entry: {
+            companyId,
+            status: JournalEntryStatus.POSTED,
+            entryDate: {
+              gte: startUtc,
+              lte: endUtc,
+            },
+          },
+        },
+        _sum: {
+          debit: true,
+          credit: true,
+        },
+      });
+
+      postedDebitTotal = lineAgg._sum.debit
+        ? new Prisma.Decimal(lineAgg._sum.debit)
+        : new Prisma.Decimal('0');
+      postedCreditTotal = lineAgg._sum.credit
+        ? new Prisma.Decimal(lineAgg._sum.credit)
+        : new Prisma.Decimal('0');
+
+      const tbBalanced = postedDebitTotal.equals(postedCreditTotal);
+      checks.push({
+        code: 'TRIAL_BALANCE_BALANCED',
+        status: tbBalanced ? 'PASS' : 'FAIL',
+        blocking: true,
+        message: tbBalanced
+          ? 'Trial balance is balanced (total debit equals total credit).'
+          : 'Trial balance is unbalanced: total debit does not equal total credit.',
+        metadata: {
+          debitTotal: postedDebitTotal.toFixed(4),
+          creditTotal: postedCreditTotal.toFixed(4),
+          difference: postedDebitTotal.minus(postedCreditTotal).toFixed(4),
+        },
+      });
+
+      // 6. NO_FAILED_POSTING_EVENTS
+      checks.push({
+        code: 'NO_FAILED_POSTING_EVENTS',
+        status: 'SKIPPED',
+        blocking: false,
+        message:
+          'No posting-event failure model is available in the current schema.',
+        metadata: {
+          reason:
+            'No posting-event failure model is available in the current schema.',
+        },
+      });
+
+      // 7. RECONCILIATION_WARNINGS
+      try {
+        const unmatchedBankTxCount = await this.prisma.bankTransaction.count({
+          where: {
+            companyId,
+            status: ReconciliationStatus.UNMATCHED,
+            transactionDate: {
+              gte: startUtc,
+              lte: endUtc,
+            },
+          },
+        });
+
+        if (unmatchedBankTxCount > 0) {
+          const warnMsg = `Found ${unmatchedBankTxCount} unmatched bank transaction(s) in the period.`;
+          warnings.push(warnMsg);
+          checks.push({
+            code: 'RECONCILIATION_WARNINGS',
+            status: 'WARNING',
+            blocking: false,
+            message: warnMsg,
+            metadata: {
+              unmatchedBankTransactions: unmatchedBankTxCount,
+            },
+          });
+        } else {
+          checks.push({
+            code: 'RECONCILIATION_WARNINGS',
+            status: 'PASS',
+            blocking: false,
+            message: 'No unmatched bank transactions found in the period.',
+            metadata: {
+              unmatchedBankTransactions: 0,
+            },
+          });
+        }
+      } catch {
+        checks.push({
+          code: 'RECONCILIATION_WARNINGS',
+          status: 'SKIPPED',
+          blocking: false,
+          message: 'Reconciliation check skipped.',
+        });
+      }
+    } else {
+      // If date range is invalid, skip other checks
+      checks.push(
+        {
+          code: 'NO_EXISTING_CLOSED_OVERLAP',
+          status: 'SKIPPED',
+          blocking: true,
+          message: 'Skipped due to invalid date range.',
+        },
+        {
+          code: 'NO_DRAFT_JOURNALS',
+          status: 'SKIPPED',
+          blocking: true,
+          message: 'Skipped due to invalid date range.',
+        },
+        {
+          code: 'POSTED_JOURNALS_BALANCED',
+          status: 'SKIPPED',
+          blocking: true,
+          message: 'Skipped due to invalid date range.',
+        },
+        {
+          code: 'TRIAL_BALANCE_BALANCED',
+          status: 'SKIPPED',
+          blocking: true,
+          message: 'Skipped due to invalid date range.',
+        },
+        {
+          code: 'NO_FAILED_POSTING_EVENTS',
+          status: 'SKIPPED',
+          blocking: false,
+          message:
+            'No posting-event failure model is available in the current schema.',
+        },
+        {
+          code: 'RECONCILIATION_WARNINGS',
+          status: 'SKIPPED',
+          blocking: false,
+          message: 'Skipped due to invalid date range.',
+        },
+      );
+    }
+
+    const blockingFailures = checks.filter(
+      (c) => c.blocking && c.status === 'FAIL',
+    ).length;
+    const canClose = blockingFailures === 0;
+
+    return {
+      status: 'ok',
+      companyId,
+      data: {
+        periodStart: startUtc ? startUtc.toISOString() : dto.periodStart,
+        periodEnd: endUtc ? endUtc.toISOString() : dto.periodEnd,
+        fiscalYear:
+          dto.fiscalYear ?? (startUtc ? startUtc.getUTCFullYear() : null),
+        periodNumber: dto.periodNumber ?? null,
+        canClose,
+        blockingFailures,
+        warnings,
+        checks,
+        totals: {
+          postedDebitTotal: postedDebitTotal.toFixed(4),
+          postedCreditTotal: postedCreditTotal.toFixed(4),
+        },
       },
     };
   }

@@ -106,3 +106,43 @@ export interface PeriodCloseAuditLogListResponse {
     }>;
   };
 }
+
+export type PeriodCloseCheckStatus = 'PASS' | 'FAIL' | 'WARNING' | 'SKIPPED';
+
+export type PeriodCloseCheckCode =
+  | 'DATE_RANGE_VALID'
+  | 'NO_EXISTING_CLOSED_OVERLAP'
+  | 'NO_DRAFT_JOURNALS'
+  | 'POSTED_JOURNALS_BALANCED'
+  | 'TRIAL_BALANCE_BALANCED'
+  | 'NO_FAILED_POSTING_EVENTS'
+  | 'RECONCILIATION_WARNINGS';
+
+export interface PeriodCloseValidationCheck {
+  code: PeriodCloseCheckCode;
+  status: PeriodCloseCheckStatus;
+  blocking: boolean;
+  message: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PeriodCloseValidationData {
+  periodStart: string;
+  periodEnd: string;
+  fiscalYear: number | null;
+  periodNumber: number | null;
+  canClose: boolean;
+  blockingFailures: number;
+  warnings: string[];
+  checks: PeriodCloseValidationCheck[];
+  totals: {
+    postedDebitTotal: string;
+    postedCreditTotal: string;
+  };
+}
+
+export interface PeriodCloseValidationResponse {
+  status: 'ok';
+  companyId: string;
+  data: PeriodCloseValidationData;
+}

@@ -4,7 +4,7 @@
 // Guarded with JwtAuthGuard, PermissionsGuard, and @RequirePermissions('period_close.read')
 // Tenant isolation via JWT companyId only.
 // =====================================================
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../auth/guards/permissions.guard';
@@ -18,6 +18,7 @@ import {
   GetPeriodClosesQueryDto,
   GetPeriodCloseStatusQueryDto,
 } from './dto/period-close-query.dto';
+import { ValidatePeriodCloseDto } from './dto/validate-period-close.dto';
 
 @ApiTags('Accounting - Period Close')
 @ApiBearerAuth()
@@ -60,5 +61,14 @@ export class PeriodCloseController {
     @Query() query: GetPeriodCloseAuditLogsQueryDto,
   ) {
     return this.svc.listAuditLogs(me.companyId, query);
+  }
+
+  @Post('periods/validate')
+  @RequirePermissions('period_close.read')
+  validatePeriod(
+    @CurrentUser() me: AuthenticatedUser,
+    @Body() dto: ValidatePeriodCloseDto,
+  ) {
+    return this.svc.validatePeriod(me.companyId, dto);
   }
 }
