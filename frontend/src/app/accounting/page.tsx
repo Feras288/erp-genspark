@@ -630,6 +630,15 @@ export default function AccountingPage() {
               المطابقة البنكية
             </Link>
           )}
+          {hasPermission('period_close.read') && (
+            <Link
+              href="/accounting/period-close"
+              className="rounded-md bg-purple-600 hover:bg-purple-700 text-white text-sm px-4 py-2"
+            >
+              إقفال الفترات
+            </Link>
+          )}
+
           <Link
             href="/dashboard"
             className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"
