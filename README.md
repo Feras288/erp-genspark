@@ -3337,4 +3337,196 @@ function ensureJournalEntryCanCancel(entry: JournalEntry | null): asserts entry 
 - ❌ **أي تعديلات على إعدادات النشر السحابي أو البنية التحتية (Deployment changes)**.
 - ❌ **أي تعديلات على الفوترة الضريبية أو الربط مع هيئة الزكاة والضريبة والجمارك (Tax/ZATCA changes)**.
 
+---
+
+## Phase 14A: Period Close / Fiscal Closing
+
+> تم تنفيذ المرحلة 14A بالكامل مع **207/207 e2e tests passing** عبر جميع مجموعات الاختبارات، وبناء نظيف تماماً للـ backend والـ frontend. توفر هذه المرحلة نظاماً رقابياً محاسبياً متكاملاً لإقفال وإعادة فتح الفترات المحاسبية الشهرية والسنوات المالية، والتحقق التلقائي من توازن القيود وميزان المراجعة قبل الإقفال، وفرض حواجز الحماية الرقابية لمنع الترحيل المحاسبي داخل الفترات والسنوات المقفلة عبر كافة تدفقات دفتر الأستاذ والمبيعات والمشتريات والمدفوعات، مع توفير مساحة عمل تفاعلية في الواجهة الأمامية عبر المسار `/accounting/period-close`، مع الحفاظ التام على ثوابت المحاسبة وتأجيل قيد الأرباح المبقاة لهذه المرحلة.
+
+### Completed Commits (Phase 14A)
+
+- `3b8eeb4` — `docs(phase-14a): add period close architecture plan`
+- `1c993d7` — `feat(phase-14a): add period close schema and permissions`
+- `61f4718` — `feat(phase-14a): add period close backend skeleton`
+- `a3fd4b8` — `feat(phase-14a): implement period close validation`
+- `888b957` — `feat(phase-14a): implement period close workflow`
+- `ed1e0d1` — `feat(phase-14a): enforce closed period posting guards`
+- `0bcefb8` — `feat(phase-14a): add fiscal year close guardrails`
+- `0ba1cd9` — `feat(phase-14a): add period close frontend view`
+
+---
+
+### 1. Scope (النطاق المحقق)
+1. **Period close architecture and implementation**: تصميم وبناء الهيكلية المحاسبية والرقابية لإقفال الفترات والسنوات المالية.
+2. **Period close schema and RBAC permissions**: إضافة نماذج قاعدة البيانات وصلاحيات الوصول المخصصة.
+3. **Read-only period close endpoints**: واجهات استعلام لقراءة حالة التواريخ، وسجل الفترات، والسنوات المالية، وسجل التدقيق.
+4. **Period close validation endpoint**: محرك فحص وتحقق استباقي شامل قبل إقفال الفترة (فحص المسودات، توازن القيود، وتوازن ميزان المراجعة).
+5. **Controlled period close and reopen workflow**: سير عمل محكم لإقفال الفترات وإعادة فتحها مع توثيق أسباب الفتح وسجل التدقيق في معاملات ذرية (`$transaction`).
+6. **Closed period posting guards**: حواجز حماية ممركزة على مستوى الخادم تمنع الترحيل داخل الفترات والسنوات المقفلة عبر دفتر الأستاذ العام والمبيعات والمشتريات والمدفوعات.
+7. **Fiscal year close guardrails**: فحص وتحقق وإقفال وإعادة فتح السنوات المالية مع اشتراط إقفال جميع الفترات الداخلية وتوازن حركة السنة.
+8. **Frontend workspace**: مساحة عمل متكاملة للمستخدمين والمدققين على المسار `/accounting/period-close`.
+9. **No retained earnings journal posting**: استبعاد قيد ترحيل الأرباح المبقاة عمداً في هذه المرحلة وتأجيله لمرحلة لاحقة.
+
+---
+
+### 2. Data Model (نموذج البيانات)
+تم إدخال النماذج وحالات الإقفال التالية في مخطط Prisma (`schema.prisma`):
+
+- **`PeriodCloseStatus` (Enum)**:
+  - `OPEN`: الفترة أو السنة المالية مفتوحة ومتاحة للترحيل المحاسبي.
+  - `CLOSING`: جاري الإقفال (تُعامل رقابياً كمعاملة مقفلة وتمنع الترحيل).
+  - `CLOSED`: مقفلة تماماً وتمنع الترحيل والتعديل.
+  - `REOPENED`: أُعيد فتحها بمبرر رقابي ومتاحة للترحيل.
+
+- **`PeriodCloseAuditAction` (Enum)**:
+  - `CLOSE_STARTED` | `CLOSED` | `REOPENED` | `FAILED_VALIDATION`.
+
+- **`PeriodClose` (نموذج إقفال الفترات)**:
+  - `id`: المعرّف الفريد.
+  - `companyId`: معرّف الشركة المستأجرة (عزل تام للمستأجرين).
+  - `fiscalYear` (Int) و `periodNumber` (Int?): السنة المالية ورقم الفترة (1-12).
+  - `periodStart` و `periodEnd` (DateTime): نطاق الفترة بتوقيت UTC.
+  - `status` (`PeriodCloseStatus` @default(OPEN)).
+  - `closedAt`, `closedById`: وقت ومستخدم الإقفال.
+  - `reopenedAt`, `reopenedById`, `reopenReason`: وقت ومستخدم وسبب إعادة الفتح.
+  - `notes`: ملاحظات اختيارية.
+  - الفهرس الفريد: `@@unique([companyId, periodStart, periodEnd])`.
+
+- **`FiscalYearClose` (نموذج إقفال السنوات المالية)**:
+  - `id`: المعرّف الفريد.
+  - `companyId`: معرّف الشركة.
+  - `fiscalYear` (Int): رقم السنة المالية (مثل 2026).
+  - `fiscalYearStart` و `fiscalYearEnd` (DateTime): نطاق السنة المالية.
+  - `status` (`PeriodCloseStatus` @default(OPEN)).
+  - `retainedEarningsJournalEntryId` (String?): حقل معرّف قيد الأرباح المبقاة (موجود في المخطط ويبقى `null` في هذه المرحلة).
+  - `closedAt`, `closedById`, `reopenedAt`, `reopenedById`, `reopenReason`, `notes`.
+  - الفهارس الفريدة: `@@unique([companyId, fiscalYear])` و `@@unique([companyId, fiscalYearStart, fiscalYearEnd])`.
+
+- **`PeriodCloseAuditLog` (سجل التدقيق الرقابي)**:
+  - سجل غير قابل للتعديل يوثق عمليات `CLOSED` و `REOPENED` للفترات والسنوات المالية مع المستخدم المسؤول `actorUserId`، والسبب `reason`، والبيانات الإضافية `metadata` (Json).
+
+- **عزل المستأجرين (Tenant Isolation)**: جميع السجلات معزولة تماماً على مستوى الشركة `companyId` المستخرج حصراً من رمز الـ JWT.
+
+---
+
+### 3. APIs (واجهات برمجة التطبيقات)
+المسارات المتاحة تحت البادئة `/api/accounting/period-close`:
+
+#### أ. واجهات الاستعلام والقراءة (Read-Only):
+- `GET /api/accounting/period-close/status`: فحص حالة تاريخ معين (افتراضياً اليوم) وإرجاع حالة الفترة المحاسبية والسنة المالية وما إذا كان الترحيل متاحاً أو مغلقاً.
+- `GET /api/accounting/period-close/periods`: استعراض سجل الفترات المحاسبية مع إمكانية التصفية بالحالة أو السنة المالية.
+- `GET /api/accounting/period-close/fiscal-years`: استعراض سجل السنوات المالية المسجلة وحالاتها.
+- `GET /api/accounting/period-close/audit-log`: استعراض سجل التدقيق الرقابي للعمليات.
+
+#### ب. واجهات التحقق والفحص (Validation):
+- `POST /api/accounting/period-close/periods/validate`: التحقق المسبق من جاهزية الفترة للإقفال والتأكد من استيفاء الفحوصات المانعة.
+- `POST /api/accounting/period-close/fiscal-years/validate`: التحقق المسبق من جاهزية السنة المالية للإقفال وإرجاع تفاصيل الفحوصات ومجموع المدين والدائن.
+
+#### ج. واجهات سير العمل والتحكم (Workflow):
+- `POST /api/accounting/period-close/periods/close`: إقفال فترة محاسبية محددة وتغيير حالتها إلى `CLOSED` وتوثيق العملية في سجل التدقيق.
+- `POST /api/accounting/period-close/periods/:id/reopen`: إعادة فتح فترة مقفلة وتحويلها إلى `OPEN` مع اشتراط تسجيل سبب إعادة الفتح.
+- `POST /api/accounting/period-close/fiscal-years/close`: إقفال سنة مالية محددة وتغيير حالتها إلى `CLOSED` بعد اجتياز التحقق.
+- `POST /api/accounting/period-close/fiscal-years/:id/reopen`: إعادة فتح سنة مالية مقفلة مع اشتراط تسجيل سبب إعادة الفتح.
+
+---
+
+### 4. RBAC (الأذونات والصلاحيات)
+أذونات مخصصة لوحدة إقفال الفترات مدمجة في نظام الصلاحيات ومصفوفة الأدوار:
+- **`period_close.read`**: استعراض حالة الفترات والسنوات وسجل التدقيق وتشغيل واجهات التحقق المسبق.
+- **`period_close.close`**: صلاحية تنفيذ إقفال الفترات المحاسبية والسنوات المالية.
+- **`period_close.reopen`**: صلاحية إعادة فتح الفترات والسنوات المالية المقفلة.
+
+---
+
+### 5. Validation Behavior (سلوك محرك التحقق)
+
+#### فحوصات إقفال الفترة المحاسبية (`validatePeriod`):
+- `DATE_RANGE_VALID`: التحقق من صحة تواريخ الفترة وتأكيد أن تاريخ النهاية أكبر من أو يساوي البداية (مانع).
+- `NO_EXISTING_CLOSED_OVERLAP`: التأكد من عدم وجود أي فترة أخرى بحالة `CLOSED` أو `CLOSING` تتداخل مع النطاق المطلوب (مانع).
+- `NO_DRAFT_JOURNALS`: التأكد من خلو الفترة من أي مسودات قيود `DRAFT` (يجب ترحيلها أو إلغاؤها قبل الإقفال) (مانع).
+- `POSTED_JOURNALS_BALANCED`: التحقق الدقيق باستخدام `Prisma.Decimal` من توازن كل قيد مرحّل داخل الفترة (مدين = دائن) (مانع).
+- `TRIAL_BALANCE_BALANCED`: تجميع حركات كافة أسطر القيود المرحلة والتأكد من توازن ميزان المراجعة للفترة (مانع).
+- `NO_FAILED_POSTING_EVENTS`: فحص أحداث الترحيل (متخطى `SKIPPED` لعدم وجود سجل أخطاء مستقل).
+- `RECONCILIATION_WARNINGS`: فحص تنبيهات المطابقة البنكية (إعلامي غير مانع).
+
+#### فحوصات إقفال السنة المالية (`validateFiscalYear`):
+- `FISCAL_YEAR_RANGE_VALID`: صحة نطاق تواريخ السنة المالية (مانع).
+- `NO_EXISTING_CLOSED_FISCAL_YEAR_OVERLAP`: عدم وجود سنة مالية أخرى مقفلة تتداخل مع التواريخ (مانع).
+- `ALL_PERIODS_CLOSED`: اشتراط وجود فترات محاسبية داخل نطاق السنة، والتأكد من أن جميع الفترات بالكامل بحالة `CLOSED` (مانع).
+- `NO_DRAFT_JOURNALS_IN_YEAR`: خلو السنة المالية من أي قيود يومية مسودة (مانع).
+- `POSTED_JOURNALS_BALANCED_IN_YEAR`: توازن جميع القيود المرحلة الفردية داخل السنة المالية (مانع).
+- `YEAR_TRIAL_BALANCE_BALANCED`: توازن ميزان المراجعة لكامل حركات السنة المالية (مانع).
+- `RETAINED_EARNINGS_POSTING_SKIPPED`: إشعار بتخطي قيد الأرباح المبقاة (إعلامي غير مانع `SKIPPED`).
+
+---
+
+### 6. Posting Guard Behavior (حواجز منع الترحيل المحاسبي)
+دالة الحماية الممركزة `assertPeriodIsOpen(companyId, entryDate, context?, txClient?)`:
+- تفحص أولاً جدول `PeriodClose`: إذا وجد سجل بحالة `CLOSED` أو `CLOSING` يغطي تاريخ المعاملة، ترفض العملية برمز خطأ `409 Conflict` وتوضح أن المنع ناتج عن فترة محاسبية مقفلة.
+- تفحص ثانياً جدول `FiscalYearClose`: إذا وجد سجل بحالة `CLOSED` أو `CLOSING` يغطي تاريخ المعاملة، ترفض العملية برمز خطأ `409 Conflict` وتوضح أن المنع ناتج عن سنة مالية مقفلة.
+- الحماية مفروضة تلقائياً عبر المعاملات التالية:
+  - إنشاء قيود اليومية اليدوية (`create manual journal entry`).
+  - تعديل قيود اليومية اليدوية وتعديل تواريخها (`update manual journal entry`).
+  - ترحيل قيود اليومية اليدوية (`post manual journal entry`).
+  - إلغاء قيود اليومية اليدوية (`cancel manual journal entry`).
+  - ترحيل فواتير المبيعات الصادرة تلقائياً (`sales invoice issue`).
+  - ترحيل فواتير المشتريات المستلمة تلقائياً (`purchase invoice receive`).
+  - ترحيل سندات قبض العملاء (`AR payment`).
+  - ترحيل سندات صرف الموردين (`AP payment`).
+- **العمليات المسموحة**: استعراض التقارير والقوائم المالية يظل متاحاً للقراءة، وعمليات استيراد ومطابقة وإلغاء مطابقة كشوف الحسابات البنكية تظل متاحة لأنها لا تولد قيوداً في دفتر الأستاذ العام.
+
+---
+
+### 7. Frontend Workspace (واجهة المستخدم لإقفال الفترات)
+مسار الصفحة: `/accounting/period-close`
+- **حماية الصلاحيات**: تشترط صلاحية `period_close.read` لعرض الصفحة، مع إظهار بطاقة توجيهية واضحة للمستخدمين غير المصرح لهم.
+- **مفتش الحالة الفورية (Current Status Inspector)**: اختيار أي تاريخ لمعرفة هل الفترة أو السنة المالية مفتوحة أو مقفلة وهل الترحيل مسموح أو محظور.
+- **لوحة الفترات المحاسبية (Periods Tab)**:
+  - نموذج إدخال تواريخ وملاحظات الفترة.
+  - زر الفحص والتحقق (`Validate`) مع جدول تفصيلي بحالات الفحوصات ومجموع المدين والدائن.
+  - زر الإقفال (`Close Period`) مقيد بصلاحية `period_close.close` ومحمي بتأكيد المستخدم.
+  - جدول الفترات المحاسبية السابقة مع شارات الحالة وتفاصيل الإقفال.
+  - زر إعادة فتح الفترة (`Reopen`) مقيد بصلاحية `period_close.reopen` ويفتح نافذة تطلب تسبيب مبرر الفتح.
+- **لوحة السنوات المالية (Fiscal Years Tab)**:
+  - نموذج إقفال السنة المالية مع إشعار صريح باستبعاد قيد الأرباح المبقاة.
+  - زر التحقق من السنة المالية وعرض توازن السنة بالكامل.
+  - زر إقفال السنة المالية مقيد بالصلاحيات وتأكيد المستخدم.
+  - جدول السنوات المالية مع إمكانية إعادة الفتح بمبرر رقابي.
+- **لوحة سجل التدقيق (Audit Trail Tab)**:
+  - استعراض زمني غير قابل للتعديل لكافة عمليات الإقفال وإعادة الفتح مع المستخدم والسبب والبيانات الوصفية.
+- **روابط التنقل المحاسبي**: روابط سريعة للقوائم المالية `/accounting/reports`، والمطابقة البنكية، ودليل الحسابات، ولوحة التحكم.
+
+---
+
+### 8. Accounting Invariants (الثوابت المحاسبية الصارمة)
+- **عدم إنشاء قيد أرباح مبقاة**: لا يتم إنشاء أي قيد لترحيل الأرباح المبقاة (`retainedEarningsJournalEntryId` يبقى `null`).
+- **عدم تعديل القيود القائمة**: لا يتم تعديل أو كتابة أي أسطر قيود بصورة صامتة؛ الحواجز تمنع الترحيل قبل بدء المعاملة المصرفية وترفضه بـ 409 Conflict.
+- **استقلالية حالة الدفعات**: لا تُستخدم حالة الدفعة `Payment.status` لتمثيل حالة الإقفال وتظل مستقلة تماماً.
+- **استقلالية المطابقة البنكية**: لا تؤثر عمليات المطابقة البنكية على دفتر الأستاذ ولا تتأثر بحواجز إقفال الفترات.
+- **التعامل الصارم مع العمليات النقدية**: العمليات الحسابية في الـ Backend تعتمد حصراً على `Prisma.Decimal`، وتُعرض في الـ Frontend كسلاسل نصية منسقة دون استخدام دالة `Number()` في الحسابات المحاسبية.
+
+---
+
+### 9. Verification Summary (سجل التحقق المعتمد)
+- **Prisma Client Generate**: **PASS** (`Prisma Client v5.22.0`).
+- **Backend Build (`pnpm --filter @erp/backend build`)**: **PASS** (NestJS compiled successfully).
+- **Backend E2E Tests (`pnpm --filter @erp/backend test:e2e`)**: **PASS = 207/207 tests** عبر مجموعتي الاختبار (`reports.e2e-spec.ts` و `app.e2e-spec.ts`).
+- **Frontend Build (`pnpm --filter @erp/frontend build`)**: **PASS** (Next.js compiled with 19 static routes including `○ /accounting/period-close`).
+- **حالة شجرة العمل (Working Tree)**: نظيفة ومستقرة تماماً خلال التحقق النهائي في المرحلة 14A-D-1.
+
+---
+
+### 10. Out of Scope (خارج النطاق ومؤجل للمراحل القادمة)
+- ❌ **قيد إقفال الأرباح المبقاة الآلي (Automated Retained Earnings Closing Entry)**.
+- ❌ **إقفال المخزون الدوري (Inventory Period Close)**.
+- ❌ **إقفال الرواتب ومسيرات الأجور (Payroll Close)**.
+- ❌ **الإقرارات الضريبية والفوترة الإلكترونية لهيئة الزكاة (Tax / ZATCA Filing)**.
+- ❌ **إعادة تقييم العملات الأجنبية (Multi-Currency Revaluation)**.
+- ❌ **الترحيل الآلي للرسوم البنكية (Bank Fee Auto-Posting)**.
+- ❌ **التحقق الذكي بالذكاء الاصطناعي (AI Validation)**.
+- ❌ **تصدير التقارير إلى PDF أو Excel**.
+- ❌ **أي تعديلات على إعدادات النشر السحابي أو البنية التحتية (Deployment changes)**.
+- ❌ **أي تعديلات على الـ schema أو الـ RBAC بعد المرحلة 14A-B-1**.
+
+
 
