@@ -57,7 +57,7 @@ import { UpdatePurchaseInvoiceDto } from './dto/update-purchase-invoice.dto';
 import { PurchaseInvoiceQueryDto } from './dto/purchase-invoice-query.dto';
 import { ReceivePurchaseInvoiceDto } from './dto/receive-purchase-invoice.dto';
 import { CancelPurchaseInvoiceDto } from './dto/cancel-purchase-invoice.dto';
-import { postPurchaseInvoiceReceived } from '../accounting/posting-events';
+import { postPurchaseInvoiceReceived, assertPeriodIsOpen } from '../accounting/posting-events';
 
 const INVOICE_FIELDS = {
   id: true,
@@ -784,6 +784,7 @@ export class PurchasesService {
       // Flip status RECEIVED + receivedAt / receivedBy / receivedDate.
       const receivedAt = new Date();
       const purchaseDate = dto.purchaseDate ? new Date(dto.purchaseDate) : receivedAt;
+      await assertPeriodIsOpen(tx, companyId, purchaseDate, 'purchase invoice receive');
       const finalNotes = dto.notes ?? invoice.notes ?? null;
 
       const updated = await tx.purchaseInvoice.update({

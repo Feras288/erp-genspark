@@ -24,6 +24,7 @@ import {
 import { assertBalancedLines, omitZeroAmountLines } from '../decimal';
 import { buildSalesInvoiceIssuedTemplate } from '../sales-invoice-issued.template';
 import type { SalesInvoiceIssuedSource } from '../types';
+import { assertPeriodIsOpen } from '../../period-close/period-close.service';
 
 const SOURCE_TYPE = JournalEntrySourceType.SALES_INVOICE;
 
@@ -111,6 +112,13 @@ export async function postSalesInvoiceIssued(
   });
 
   const postedAt = new Date();
+  await assertPeriodIsOpen(
+    tx,
+    args.companyId,
+    postedAt,
+    'sales invoice issue auto-posting',
+  );
+
   const createWithEntryNumber = (entryNumber: string) =>
     tx.journalEntry.create({
       data: {

@@ -39,6 +39,7 @@ import { CreateJournalEntryDto } from './dto/create-journal-entry.dto';
 import { UpdateJournalEntryDto } from './dto/update-journal-entry.dto';
 import { PostJournalEntryDto } from './dto/post-journal-entry.dto';
 import { CancelJournalEntryDto } from './dto/cancel-journal-entry.dto';
+import { PeriodCloseService } from './period-close/period-close.service';
 
 const ACCOUNT_SELECT = {
   id: true,
@@ -99,6 +100,7 @@ export class AccountingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly periodCloseService: PeriodCloseService,
   ) {}
 
   // ===================================================
@@ -594,12 +596,14 @@ export class AccountingService {
         );
       }
       const entryNumber = await this.generateEntryNumber(tx, companyId);
+      const effectiveEntryDate = dto.entryDate ? new Date(dto.entryDate) : new Date();
+      await this.periodCloseService.assertPeriodIsOpen(companyId, effectiveEntryDate, 'create manual journal entry', tx);
       const entry = await tx.journalEntry.create({
         data: {
           companyId,
           entryNumber,
           status: JournalEntryStatus.DRAFT,
-          entryDate: dto.entryDate ? new Date(dto.entryDate) : new Date(),
+          entryDate: effectiveEntryDate,
           description: dto.description ?? null,
           reference: dto.reference ?? null,
           notes: dto.notes ?? null,
@@ -637,13 +641,17 @@ export class AccountingService {
     return this.prisma.$transaction(async (tx) => {
       const existing = await tx.journalEntry.findFirst({
         where: { id, companyId },
-        select: { id: true, status: true },
+        select: { id: true, status: true, entryDate: true },
       });
       if (!existing) throw new NotFoundException('Journal entry not found');
       if (existing.status !== JournalEntryStatus.DRAFT) {
         throw new ConflictException(
           `Cannot edit a ${existing.status} journal entry`,
         );
+      }
+      await this.periodCloseService.assertPeriodIsOpen(companyId, existing.entryDate, 'update manual journal entry', tx);
+      if (typeof dto.entryDate === 'string' && dto.entryDate) {
+        await this.periodCloseService.assertPeriodIsOpen(companyId, new Date(dto.entryDate), 'update manual journal entry date', tx);
       }
       if (Array.isArray(dto.lines)) {
         const accounts = this.validateLinesShape(
@@ -724,7 +732,7 @@ export class AccountingService {
     return this.prisma.$transaction(async (tx) => {
       const entry = await tx.journalEntry.findFirst({
         where: { id, companyId },
-        select: { id: true, status: true, totalDebit: true, totalCredit: true },
+        select: { id: true, status: true, totalDebit: true, totalCredit: true, entryDate: true },
       });
       // Tenant guard: implied by `{ id, companyId }` filter above.
       // companyId is sourced from the JWT only — never from the URL or body.
@@ -737,13 +745,15 @@ export class AccountingService {
           'Entry is not balanced — cannot post',
         );
       }
+      const effectiveEntryDate = dto.entryDate ? new Date(dto.entryDate) : entry.entryDate;
+      await this.periodCloseService.assertPeriodIsOpen(companyId, effectiveEntryDate, 'post manual journal entry', tx);
       const updated = await tx.journalEntry.update({
         where: { id: entry.id },
         data: {
           status: JournalEntryStatus.POSTED,
           postedAt: new Date(),
           postedBy: { connect: { id: userId } },
-          entryDate: dto.entryDate ? new Date(dto.entryDate) : undefined,
+          entryDate: effectiveEntryDate,
           notes: dto.notes ?? undefined,
           updatedBy: { connect: { id: userId } },
         },
@@ -773,7 +783,7 @@ export class AccountingService {
     return this.prisma.$transaction(async (tx) => {
       const entry = await tx.journalEntry.findFirst({
         where: { id, companyId },
-        select: { id: true, status: true },
+        select: { id: true, status: true, entryDate: true },
       });
       // Tenant guard: implied by `{ id, companyId }` filter above.
       // companyId comes from the JWT only (no companyId from URL/body).
@@ -790,6 +800,7 @@ export class AccountingService {
       //                 generated in this phase. `REVERSED` enum remains
       //                 deferred to a later additive phase.
       this.ensureJournalEntryCanCancel(entry);
+      await this.periodCloseService.assertPeriodIsOpen(companyId, entry.entryDate, 'cancel manual journal entry', tx);
       const updated = await tx.journalEntry.update({
         where: { id: entry.id },
         data: {

@@ -34,3 +34,4 @@ export type {
   PurchaseInvoiceReceivedSource,
   SalesInvoiceIssuedSource,
 } from './types';
+export { assertPeriodIsOpen } from '../period-close/period-close.service';

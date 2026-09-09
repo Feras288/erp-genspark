@@ -39,7 +39,7 @@ import { UpdateSalesInvoiceDto } from './dto/update-sales-invoice.dto';
 import { SalesInvoiceQueryDto } from './dto/sales-invoice-query.dto';
 import { IssueSalesInvoiceDto } from './dto/issue-sales-invoice.dto';
 import { CancelSalesInvoiceDto } from './dto/cancel-sales-invoice.dto';
-import { postSalesInvoiceIssued } from '../accounting/posting-events';
+import { postSalesInvoiceIssued, assertPeriodIsOpen } from '../accounting/posting-events';
 
 const INVOICE_FIELDS = {
   id: true,
@@ -764,6 +764,7 @@ export class SalesService {
       // Flip status ISSUED + issuedAt/By/Date.
       const issuedAt = new Date();
       const issueDate = dto.issueDate ? new Date(dto.issueDate) : issuedAt;
+      await assertPeriodIsOpen(tx, companyId, issueDate, 'sales invoice issue');
       const finalNotes = dto.notes ?? invoice.notes ?? null;
 
       const updated = await tx.salesInvoice.update({

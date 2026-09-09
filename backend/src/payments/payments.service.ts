@@ -83,6 +83,7 @@ import type { PaymentsQueryDto } from './dto/payments-query.dto';
 import {
   postApPaymentPosted,
   postArPaymentPosted,
+  assertPeriodIsOpen,
 } from '../accounting/posting-events';
 
 // ---------------------------------------------------------------------
@@ -287,12 +288,15 @@ export class PaymentsService {
       // 4. INSERT Payment — invoiceType=SALES, salesInvoiceId=explicit,
       //    purchaseInvoiceId=null (exactly-one-FK CHECK enforced at DB
       //    level — Phase 10A-B-1 migration adds the constraint).
+      const effectivePaidAt = dto.paidAt ? new Date(dto.paidAt) : new Date();
+      await assertPeriodIsOpen(tx, companyId, effectivePaidAt, 'AR payment');
+
       const payment = await tx.payment.create({
         data: {
           companyId,
           paymentMethod: dto.paymentMethod,
           amount: requested,
-          paidAt: dto.paidAt ? new Date(dto.paidAt) : new Date(),
+          paidAt: effectivePaidAt,
           reference: dto.reference ?? null,
           notes: dto.notes ?? null,
           salesInvoiceId: invoiceId,
@@ -490,12 +494,15 @@ export class PaymentsService {
 
       // 4. INSERT Payment — invoiceType=PURCHASE, purchaseInvoiceId=explicit,
       //    salesInvoiceId=null. Exactly-one-FK CHECK enforced at DB level.
+      const effectivePaidAt = dto.paidAt ? new Date(dto.paidAt) : new Date();
+      await assertPeriodIsOpen(tx, companyId, effectivePaidAt, 'AP payment');
+
       const payment = await tx.payment.create({
         data: {
           companyId,
           paymentMethod: dto.paymentMethod,
           amount: requested,
-          paidAt: dto.paidAt ? new Date(dto.paidAt) : new Date(),
+          paidAt: effectivePaidAt,
           reference: dto.reference ?? null,
           notes: dto.notes ?? null,
           salesInvoiceId: null,

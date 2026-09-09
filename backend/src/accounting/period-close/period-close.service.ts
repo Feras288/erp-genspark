@@ -58,9 +58,109 @@ function parseDateEndUtc(dateStr?: string | null): Date | null {
   return new Date(`${yyyy}-${mm}-${dd}T23:59:59.999Z`);
 }
 
+/**
+ * Period Close Guard:
+ * Asserts that entryDate does not fall within any PeriodClose row with status CLOSED or CLOSING.
+ * Throws ConflictException (HTTP 409) if closed/closing.
+ * Read-only, zero database mutations.
+ */
+export async function assertPeriodIsOpen(
+  prisma: {
+    periodClose: {
+      findFirst: (args: {
+        where: {
+          companyId: string;
+          status: { in: PeriodCloseStatus[] };
+          periodStart: { lte: Date };
+          periodEnd: { gte: Date };
+        };
+        select: {
+          id: true;
+          periodStart: true;
+          periodEnd: true;
+          status: true;
+          fiscalYear: true;
+          periodNumber: true;
+        };
+      }) => Promise<{
+        id: string;
+        periodStart: Date;
+        periodEnd: Date;
+        status: PeriodCloseStatus;
+        fiscalYear: number;
+        periodNumber: number | null;
+      } | null>;
+    };
+  },
+  companyId: string,
+  entryDate: Date | string,
+  context?: string,
+): Promise<void> {
+  let targetDate: Date;
+  if (typeof entryDate === 'string') {
+    targetDate = new Date(entryDate);
+  } else {
+    targetDate = entryDate;
+  }
+
+  if (!targetDate || isNaN(targetDate.getTime())) {
+    throw new BadRequestException(
+      'Invalid entry date provided for period close check',
+    );
+  }
+
+  const closedPeriod = await prisma.periodClose.findFirst({
+    where: {
+      companyId,
+      status: { in: [PeriodCloseStatus.CLOSED, PeriodCloseStatus.CLOSING] },
+      periodStart: { lte: targetDate },
+      periodEnd: { gte: targetDate },
+    },
+    select: {
+      id: true,
+      periodStart: true,
+      periodEnd: true,
+      status: true,
+      fiscalYear: true,
+      periodNumber: true,
+    },
+  });
+
+  if (closedPeriod) {
+    const startStr = closedPeriod.periodStart.toISOString().slice(0, 10);
+    const endStr = closedPeriod.periodEnd.toISOString().slice(0, 10);
+    const contextMsg = context ? ` (${context})` : '';
+    throw new ConflictException(
+      `Cannot post or modify accounting records${contextMsg}: Date ${targetDate
+        .toISOString()
+        .slice(0, 10)} falls within a ${closedPeriod.status} period (${startStr} to ${endStr}).`,
+    );
+  }
+}
+
 @Injectable()
 export class PeriodCloseService {
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Period Close Guard:
+   * Asserts that entryDate does not fall within any PeriodClose row with status CLOSED or CLOSING.
+   * Throws ConflictException (HTTP 409) if closed/closing.
+   * Read-only, zero database mutations.
+   */
+  async assertPeriodIsOpen(
+    companyId: string,
+    entryDate: Date | string,
+    context?: string,
+    txClient?: Prisma.TransactionClient,
+  ): Promise<void> {
+    return assertPeriodIsOpen(
+      txClient ?? this.prisma,
+      companyId,
+      entryDate,
+      context,
+    );
+  }
 
   /**
    * 1. GET status for a specific date (defaults to current date UTC).

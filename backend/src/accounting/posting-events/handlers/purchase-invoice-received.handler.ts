@@ -24,6 +24,7 @@ import {
 import { assertBalancedLines, omitZeroAmountLines } from '../decimal';
 import { buildPurchaseInvoiceReceivedTemplate } from '../purchase-invoice-received.template';
 import type { PurchaseInvoiceReceivedSource } from '../types';
+import { assertPeriodIsOpen } from '../../period-close/period-close.service';
 
 const SOURCE_TYPE = JournalEntrySourceType.PURCHASE_INVOICE;
 
@@ -111,6 +112,13 @@ export async function postPurchaseInvoiceReceived(
   });
 
   const postedAt = new Date();
+  await assertPeriodIsOpen(
+    tx,
+    args.companyId,
+    postedAt,
+    'purchase invoice receive auto-posting',
+  );
+
   const createWithEntryNumber = (entryNumber: string) =>
     tx.journalEntry.create({
       data: {

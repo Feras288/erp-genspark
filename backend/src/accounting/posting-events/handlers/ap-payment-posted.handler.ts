@@ -24,6 +24,7 @@ import {
 import { assertBalancedLines, omitZeroAmountLines } from '../decimal';
 import { buildApPaymentPostedTemplate } from '../ap-payment-posted.template';
 import type { ApPaymentPostedSource } from '../types';
+import { assertPeriodIsOpen } from '../../period-close/period-close.service';
 
 const SOURCE_TYPE = JournalEntrySourceType.AP_PAYMENT;
 
@@ -111,6 +112,13 @@ export async function postApPaymentPosted(
   });
 
   const postedAt = new Date();
+  await assertPeriodIsOpen(
+    tx,
+    args.companyId,
+    postedAt,
+    'AP payment auto-posting',
+  );
+
   const createWithEntryNumber = (entryNumber: string) =>
     tx.journalEntry.create({
       data: {
