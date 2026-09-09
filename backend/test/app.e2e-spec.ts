@@ -17,7 +17,7 @@ import request from 'supertest';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { AppModule } from '../src/app.module';
-import { JournalEntrySourceType, Prisma } from '@prisma/client';
+import { JournalEntrySourceType, JournalEntryStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../src/database/prisma.service';
 import {
   postApPaymentPosted,
@@ -3751,6 +3751,454 @@ describe('Phase 11B-B-5: AP Payment POSTED auto-post (e2e smoke)', () => {
     expect(owned?.id).toBe(journalId);
     expect(owned?.sourceType).toBe(JournalEntrySourceType.AP_PAYMENT);
     expect(owned?.sourceId).toBe(paymentId);
+  });
+});
+
+// =====================================================
+// Phase 11B-B-6: GL posting consolidation (e2e)
+//
+// End-to-end coverage proving all four real posting flows
+// work together and remain balanced and idempotent:
+//   1. SALES_INVOICE (sales invoice issue)
+//   2. PURCHASE_INVOICE (purchase invoice receive)
+//   3. AR_PAYMENT (sales payment register)
+//   4. AP_PAYMENT (purchase payment register)
+// =====================================================
+describe('Phase 11B-B-6: GL posting consolidation (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+  let consolToken: string;
+  let companyId: string;
+  let consolUserId: string;
+  let prisma: PrismaService;
+
+  const unique = Date.now().toString(36);
+  const SKU_SVC = `GL11B-C-SVC-${unique}`;
+  const CUST_CODE = `GL11B-C-CUST-${unique}`;
+  const SUPP_CODE = `GL11B-C-SUPP-${unique}`;
+  const AR_PAYMENT_AMOUNT = '50.0000';
+  const AP_PAYMENT_AMOUNT = '40.0000';
+  const AR_PAYMENT_REF = `REF-AR-CONSOL-${unique}`;
+  const AP_PAYMENT_REF = `REF-AP-CONSOL-${unique}`;
+
+  let salesInvoiceId = '';
+  let purchaseInvoiceId = '';
+  let arPaymentId = '';
+  let apPaymentId = '';
+
+  const REQUIRED_MAPPING_CODES = new Set([
+    'AR_CONTROL',
+    'AP_CONTROL',
+    'CASH_OR_BANK',
+    'SALES_REVENUE',
+    'INVENTORY_OR_EXPENSE',
+    'VAT_OUTPUT',
+    'VAT_INPUT',
+    'SALES_DISCOUNTS',
+  ]);
+
+  async function loadConsolidatedJournals() {
+    return prisma.journalEntry.findMany({
+      where: {
+        companyId,
+        sourceId: {
+          in: [salesInvoiceId, purchaseInvoiceId, arPaymentId, apPaymentId],
+        },
+      },
+      include: { lines: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+    prisma = app.get(PrismaService);
+
+    // 1. Admin login
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+    companyId = login.body.user.companyId;
+    expect(companyId).toBeTruthy();
+
+    // 2. Setup consolidation agent with payments permissions
+    const consolRoleKey = `consol_post_role_${unique}`;
+    const consolRole = await prisma.role.create({
+      data: {
+        companyId,
+        key: consolRoleKey,
+        name: 'GL Consolidation E2E Role',
+      },
+    });
+
+    const paymentPerms = await prisma.permission.findMany({
+      where: {
+        key: {
+          in: [
+            'ar_payments.read',
+            'ar_payments.write',
+            'ap_payments.read',
+            'ap_payments.write',
+          ],
+        },
+      },
+    });
+    for (const p of paymentPerms) {
+      await prisma.rolePermission.create({
+        data: { roleId: consolRole.id, permissionId: p.id },
+      });
+    }
+
+    const consolUserEmail = `consol-agent-${unique}@example.sa`;
+    const createdUser = await request(http)
+      .post(`${API_PREFIX}/users`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        email: consolUserEmail,
+        password: 'ConsolAgent@123',
+        fullName: 'Consolidation Auto-post Agent',
+        roleKeys: [consolRoleKey],
+      });
+    expect(createdUser.status).toBe(201);
+
+    const consolLogin = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: consolUserEmail, password: 'ConsolAgent@123' });
+    expect(consolLogin.status).toBe(200);
+    consolToken = consolLogin.body.accessToken;
+    consolUserId = consolLogin.body.user.id;
+
+    // 3. Create customer and supplier partners
+    const customer = await request(http)
+      .post(`${API_PREFIX}/partners`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: CUST_CODE,
+        name: 'Consolidation Customer',
+        type: 'CUSTOMER',
+      });
+    expect(customer.status).toBe(201);
+
+    const supplier = await request(http)
+      .post(`${API_PREFIX}/partners`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: SUPP_CODE,
+        name: 'Consolidation Supplier',
+        type: 'SUPPLIER',
+      });
+    expect(supplier.status).toBe(201);
+
+    // 4. Create product
+    const product = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        sku: SKU_SVC,
+        name: 'Consolidation Service Product',
+        type: 'SERVICE',
+      });
+    expect(product.status).toBe(201);
+
+    // 5. Create and issue Sales Invoice (flow 1: SALES_INVOICE)
+    const createdSalesInvoice = await request(http)
+      .post(`${API_PREFIX}/sales/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        customerId: customer.body.id,
+        notes: 'Consolidation sales invoice fixture',
+        lines: [
+          {
+            productId: product.body.id,
+            quantity: '2.0000',
+            unitPrice: '100.0000',
+            discountAmount: '10.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(createdSalesInvoice.status).toBe(201);
+    salesInvoiceId = createdSalesInvoice.body.id;
+
+    const issuedSales = await request(http)
+      .post(`${API_PREFIX}/sales/invoices/${salesInvoiceId}/issue`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'issue sales invoice in consolidation' });
+    expect(issuedSales.status).toBe(201);
+    expect(issuedSales.body.status).toBe('ISSUED');
+
+    // 6. Create and receive Purchase Invoice (flow 2: PURCHASE_INVOICE)
+    const createdPurchaseInvoice = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        supplierId: supplier.body.id,
+        notes: 'Consolidation purchase invoice fixture',
+        lines: [
+          {
+            productId: product.body.id,
+            quantity: '2.0000',
+            unitCost: '80.0000',
+            discountAmount: '10.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(createdPurchaseInvoice.status).toBe(201);
+    purchaseInvoiceId = createdPurchaseInvoice.body.id;
+
+    const receivedPurchase = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices/${purchaseInvoiceId}/receive`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'receive purchase invoice in consolidation' });
+    expect(receivedPurchase.status).toBe(201);
+    expect(receivedPurchase.body.status).toBe('RECEIVED');
+
+    // 7. Register AR Payment (flow 3: AR_PAYMENT)
+    const arPaymentRes = await request(http)
+      .post(`${API_PREFIX}/sales-invoices/${salesInvoiceId}/payments`)
+      .set('Authorization', `Bearer ${consolToken}`)
+      .send({
+        amount: AR_PAYMENT_AMOUNT,
+        paymentMethod: 'CASH',
+        reference: AR_PAYMENT_REF,
+        idempotencyKey: `idemp-ar-c-${unique}`,
+      });
+    expect(arPaymentRes.status).toBe(201);
+    expect(arPaymentRes.body.status).toBe('POSTED');
+    arPaymentId = arPaymentRes.body.id;
+
+    // 8. Register AP Payment (flow 4: AP_PAYMENT)
+    const apPaymentRes = await request(http)
+      .post(`${API_PREFIX}/purchase-invoices/${purchaseInvoiceId}/payments`)
+      .set('Authorization', `Bearer ${consolToken}`)
+      .send({
+        amount: AP_PAYMENT_AMOUNT,
+        paymentMethod: 'TRANSFER',
+        reference: AP_PAYMENT_REF,
+        idempotencyKey: `idemp-ap-c-${unique}`,
+      });
+    expect(apPaymentRes.status).toBe(201);
+    expect(apPaymentRes.body.status).toBe('POSTED');
+    apPaymentId = apPaymentRes.body.id;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('11B-B-6.1) all four sourceTypes exist in JournalEntry', async () => {
+    const entries = await loadConsolidatedJournals();
+    expect(entries).toHaveLength(4);
+
+    const sourceTypes = entries.map((e) => e.sourceType);
+    expect(sourceTypes).toContain(JournalEntrySourceType.SALES_INVOICE);
+    expect(sourceTypes).toContain(JournalEntrySourceType.PURCHASE_INVOICE);
+    expect(sourceTypes).toContain(JournalEntrySourceType.AR_PAYMENT);
+    expect(sourceTypes).toContain(JournalEntrySourceType.AP_PAYMENT);
+
+    const bySourceType = new Map(entries.map((e) => [e.sourceType, e]));
+    expect(bySourceType.get(JournalEntrySourceType.SALES_INVOICE)?.sourceId).toBe(salesInvoiceId);
+    expect(bySourceType.get(JournalEntrySourceType.PURCHASE_INVOICE)?.sourceId).toBe(purchaseInvoiceId);
+    expect(bySourceType.get(JournalEntrySourceType.AR_PAYMENT)?.sourceId).toBe(arPaymentId);
+    expect(bySourceType.get(JournalEntrySourceType.AP_PAYMENT)?.sourceId).toBe(apPaymentId);
+  });
+
+  it('11B-B-6.2) every generated GL posting is POSTED', async () => {
+    const entries = await loadConsolidatedJournals();
+    expect(entries).toHaveLength(4);
+
+    for (const entry of entries) {
+      expect(entry.status).toBe(JournalEntryStatus.POSTED);
+      expect(entry.postedAt).toBeTruthy();
+      expect(entry.postedById).toBeTruthy();
+      expect(entry.companyId).toBe(companyId);
+    }
+  });
+
+  it('11B-B-6.3) every generated GL posting is balanced (totalDebit === totalCredit)', async () => {
+    const entries = await loadConsolidatedJournals();
+    expect(entries).toHaveLength(4);
+
+    for (const entry of entries) {
+      const td = new Prisma.Decimal(entry.totalDebit);
+      const tc = new Prisma.Decimal(entry.totalCredit);
+      expect(td.equals(tc)).toBe(true);
+      expect(td.gt(0)).toBe(true);
+
+      let sumDebit = new Prisma.Decimal(0);
+      let sumCredit = new Prisma.Decimal(0);
+      for (const line of entry.lines) {
+        sumDebit = sumDebit.add(new Prisma.Decimal(line.debit));
+        sumCredit = sumCredit.add(new Prisma.Decimal(line.credit));
+      }
+      expect(sumDebit.equals(sumCredit)).toBe(true);
+      expect(sumDebit.equals(td)).toBe(true);
+    }
+  });
+
+  it('11B-B-6.4) source uniqueness holds (no duplicate JournalEntry for same companyId/sourceType/sourceId)', async () => {
+    const sources = [
+      { type: JournalEntrySourceType.SALES_INVOICE, id: salesInvoiceId },
+      { type: JournalEntrySourceType.PURCHASE_INVOICE, id: purchaseInvoiceId },
+      { type: JournalEntrySourceType.AR_PAYMENT, id: arPaymentId },
+      { type: JournalEntrySourceType.AP_PAYMENT, id: apPaymentId },
+    ];
+
+    // Verify exactly one entry per (companyId, sourceType, sourceId)
+    for (const s of sources) {
+      const count = await prisma.journalEntry.count({
+        where: {
+          companyId,
+          sourceType: s.type,
+          sourceId: s.id,
+        },
+      });
+      expect(count).toBe(1);
+    }
+
+    // Direct database uniqueness constraint violation check
+    await expect(
+      prisma.journalEntry.create({
+        data: {
+          companyId,
+          entryNumber: `DUP-CONSOL-${unique}`,
+          status: JournalEntryStatus.POSTED,
+          entryDate: new Date(),
+          totalDebit: new Prisma.Decimal('10.0000'),
+          totalCredit: new Prisma.Decimal('10.0000'),
+          sourceType: JournalEntrySourceType.SALES_INVOICE,
+          sourceId: salesInvoiceId,
+        },
+      }),
+    ).rejects.toThrow();
+
+    // Idempotent handler calls all return reused: true
+    await prisma.$transaction(async (tx) => {
+      const arResult = await postArPaymentPosted(tx, {
+        companyId,
+        userId: consolUserId,
+        payment: {
+          id: arPaymentId,
+          amount: AR_PAYMENT_AMOUNT,
+          paymentMethod: 'CASH',
+          salesInvoiceId,
+          reference: AR_PAYMENT_REF,
+        },
+      });
+      expect(arResult.reused).toBe(true);
+
+      const apResult = await postApPaymentPosted(tx, {
+        companyId,
+        userId: consolUserId,
+        payment: {
+          id: apPaymentId,
+          amount: AP_PAYMENT_AMOUNT,
+          paymentMethod: 'TRANSFER',
+          purchaseInvoiceId,
+          reference: AP_PAYMENT_REF,
+        },
+      });
+      expect(apResult.reused).toBe(true);
+    });
+  });
+
+  it('11B-B-6.5) account codes used are from required mapping only', async () => {
+    const entries = await loadConsolidatedJournals();
+    expect(entries).toHaveLength(4);
+
+    const accountIds = new Set<string>();
+    for (const entry of entries) {
+      for (const line of entry.lines) {
+        if (line.debitAccountId) accountIds.add(line.debitAccountId);
+        if (line.creditAccountId) accountIds.add(line.creditAccountId);
+      }
+    }
+
+    const accounts = await prisma.account.findMany({
+      where: { id: { in: [...accountIds] } },
+      select: { id: true, code: true },
+    });
+    expect(accounts.length).toBeGreaterThan(0);
+
+    for (const acc of accounts) {
+      expect(REQUIRED_MAPPING_CODES.has(acc.code)).toBe(true);
+    }
+
+    const bySourceType = new Map(entries.map((e) => [e.sourceType, e]));
+    const accountCodeById = new Map(accounts.map((a) => [a.id, a.code]));
+
+    // Check specific required account codes per flow
+    const salesLinesCodes = bySourceType
+      .get(JournalEntrySourceType.SALES_INVOICE)!
+      .lines.map((l) => accountCodeById.get(l.debitAccountId ?? l.creditAccountId!));
+    expect(salesLinesCodes).toContain('AR_CONTROL');
+    expect(salesLinesCodes).toContain('SALES_REVENUE');
+    expect(salesLinesCodes).toContain('VAT_OUTPUT');
+    expect(salesLinesCodes).toContain('SALES_DISCOUNTS');
+
+    const purchaseLinesCodes = bySourceType
+      .get(JournalEntrySourceType.PURCHASE_INVOICE)!
+      .lines.map((l) => accountCodeById.get(l.debitAccountId ?? l.creditAccountId!));
+    expect(purchaseLinesCodes).toContain('INVENTORY_OR_EXPENSE');
+    expect(purchaseLinesCodes).toContain('VAT_INPUT');
+    expect(purchaseLinesCodes).toContain('AP_CONTROL');
+
+    const arLinesCodes = bySourceType
+      .get(JournalEntrySourceType.AR_PAYMENT)!
+      .lines.map((l) => accountCodeById.get(l.debitAccountId ?? l.creditAccountId!));
+    expect(arLinesCodes).toContain('CASH_OR_BANK');
+    expect(arLinesCodes).toContain('AR_CONTROL');
+
+    const apLinesCodes = bySourceType
+      .get(JournalEntrySourceType.AP_PAYMENT)!
+      .lines.map((l) => accountCodeById.get(l.debitAccountId ?? l.creditAccountId!));
+    expect(apLinesCodes).toContain('AP_CONTROL');
+    expect(apLinesCodes).toContain('CASH_OR_BANK');
+  });
+
+  it('11B-B-6.6) tenant isolation holds for all consolidated postings', async () => {
+    const entries = await loadConsolidatedJournals();
+    expect(entries).toHaveLength(4);
+
+    for (const entry of entries) {
+      // 1. Unauthenticated read => 401
+      const unauth = await request(http).get(
+        `${API_PREFIX}/accounting/journal/${entry.id}`,
+      );
+      expect(unauth.status).toBe(401);
+
+      // 2. Cross-tenant DB lookup returns null
+      const cross = await prisma.journalEntry.findFirst({
+        where: {
+          id: entry.id,
+          companyId: 'non-existent-or-other-tenant',
+        },
+        select: { id: true },
+      });
+      expect(cross).toBeNull();
+
+      // 3. Entry is properly scoped to companyId
+      expect(entry.companyId).toBe(companyId);
+    }
   });
 });
 
