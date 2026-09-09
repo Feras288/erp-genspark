@@ -29,6 +29,7 @@ import { CreateBankAccountDto } from './dto/create-bank-account.dto';
 import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 import { ImportStatementCsvDto } from './dto/import-statement-csv.dto';
 import { GetSuggestionsQueryDto } from './dto/get-suggestions-query.dto';
+import { CreateReconciliationMatchDto } from './dto/create-reconciliation-match.dto';
 import { UploadedCsvFile } from './types/reconciliation.types';
 
 @ApiTags('Reconciliation')
@@ -108,4 +109,24 @@ export class ReconciliationController {
   unmatchedReport(@CurrentUser() me: AuthenticatedUser) {
     return this.svc.unmatchedReport(me.companyId);
   }
+
+  @Post('matches')
+  @RequirePermissions('reconciliation.write')
+  @HttpCode(201)
+  createMatch(
+    @CurrentUser() me: AuthenticatedUser,
+    @Body() dto: CreateReconciliationMatchDto,
+  ) {
+    return this.svc.createMatch(me.companyId, me.id, dto);
+  }
+
+  @Delete('matches/:id')
+  @RequirePermissions('reconciliation.write')
+  unmatch(
+    @CurrentUser() me: AuthenticatedUser,
+    @Param('id') id: string,
+  ) {
+    return this.svc.unmatch(me.companyId, me.id, id);
+  }
 }
+

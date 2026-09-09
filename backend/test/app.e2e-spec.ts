@@ -5578,6 +5578,311 @@ describe('Phase 12A-B-5: Financial Statements consolidation (e2e)', () => {
       expect(forbidden.status).toBe(403);
     });
   });
+
+  // ===== Phase 13A-B-5: Manual reconciliation match/unmatch workflow =====
+  describe('Phase 13A-B-5: Manual reconciliation match/unmatch workflow', () => {
+    let reconToken: string;
+    let cashierToken: string;
+    let adminCompanyId: string;
+    let testBankAccountId: string;
+    let matchInflowTxId: string;
+    let matchOutflowTxId: string;
+    let diffAmountInflowTxId: string;
+    let matchArPaymentId: string;
+    let matchApPaymentId: string;
+    let arMismatchPaymentId: string;
+    let createdMatchId: string;
+    const unique = Date.now().toString().slice(-6);
+
+    beforeAll(async () => {
+      const prisma = app.get(PrismaService);
+
+      const loginRes = await request(http)
+        .post(`${API_PREFIX}/auth/login`)
+        .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+      reconToken = loginRes.body.accessToken;
+      adminCompanyId = loginRes.body.user.companyId;
+
+      const cashierLogin = await request(http)
+        .post(`${API_PREFIX}/auth/login`)
+        .send({ email: 'cashier-e2e@example.sa', password: 'Cashier@123' });
+      if (cashierLogin.status === 200) {
+        cashierToken = cashierLogin.body.accessToken;
+      }
+
+      // Create a bank account
+      const createAccRes = await request(http)
+        .post(`${API_PREFIX}/reconciliation/bank-accounts`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankName: 'Alinma Bank',
+          accountName: 'Match Workflow Account',
+          accountNumber: `ACC-MATCH-${unique}`,
+          iban: `SA11223344556677889900${unique}`,
+          currency: 'SAR',
+        });
+      expect(createAccRes.status).toBe(201);
+      testBankAccountId = createAccRes.body.data.id;
+
+      // Invoices for FK constraint
+      const salesInv = await prisma.salesInvoice.findFirst({
+        where: { companyId: adminCompanyId },
+      });
+      const purchInv = await prisma.purchaseInvoice.findFirst({
+        where: { companyId: adminCompanyId },
+      });
+
+      // 1. AR payment (amount 4200)
+      const arPayment = await prisma.payment.create({
+        data: {
+          companyId: adminCompanyId,
+          salesInvoiceId: salesInv?.id || null,
+          purchaseInvoiceId: null,
+          invoiceType: 'SALES',
+          paymentMethod: 'TRANSFER',
+          amount: new Prisma.Decimal('4200.0000'),
+          paidAt: new Date('2026-09-08T00:00:00.000Z'),
+          reference: `AR-MATCH-WF-${unique}`,
+          status: 'POSTED',
+        },
+      });
+      matchArPaymentId = arPayment.id;
+
+      // 2. AP payment (amount 1500)
+      const apPayment = await prisma.payment.create({
+        data: {
+          companyId: adminCompanyId,
+          salesInvoiceId: null,
+          purchaseInvoiceId: purchInv?.id || null,
+          invoiceType: 'PURCHASE',
+          paymentMethod: 'TRANSFER',
+          amount: new Prisma.Decimal('1500.0000'),
+          paidAt: new Date('2026-09-08T00:00:00.000Z'),
+          reference: `AP-MATCH-WF-${unique}`,
+          status: 'POSTED',
+        },
+      });
+      matchApPaymentId = apPayment.id;
+
+      // 3. AR payment with amount 1500 (for direction mismatch test against outflow)
+      const arMismatchPayment = await prisma.payment.create({
+        data: {
+          companyId: adminCompanyId,
+          salesInvoiceId: salesInv?.id || null,
+          purchaseInvoiceId: null,
+          invoiceType: 'SALES',
+          paymentMethod: 'TRANSFER',
+          amount: new Prisma.Decimal('1500.0000'),
+          paidAt: new Date('2026-09-08T00:00:00.000Z'),
+          reference: `AR-MISMATCH-WF-${unique}`,
+          status: 'POSTED',
+        },
+      });
+      arMismatchPaymentId = arMismatchPayment.id;
+
+      // 4. INFLOW bank transaction (amount 4200)
+      const inflow = await prisma.bankTransaction.create({
+        data: {
+          companyId: adminCompanyId,
+          bankAccountId: testBankAccountId,
+          transactionDate: new Date('2026-09-08T00:00:00.000Z'),
+          type: 'INFLOW',
+          amount: new Prisma.Decimal('4200.0000'),
+          reference: `AR-MATCH-WF-${unique}`,
+          description: 'Customer wire transfer',
+          fingerprint: `fp-inflow-match-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      matchInflowTxId = inflow.id;
+
+      // 5. OUTFLOW bank transaction (amount 1500)
+      const outflow = await prisma.bankTransaction.create({
+        data: {
+          companyId: adminCompanyId,
+          bankAccountId: testBankAccountId,
+          transactionDate: new Date('2026-09-08T00:00:00.000Z'),
+          type: 'OUTFLOW',
+          amount: new Prisma.Decimal('1500.0000'),
+          reference: `AP-MATCH-WF-${unique}`,
+          description: 'Vendor payment wire',
+          fingerprint: `fp-outflow-match-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      matchOutflowTxId = outflow.id;
+
+      // 6. INFLOW bank transaction with different amount (9999)
+      const diffTx = await prisma.bankTransaction.create({
+        data: {
+          companyId: adminCompanyId,
+          bankAccountId: testBankAccountId,
+          transactionDate: new Date('2026-09-08T00:00:00.000Z'),
+          type: 'INFLOW',
+          amount: new Prisma.Decimal('9999.0000'),
+          reference: `DIFF-AMOUNT-${unique}`,
+          description: 'Different amount',
+          fingerprint: `fp-diff-amount-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      diffAmountInflowTxId = diffTx.id;
+    });
+
+    it('13A-B-5.1) Creates manual match for compatible INFLOW AR payment and sets BankTransaction.status = MATCHED', async () => {
+      const prisma = app.get(PrismaService);
+      const jeCountBefore = await prisma.journalEntry.count({ where: { companyId: adminCompanyId } });
+      const jelCountBefore = await prisma.journalEntryLine.count({ where: { companyId: adminCompanyId } });
+
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/matches`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankTransactionId: matchInflowTxId,
+          paymentId: matchArPaymentId,
+          matchType: 'MANUAL',
+          notes: 'Test manual match notes',
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.data.matchId).toBeDefined();
+      expect(res.body.data.bankTransactionId).toBe(matchInflowTxId);
+      expect(res.body.data.paymentId).toBe(matchArPaymentId);
+      expect(res.body.data.amount).toBe('4200.0000');
+      expect(res.body.data.matchType).toBe('MANUAL');
+      expect(res.body.data.matchedAt).toBeDefined();
+      createdMatchId = res.body.data.matchId;
+
+      // Verify BankTransaction is MATCHED
+      const updatedTx = await prisma.bankTransaction.findUnique({ where: { id: matchInflowTxId } });
+      expect(updatedTx?.status).toBe('MATCHED');
+
+      // Verify Payment is still POSTED (never mutated)
+      const payment = await prisma.payment.findUnique({ where: { id: matchArPaymentId } });
+      expect(payment?.status).toBe('POSTED');
+
+      // Verify JournalEntry / JournalEntryLine counts untouched
+      const jeCountAfter = await prisma.journalEntry.count({ where: { companyId: adminCompanyId } });
+      const jelCountAfter = await prisma.journalEntryLine.count({ where: { companyId: adminCompanyId } });
+      expect(jeCountAfter).toBe(jeCountBefore);
+      expect(jelCountAfter).toBe(jelCountBefore);
+    });
+
+    it('13A-B-5.2) Rejects amount mismatch', async () => {
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/matches`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankTransactionId: diffAmountInflowTxId,
+          paymentId: matchArPaymentId,
+          matchType: 'MANUAL',
+        });
+
+      expect([400, 409]).toContain(res.status);
+    });
+
+    it('13A-B-5.3) Rejects direction mismatch', async () => {
+      // matchOutflowTxId (OUTFLOW) with arMismatchPaymentId (SALES) - amounts both 1500
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/matches`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankTransactionId: matchOutflowTxId,
+          paymentId: arMismatchPaymentId,
+          matchType: 'MANUAL',
+        });
+
+      expect([400, 409]).toContain(res.status);
+    });
+
+    it('13A-B-5.4) Rejects duplicate active match for same bankTransaction or payment', async () => {
+      // matchInflowTxId is already MATCHED and actively matched
+      const res = await request(http)
+        .post(`${API_PREFIX}/reconciliation/matches`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankTransactionId: matchInflowTxId,
+          paymentId: matchArPaymentId,
+          matchType: 'MANUAL',
+        });
+
+      expect(res.status).toBe(409);
+    });
+
+    it('13A-B-5.5) Soft-unmatches and sets BankTransaction.status back to UNMATCHED while Payment.status remains POSTED', async () => {
+      const prisma = app.get(PrismaService);
+      const jeCountBefore = await prisma.journalEntry.count({ where: { companyId: adminCompanyId } });
+      const jelCountBefore = await prisma.journalEntryLine.count({ where: { companyId: adminCompanyId } });
+
+      const res = await request(http)
+        .delete(`${API_PREFIX}/reconciliation/matches/${createdMatchId}`)
+        .set('Authorization', `Bearer ${reconToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.data.matchId).toBe(createdMatchId);
+      expect(res.body.data.bankTransactionId).toBe(matchInflowTxId);
+      expect(res.body.data.paymentId).toBe(matchArPaymentId);
+      expect(res.body.data.unmatchedAt).toBeDefined();
+
+      // Verify row is soft-unmatched in DB, NOT hard-deleted
+      const matchRow = await prisma.reconciliationMatch.findUnique({ where: { id: createdMatchId } });
+      expect(matchRow).not.toBeNull();
+      expect(matchRow?.unmatchedAt).not.toBeNull();
+
+      // Verify BankTransaction returned to UNMATCHED
+      const updatedTx = await prisma.bankTransaction.findUnique({ where: { id: matchInflowTxId } });
+      expect(updatedTx?.status).toBe('UNMATCHED');
+
+      // Verify Payment remains POSTED
+      const payment = await prisma.payment.findUnique({ where: { id: matchArPaymentId } });
+      expect(payment?.status).toBe('POSTED');
+
+      // Verify Journal entries untouched
+      const jeCountAfter = await prisma.journalEntry.count({ where: { companyId: adminCompanyId } });
+      const jelCountAfter = await prisma.journalEntryLine.count({ where: { companyId: adminCompanyId } });
+      expect(jeCountAfter).toBe(jeCountBefore);
+      expect(jelCountAfter).toBe(jelCountBefore);
+    });
+
+    it('13A-B-5.6) Requires reconciliation.write (401 unauth, 403 forbidden)', async () => {
+      // POST without token -> 401
+      const unauthPost = await request(http).post(`${API_PREFIX}/reconciliation/matches`).send({});
+      expect(unauthPost.status).toBe(401);
+
+      // POST with cashier token -> 403
+      const forbiddenPost = await request(http)
+        .post(`${API_PREFIX}/reconciliation/matches`)
+        .set('Authorization', `Bearer ${cashierToken}`)
+        .send({ bankTransactionId: matchInflowTxId, paymentId: matchArPaymentId });
+      expect(forbiddenPost.status).toBe(403);
+
+      // DELETE without token -> 401
+      const unauthDelete = await request(http).delete(`${API_PREFIX}/reconciliation/matches/${createdMatchId}`);
+      expect(unauthDelete.status).toBe(401);
+
+      // DELETE with cashier token -> 403
+      const forbiddenDelete = await request(http)
+        .delete(`${API_PREFIX}/reconciliation/matches/${createdMatchId}`)
+        .set('Authorization', `Bearer ${cashierToken}`);
+      expect(forbiddenDelete.status).toBe(403);
+    });
+
+    it('13A-B-5.7) Unmatching non-existent or already-unmatched match returns 404', async () => {
+      // createdMatchId is already unmatched
+      const res = await request(http)
+        .delete(`${API_PREFIX}/reconciliation/matches/${createdMatchId}`)
+        .set('Authorization', `Bearer ${reconToken}`);
+      expect(res.status).toBe(404);
+
+      const resNotFound = await request(http)
+        .delete(`${API_PREFIX}/reconciliation/matches/non-existent-match-id`)
+        .set('Authorization', `Bearer ${reconToken}`);
+      expect(resNotFound.status).toBe(404);
+    });
+  });
 });
+
 
 

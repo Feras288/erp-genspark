@@ -9,13 +9,14 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AccountType, BankTransactionType, Prisma } from '@prisma/client';
+import { AccountType, BankTransactionType, MatchType, Prisma } from '@prisma/client';
 import * as crypto from 'crypto';
 import { PrismaService } from '../database/prisma.service';
 import { CreateBankAccountDto } from './dto/create-bank-account.dto';
 import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 import { ImportStatementCsvDto } from './dto/import-statement-csv.dto';
 import { GetSuggestionsQueryDto } from './dto/get-suggestions-query.dto';
+import { CreateReconciliationMatchDto } from './dto/create-reconciliation-match.dto';
 import { UploadedCsvFile } from './types/reconciliation.types';
 import { computeMatchScore, isDirectionCompatible } from './utils/matching-scorer';
 import {
@@ -745,4 +746,210 @@ export class ReconciliationService {
       data: results,
     };
   }
+
+  /**
+   * Manual match between an unmatched bank transaction and a posted payment.
+   * Transactional: creates ReconciliationMatch and marks BankTransaction as MATCHED.
+   * Does NOT update Payment.status.
+   * Does NOT mutate JournalEntry or JournalEntryLine.
+   */
+  async createMatch(
+    companyId: string,
+    userId: string,
+    dto: CreateReconciliationMatchDto,
+  ) {
+    // 1. Validate BankTransaction
+    const bankTx = await this.prisma.bankTransaction.findFirst({
+      where: {
+        id: dto.bankTransactionId,
+        companyId,
+      },
+    });
+
+    if (!bankTx) {
+      throw new NotFoundException(
+        `Bank transaction with id "${dto.bankTransactionId}" not found`,
+      );
+    }
+
+    if (bankTx.status !== 'UNMATCHED') {
+      throw new ConflictException(
+        `Bank transaction is already matched (status: ${bankTx.status})`,
+      );
+    }
+
+    // 2. Validate Payment
+    const payment = await this.prisma.payment.findFirst({
+      where: {
+        id: dto.paymentId,
+        companyId,
+        deletedAt: null,
+      },
+      include: {
+        salesInvoice: { select: { invoiceNumber: true } },
+        purchaseInvoice: { select: { invoiceNumber: true } },
+      },
+    });
+
+    if (!payment) {
+      throw new NotFoundException(
+        `Payment with id "${dto.paymentId}" not found`,
+      );
+    }
+
+    if (payment.status !== 'POSTED') {
+      throw new BadRequestException(
+        `Payment must be POSTED to be matched (current status: ${payment.status})`,
+      );
+    }
+
+    // Check if payment is already actively matched
+    const activePaymentMatch = await this.prisma.reconciliationMatch.findFirst({
+      where: {
+        companyId,
+        paymentId: dto.paymentId,
+        unmatchedAt: null,
+      },
+    });
+
+    if (activePaymentMatch) {
+      throw new ConflictException(
+        `Payment is already actively matched in reconciliation match "${activePaymentMatch.id}"`,
+      );
+    }
+
+    // 3. Direction compatibility
+    if (!isDirectionCompatible(bankTx.type, payment.invoiceType)) {
+      throw new BadRequestException(
+        `Direction incompatible: bank transaction is ${bankTx.type} but payment invoiceType is ${payment.invoiceType}`,
+      );
+    }
+
+    // 4. Amount equality
+    if (!bankTx.amount.equals(payment.amount)) {
+      throw new ConflictException(
+        `Amount mismatch: bank transaction amount (${bankTx.amount.toFixed(4)}) does not equal payment amount (${payment.amount.toFixed(4)})`,
+      );
+    }
+
+    // 5. Confidence score
+    const matchType = dto.matchType || MatchType.MANUAL;
+    let confidenceScore: number | null = null;
+    if (matchType === MatchType.EXACT || matchType === MatchType.SUGGESTED) {
+      const scoreResult = computeMatchScore({
+        bankAmount: bankTx.amount,
+        paymentAmount: payment.amount,
+        bankDate: bankTx.transactionDate,
+        paymentDate: payment.paidAt,
+        bankReference: bankTx.reference,
+        bankDescription: bankTx.description,
+        bankPayerPayee: bankTx.payerPayee,
+        paymentReference: payment.reference,
+        paymentNotes: payment.notes,
+        invoiceNumber:
+          payment.salesInvoice?.invoiceNumber ||
+          payment.purchaseInvoice?.invoiceNumber,
+      });
+      confidenceScore = scoreResult.score;
+    }
+
+    // 6. Transactional persistence
+    try {
+      const match = await this.prisma.$transaction(async (tx) => {
+        const created = await tx.reconciliationMatch.create({
+          data: {
+            companyId,
+            bankTransactionId: bankTx.id,
+            paymentId: payment.id,
+            amount: bankTx.amount,
+            matchType,
+            confidenceScore,
+            notes: dto.notes || null,
+            matchedById: userId || null,
+          },
+        });
+
+        await tx.bankTransaction.update({
+          where: { id: bankTx.id },
+          data: { status: 'MATCHED' },
+        });
+
+        return created;
+      });
+
+      return {
+        status: 'ok',
+        companyId,
+        data: {
+          matchId: match.id,
+          bankTransactionId: match.bankTransactionId,
+          paymentId: match.paymentId,
+          amount: match.amount.toFixed(4),
+          matchType: match.matchType,
+          confidenceScore: match.confidenceScore,
+          matchedAt: match.matchedAt.toISOString(),
+        },
+      };
+    } catch (err: any) {
+      if (err.code === 'P2002') {
+        throw new ConflictException(
+          'This bank transaction or payment is already actively matched',
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Soft-unmatch an active reconciliation match.
+   * Marks ReconciliationMatch as unmatched (unmatchedAt, unmatchedById).
+   * Returns related BankTransaction to UNMATCHED status.
+   * Does NOT delete the match row.
+   * Does NOT update Payment.status.
+   * Does NOT mutate JournalEntry or JournalEntryLine.
+   */
+  async unmatch(companyId: string, userId: string, matchId: string) {
+    const match = await this.prisma.reconciliationMatch.findFirst({
+      where: {
+        id: matchId,
+        companyId,
+        unmatchedAt: null,
+      },
+    });
+
+    if (!match) {
+      throw new NotFoundException(
+        `Active reconciliation match with id "${matchId}" not found`,
+      );
+    }
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.reconciliationMatch.update({
+        where: { id: match.id },
+        data: {
+          unmatchedAt: new Date(),
+          unmatchedById: userId || null,
+        },
+      });
+
+      await tx.bankTransaction.update({
+        where: { id: match.bankTransactionId },
+        data: { status: 'UNMATCHED' },
+      });
+
+      return updated;
+    });
+
+    return {
+      status: 'ok',
+      companyId,
+      data: {
+        matchId: result.id,
+        bankTransactionId: result.bankTransactionId,
+        paymentId: result.paymentId,
+        unmatchedAt: result.unmatchedAt!.toISOString(),
+      },
+    };
+  }
 }
+
