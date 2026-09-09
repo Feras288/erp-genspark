@@ -2369,7 +2369,7 @@ export class ReportsService {
           total: this.decimalToString(acc.total),
           paid: this.decimalToString(acc.paid),
           outstanding: this.decimalToString(acc.outstanding),
-          buckets: serialisedBuckets,
+          buckets: serializedBuckets,
         };
       });
 
