@@ -11,6 +11,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AuditActorType,
+  AuditCategory,
+  AuditSeverity,
   JournalEntryStatus,
   PeriodCloseAuditAction,
   PeriodCloseStatus,
@@ -18,6 +21,7 @@ import {
   ReconciliationStatus,
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
+import { AuditLogsService } from '../../audit-logs/audit-logs.service';
 import {
   GetFiscalYearClosesQueryDto,
   GetPeriodCloseAuditLogsQueryDto,
@@ -200,7 +204,10 @@ export async function assertPeriodIsOpen(
 
 @Injectable()
 export class PeriodCloseService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditLogsService: AuditLogsService,
+  ) {}
 
   /**
    * Period Close Guard:
@@ -916,6 +923,28 @@ export class PeriodCloseService {
         },
       });
 
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.PERIOD_CLOSE,
+          event: 'PERIOD_CLOSED',
+          entityType: 'PeriodClose',
+          entityId: pc.id,
+          action: 'CLOSE_PERIOD',
+          message: `Period ${startUtc.toISOString().slice(0, 10)} to ${endUtc.toISOString().slice(0, 10)} closed`,
+          metadata: {
+            periodStart: startUtc.toISOString(),
+            periodEnd: endUtc.toISOString(),
+            fiscalYear: pc.fiscalYear,
+            periodNumber: pc.periodNumber,
+            blockingFailures: validation.data.blockingFailures,
+          },
+        },
+        tx,
+      );
+
       return pc;
     });
 
@@ -995,6 +1024,28 @@ export class PeriodCloseService {
           },
         },
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.PERIOD_CLOSE,
+          event: 'PERIOD_REOPENED',
+          entityType: 'PeriodClose',
+          entityId: period.id,
+          action: 'REOPEN_PERIOD',
+          severity: AuditSeverity.WARNING,
+          message: `Period ${period.periodStart.toISOString().slice(0, 10)} to ${period.periodEnd.toISOString().slice(0, 10)} reopened`,
+          metadata: {
+            periodStart: period.periodStart.toISOString(),
+            periodEnd: period.periodEnd.toISOString(),
+            reason: dto.reason,
+            reopenedAt: reopenedAt.toISOString(),
+          },
+        },
+        tx,
+      );
 
       return period;
     });
@@ -1461,6 +1512,28 @@ export class PeriodCloseService {
         },
       });
 
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.PERIOD_CLOSE,
+          event: 'FISCAL_YEAR_CLOSED',
+          entityType: 'FiscalYearClose',
+          entityId: fyc.id,
+          action: 'CLOSE_FISCAL_YEAR',
+          message: `Fiscal year ${fyc.fiscalYear} (${startUtc.toISOString().slice(0, 10)} to ${endUtc.toISOString().slice(0, 10)}) closed`,
+          metadata: {
+            fiscalYear: fyc.fiscalYear,
+            fiscalYearStart: startUtc.toISOString(),
+            fiscalYearEnd: endUtc.toISOString(),
+            retainedEarningsJournalEntryId: null,
+            blockingFailures: validation.data.blockingFailures,
+          },
+        },
+        tx,
+      );
+
       return fyc;
     });
 
@@ -1546,6 +1619,29 @@ export class PeriodCloseService {
           },
         },
       });
+
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.PERIOD_CLOSE,
+          event: 'FISCAL_YEAR_REOPENED',
+          entityType: 'FiscalYearClose',
+          entityId: fyc.id,
+          action: 'REOPEN_FISCAL_YEAR',
+          severity: AuditSeverity.WARNING,
+          message: `Fiscal year ${fyc.fiscalYear} (${fyc.fiscalYearStart.toISOString().slice(0, 10)} to ${fyc.fiscalYearEnd.toISOString().slice(0, 10)}) reopened`,
+          metadata: {
+            fiscalYear: fyc.fiscalYear,
+            fiscalYearStart: fyc.fiscalYearStart.toISOString(),
+            fiscalYearEnd: fyc.fiscalYearEnd.toISOString(),
+            reason: dto.reason,
+            reopenedAt: reopenedAt.toISOString(),
+          },
+        },
+        tx,
+      );
 
       return fyc;
     });

@@ -61,3 +61,26 @@ export interface AuditLogExportPreviewResponse {
     message: string;
   };
 }
+
+export interface CreateAuditLogInput {
+  companyId?: string | null;
+  actorUserId?: string | null;
+  actorType?: AuditActorType;
+  category: AuditCategory;
+  event: string;
+  entityType?: string | null;
+  entityId?: string | null;
+  action?: string | null;
+  severity?: AuditSeverity;
+  status?: AuditStatus;
+  requestId?: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  route?: string | null;
+  method?: string | null;
+  before?: unknown;
+  after?: unknown;
+  metadata?: unknown;
+  message?: string | null;
+}
+

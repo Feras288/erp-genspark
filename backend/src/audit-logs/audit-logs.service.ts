@@ -4,7 +4,13 @@
 // Strict tenant isolation via companyId. No writes in this phase.
 // =====================================================
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import {
+  AuditActorType,
+  AuditCategory,
+  AuditSeverity,
+  AuditStatus,
+  Prisma,
+} from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { AuditLogQueryDto, EntityTimelineQueryDto } from './dto/audit-log-query.dto';
 import {
@@ -12,11 +18,127 @@ import {
   AuditLogItemResponse,
   AuditLogListResponse,
   AuditLogSingleResponse,
+  CreateAuditLogInput,
 } from './types/audit-log.types';
+import { redactAuditPayload, truncateAuditJson } from './utils/redact-audit-payload';
 
 @Injectable()
 export class AuditLogsService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private prepareAuditData(input: CreateAuditLogInput): Prisma.AuditLogCreateInput {
+    const cleanBefore = input.before != null
+      ? (truncateAuditJson(redactAuditPayload(input.before)) as Prisma.InputJsonValue)
+      : undefined;
+    const cleanAfter = input.after != null
+      ? (truncateAuditJson(redactAuditPayload(input.after)) as Prisma.InputJsonValue)
+      : undefined;
+    const cleanMetadata = input.metadata != null
+      ? (truncateAuditJson(redactAuditPayload(input.metadata)) as Prisma.InputJsonValue)
+      : undefined;
+
+    const data: Prisma.AuditLogCreateInput = {
+      actorType: input.actorType ?? AuditActorType.USER,
+      category: input.category,
+      event: input.event,
+      entityType: input.entityType ?? null,
+      entityId: input.entityId ?? null,
+      action: input.action ?? null,
+      severity: input.severity ?? AuditSeverity.INFO,
+      status: input.status ?? AuditStatus.SUCCESS,
+      requestId: input.requestId ?? null,
+      ipAddress: input.ipAddress ?? null,
+      userAgent: input.userAgent ?? null,
+      route: input.route ?? null,
+      method: input.method ?? null,
+      before: cleanBefore ?? Prisma.JsonNull,
+      after: cleanAfter ?? Prisma.JsonNull,
+      metadata: cleanMetadata ?? Prisma.JsonNull,
+      message: input.message ?? null,
+    };
+
+    if (input.companyId) {
+      data.company = { connect: { id: input.companyId } };
+    }
+    if (input.actorUserId) {
+      data.actorUser = { connect: { id: input.actorUserId } };
+    }
+
+    return data;
+  }
+
+  async createAuditLog(input: CreateAuditLogInput): Promise<AuditLogItemResponse> {
+    const data = this.prepareAuditData(input);
+    const row = await this.prisma.auditLog.create({
+      data,
+      include: {
+        actorUser: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+          },
+        },
+      },
+    });
+    return this.mapLogItem(row);
+  }
+
+  async createAuditLogTx(
+    tx: Prisma.TransactionClient,
+    input: CreateAuditLogInput,
+  ): Promise<AuditLogItemResponse> {
+    const data = this.prepareAuditData(input);
+    const row = await tx.auditLog.create({
+      data,
+      include: {
+        actorUser: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+          },
+        },
+      },
+    });
+    return this.mapLogItem(row);
+  }
+
+  async logSuccess(
+    input: Omit<CreateAuditLogInput, 'status'>,
+    tx?: Prisma.TransactionClient,
+  ): Promise<AuditLogItemResponse> {
+    const payload: CreateAuditLogInput = {
+      ...input,
+      status: AuditStatus.SUCCESS,
+      severity: input.severity ?? AuditSeverity.INFO,
+    };
+    return tx ? this.createAuditLogTx(tx, payload) : this.createAuditLog(payload);
+  }
+
+  async logFailure(
+    input: Omit<CreateAuditLogInput, 'status'>,
+    tx?: Prisma.TransactionClient,
+  ): Promise<AuditLogItemResponse> {
+    const payload: CreateAuditLogInput = {
+      ...input,
+      status: AuditStatus.FAILURE,
+      severity: input.severity ?? AuditSeverity.ERROR,
+    };
+    return tx ? this.createAuditLogTx(tx, payload) : this.createAuditLog(payload);
+  }
+
+  async logBlocked(
+    input: Omit<CreateAuditLogInput, 'status'>,
+    tx?: Prisma.TransactionClient,
+  ): Promise<AuditLogItemResponse> {
+    const payload: CreateAuditLogInput = {
+      ...input,
+      status: AuditStatus.BLOCKED,
+      severity: input.severity ?? AuditSeverity.WARNING,
+    };
+    return tx ? this.createAuditLogTx(tx, payload) : this.createAuditLog(payload);
+  }
 
   private mapLogItem(log: any): AuditLogItemResponse {
     return {

@@ -27,11 +27,14 @@ import {
 } from '@nestjs/common';
 import {
   AccountType,
+  AuditActorType,
+  AuditCategory,
   JournalEntryStatus,
   Prisma,
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { CreateAccountDto } from './dto/create-account.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
 import { AccountingQueryDto, JournalEntryQueryDto } from './dto/accounting-query.dto';
@@ -101,6 +104,7 @@ export class AccountingService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly periodCloseService: PeriodCloseService,
+    private readonly auditLogsService: AuditLogsService,
   ) {}
 
   // ===================================================
@@ -628,6 +632,29 @@ export class AccountingService {
         userId,
         metadata: { entryNumber: entry.entryNumber, totalDebit: this.fmt4(totals.totalDebit) },
       });
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.ACCOUNTING,
+          event: 'JOURNAL_CREATED',
+          entityType: 'JournalEntry',
+          entityId: entry.id,
+          action: 'CREATE',
+          message: `Journal entry ${entry.entryNumber} created`,
+          metadata: {
+            entryNumber: entry.entryNumber,
+            entryDate: effectiveEntryDate.toISOString(),
+            reference: entry.reference,
+            lineCount: prepared.length,
+            status: entry.status,
+            totalDebit: this.fmt4(totals.totalDebit),
+            totalCredit: this.fmt4(totals.totalCredit),
+          },
+        },
+        tx,
+      );
       return entry;
     });
   }
@@ -719,6 +746,28 @@ export class AccountingService {
         userId,
         metadata: { entryNumber: updated.entryNumber },
       });
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.ACCOUNTING,
+          event: 'JOURNAL_UPDATED',
+          entityType: 'JournalEntry',
+          entityId: updated.id,
+          action: 'UPDATE',
+          message: `Journal entry ${updated.entryNumber} updated`,
+          metadata: {
+            entryNumber: updated.entryNumber,
+            entryDate: updated.entryDate.toISOString(),
+            reference: updated.reference,
+            lineCount: Array.isArray(dto.lines) ? dto.lines.length : undefined,
+            totalDebit: this.fmt4(updated.totalDebit),
+            totalCredit: this.fmt4(updated.totalCredit),
+          },
+        },
+        tx,
+      );
       return updated;
     });
   }
@@ -770,6 +819,27 @@ export class AccountingService {
           totalDebit: this.fmt4(entry.totalDebit),
         },
       });
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.ACCOUNTING,
+          event: 'JOURNAL_POSTED',
+          entityType: 'JournalEntry',
+          entityId: updated.id,
+          action: 'POST',
+          message: `Journal entry ${updated.entryNumber} posted to GL`,
+          metadata: {
+            entryNumber: updated.entryNumber,
+            entryDate: effectiveEntryDate.toISOString(),
+            postedAt: updated.postedAt ? updated.postedAt.toISOString() : null,
+            totalDebit: this.fmt4(entry.totalDebit),
+            totalCredit: this.fmt4(entry.totalCredit),
+          },
+        },
+        tx,
+      );
       return updated;
     });
   }
@@ -823,6 +893,25 @@ export class AccountingService {
           reason: dto.reason ?? null,
         },
       });
+      await this.auditLogsService.logSuccess(
+        {
+          companyId,
+          actorUserId: userId,
+          actorType: AuditActorType.USER,
+          category: AuditCategory.ACCOUNTING,
+          event: 'JOURNAL_CANCELLED',
+          entityType: 'JournalEntry',
+          entityId: updated.id,
+          action: 'CANCEL',
+          message: `Journal entry ${updated.entryNumber} cancelled`,
+          metadata: {
+            entryNumber: updated.entryNumber,
+            cancelledAt: updated.cancelledAt ? updated.cancelledAt.toISOString() : null,
+            reason: dto.reason ?? null,
+          },
+        },
+        tx,
+      );
       return updated;
     });
   }
