@@ -52,6 +52,9 @@ model Company {
   bankStatements        BankStatement[]
   bankTransactions      BankTransaction[]
   reconciliationMatches ReconciliationMatch[]
+  periodCloses          PeriodClose[]
+  fiscalYearCloses      FiscalYearClose[]
+  periodCloseAuditLogs  PeriodCloseAuditLog[]
 
   @@index([name])
   @@map("companies")
@@ -108,6 +111,11 @@ model User {
   bankStatementsImported         BankStatement[]       @relation("BankStatementImportedBy")
   reconciliationMatchesCreated   ReconciliationMatch[] @relation("MatchMatchedBy")
   reconciliationMatchesUnmatched ReconciliationMatch[] @relation("MatchUnmatchedBy")
+  periodClosesClosed             PeriodClose[]         @relation("PeriodCloseClosedBy")
+  periodClosesReopened           PeriodClose[]         @relation("PeriodCloseReopenedBy")
+  fiscalYearClosesClosed         FiscalYearClose[]     @relation("FiscalYearCloseClosedBy")
+  fiscalYearClosesReopened       FiscalYearClose[]     @relation("FiscalYearCloseReopenedBy")
+  periodCloseAuditLogs           PeriodCloseAuditLog[] @relation("PeriodCloseAuditActor")
 
   @@unique([companyId, email]) // no duplicate emails inside one company
   @@index([email])
@@ -775,9 +783,10 @@ model JournalEntry {
   updatedBy   User?              @relation("JournalEntryUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
   postedBy    User?              @relation("JournalEntryPostedBy", fields: [postedById], references: [id], onDelete: SetNull)
   cancelledBy User?              @relation("JournalEntryCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
-  reverses    JournalEntry?      @relation("JournalEntryReversal", fields: [reversalOf], references: [id], onDelete: SetNull)
-  reversedBy  JournalEntry[]     @relation("JournalEntryReversal")
-  lines       JournalEntryLine[]
+  reverses         JournalEntry?      @relation("JournalEntryReversal", fields: [reversalOf], references: [id], onDelete: SetNull)
+  reversedBy       JournalEntry[]     @relation("JournalEntryReversal")
+  fiscalYearCloses FiscalYearClose[] @relation("FiscalYearCloseJournalEntry")
+  lines            JournalEntryLine[]
 
   @@unique([companyId, entryNumber])
   // Idempotency: at most one journal entry per source document
@@ -951,3 +960,105 @@ model ReconciliationMatch {
   @@index([companyId, paymentId])
   @@map("reconciliation_matches")
 }
+
+// =====================================================
+// Phase 14A: Period Close & Fiscal Year Close
+// Monthly period locks, fiscal year closing, audit trail.
+// =====================================================
+
+enum PeriodCloseStatus {
+  OPEN
+  CLOSING
+  CLOSED
+  REOPENED
+}
+
+enum PeriodCloseAuditAction {
+  CLOSE_STARTED
+  CLOSED
+  REOPENED
+  FAILED_VALIDATION
+}
+
+model PeriodClose {
+  id           String            @id @default(cuid())
+  companyId    String
+  fiscalYear   Int
+  periodNumber Int?
+  periodStart  DateTime
+  periodEnd    DateTime
+  status       PeriodCloseStatus @default(OPEN)
+  closedAt     DateTime?
+  closedById   String?
+  reopenedAt   DateTime?
+  reopenedById String?
+  reopenReason String?
+  notes        String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  company    Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  closedBy   User?                 @relation("PeriodCloseClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  reopenedBy User?                 @relation("PeriodCloseReopenedBy", fields: [reopenedById], references: [id], onDelete: SetNull)
+  auditLogs  PeriodCloseAuditLog[]
+
+  @@unique([companyId, periodStart, periodEnd])
+  @@index([companyId, status])
+  @@index([companyId, periodStart, periodEnd])
+  @@index([companyId, fiscalYear])
+  @@map("period_closes")
+}
+
+model FiscalYearClose {
+  id                             String            @id @default(cuid())
+  companyId                      String
+  fiscalYear                     Int
+  fiscalYearStart                DateTime
+  fiscalYearEnd                  DateTime
+  status                         PeriodCloseStatus @default(OPEN)
+  retainedEarningsJournalEntryId String?
+  closedAt                       DateTime?
+  closedById                     String?
+  reopenedAt                     DateTime?
+  reopenedById                   String?
+  reopenReason                   String?
+  notes                          String?
+  createdAt                      DateTime          @default(now())
+  updatedAt                      DateTime          @updatedAt
+
+  company                      Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  retainedEarningsJournalEntry JournalEntry?         @relation("FiscalYearCloseJournalEntry", fields: [retainedEarningsJournalEntryId], references: [id], onDelete: SetNull)
+  closedBy                     User?                 @relation("FiscalYearCloseClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  reopenedBy                   User?                 @relation("FiscalYearCloseReopenedBy", fields: [reopenedById], references: [id], onDelete: SetNull)
+  auditLogs                    PeriodCloseAuditLog[]
+
+  @@unique([companyId, fiscalYear])
+  @@unique([companyId, fiscalYearStart, fiscalYearEnd])
+  @@index([companyId, status])
+  @@index([companyId, fiscalYearStart, fiscalYearEnd])
+  @@map("fiscal_year_closes")
+}
+
+model PeriodCloseAuditLog {
+  id                String                 @id @default(cuid())
+  companyId         String
+  periodCloseId     String?
+  fiscalYearCloseId String?
+  action            PeriodCloseAuditAction
+  actorUserId       String
+  reason            String?
+  metadata          Json?
+  createdAt         DateTime               @default(now())
+
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  periodClose     PeriodClose?     @relation(fields: [periodCloseId], references: [id], onDelete: Cascade)
+  fiscalYearClose FiscalYearClose? @relation(fields: [fiscalYearCloseId], references: [id], onDelete: Cascade)
+  actorUser       User             @relation("PeriodCloseAuditActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  @@index([companyId, createdAt])
+  @@index([companyId, periodCloseId])
+  @@index([companyId, fiscalYearCloseId])
+  @@index([companyId, action])
+  @@map("period_close_audit_logs")
+}
+
