@@ -6,6 +6,7 @@
 // =====================================================
 import { PrismaClient } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import { ensureRequiredGlAccounts } from '../src/accounting/required-gl-accounts';
 
 const prisma = new PrismaClient();
 
@@ -165,6 +166,18 @@ async function main() {
     create: { userId: adminUser.id, roleId: adminRole.id },
   });
   console.log(`  ✓ Admin user upserted: ${adminUser.email} (password in dev only)`);
+
+  // Phase 11B-B-1: eight required GL posting accounts per company.
+  // Idempotent (find-or-create by companyId+code). Complements the
+  // migrate-time backfill so `prisma db seed` alone is enough on a
+  // fresh tenant, and re-runs never duplicate rows.
+  const companies = await prisma.company.findMany({ select: { id: true, name: true } });
+  for (const c of companies) {
+    const gl = await ensureRequiredGlAccounts(prisma, c.id);
+    console.log(
+      `  ✓ Required GL accounts for ${c.name}: created=${gl.created.length} existing=${gl.existing.length}`,
+    );
+  }
 
   console.log('✅ ERP seed — done');
 }

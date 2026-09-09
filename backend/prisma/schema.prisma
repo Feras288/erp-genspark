@@ -687,6 +687,16 @@ enum JournalEntryStatus {
   CANCELLED
 }
 
+// Phase 11B-B-1: polymorphic source-document identity for auto-post
+// idempotency. Null on Phase 6 manual journals. Not a Prisma FK —
+// the pointed-at row lives on a different model per value.
+enum JournalEntrySourceType {
+  SALES_INVOICE
+  PURCHASE_INVOICE
+  AR_PAYMENT
+  AP_PAYMENT
+}
+
 model Account {
   id            String        @id @default(cuid())
   companyId     String
@@ -722,35 +732,54 @@ model Account {
 }
 
 model JournalEntry {
-  id            String             @id @default(cuid())
+  id            String                  @id @default(cuid())
   companyId     String
   entryNumber   String // je-YYYYMMDD-NNNN, unique per company
-  status        JournalEntryStatus @default(DRAFT)
-  entryDate     DateTime           @default(now())
+  status        JournalEntryStatus      @default(DRAFT)
+  entryDate     DateTime                @default(now())
   description   String? // header-level memo / narration
   reference     String? // optional external doc ref (invoice id, etc.)
-  totalDebit    Decimal            @default(0) @db.Decimal(18, 4) // server-computed sum of line debits
-  totalCredit   Decimal            @default(0) @db.Decimal(18, 4) // server-computed sum of line credits
+  totalDebit    Decimal                 @default(0) @db.Decimal(18, 4) // server-computed sum of line debits
+  totalCredit   Decimal                 @default(0) @db.Decimal(18, 4) // server-computed sum of line credits
   notes         String?
   postedAt      DateTime?
   cancelledAt   DateTime?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @updatedAt
   createdById   String?
   updatedById   String?
   postedById    String?
   cancelledById String?
+  // Phase 11B-B-1: source-document linkage. Both null on Phase 6
+  // manual journals. Pair completeness is enforced by a CHECK in
+  // the migration (both null or both set). sourceId is a soft
+  // pointer — not a Prisma FK (polymorphic across 4 models).
+  sourceType    JournalEntrySourceType?
+  sourceId      String?
+  // Phase 11B-B-1: reversing-entry self-link. Column name locked
+  // here (plan §3.5 / §10). Null on original entries. No 11B-B-1
+  // code path reads or writes this yet.
+  reversalOf    String?
 
   company     Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
   createdBy   User?              @relation("JournalEntryCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
   updatedBy   User?              @relation("JournalEntryUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
   postedBy    User?              @relation("JournalEntryPostedBy", fields: [postedById], references: [id], onDelete: SetNull)
   cancelledBy User?              @relation("JournalEntryCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  reverses    JournalEntry?      @relation("JournalEntryReversal", fields: [reversalOf], references: [id], onDelete: SetNull)
+  reversedBy  JournalEntry[]     @relation("JournalEntryReversal")
   lines       JournalEntryLine[]
 
   @@unique([companyId, entryNumber])
+  // Idempotency: at most one journal entry per source document
+  // inside a company. Postgres treats NULLs as distinct, so
+  // Phase 6 manual journals (sourceType/sourceId both null) are
+  // not blocked. Pair completeness is a CHECK in the migration.
+  @@unique([companyId, sourceType, sourceId], map: "journal_entries_company_source_uniq")
   @@index([companyId, status])
   @@index([companyId, entryDate])
+  @@index([companyId, sourceType])
+  @@index([reversalOf])
   @@map("journal_entries")
 }
 
