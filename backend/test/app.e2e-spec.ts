@@ -2296,3 +2296,312 @@ describe('Phase 6: Accounting (e2e)', () => {
     for (const it of res.body.items) expect(it.status).toBe('DRAFT');
   });
 });
+
+// =====================================================
+// Phase 11A-B-3 — GL posting hardening e2e smoke.
+//
+// Add a small, additive describe block that re-runs the
+// core Phase 6 / Phase 11A-B-2 accounting surface as smoke
+// tests against FRESH per-run fixtures. This block does NOT
+// rewrite or move any existing Phase 6 test (A1/A2, D1/D2,
+// E3/E4, F3/F4/F5/F6/F7 are preserved verbatim).
+//
+// Required smoke cases (all 9 from the Phase 11A-B-3 spec):
+//   1) GET /accounting/accounts with valid token => 200 + paginated array
+//   2) GET /accounting/journal  with valid token => 200 + paginated array
+//   3) POST /accounting/journal unbalanced      => 400 / 409
+//   4) POST /accounting/journal balanced, ≥2 lines => 201 DRAFT
+//   5) POST /accounting/journal/:id/post on DRAFT      => status=POSTED + postedAt
+//   6) POST /accounting/journal/:id/post on POSTED    => 4xx (no double-post)
+//   7) POST /accounting/journal/:id/cancel on DRAFT   => 200|201 status=CANCELLED + cancelledAt + cancelledById
+//   8) POST /accounting/journal/:id/cancel on POSTED  => 4xx with /posted|reverse|out of scope/i message
+//   9) POST /accounting/journal/:id/cancel on CANCELLED => 4xx (no double-cancel)
+//
+// Phase 6 contract preserved (re-asserted without changing production code):
+//   * DRAFT can be CANCELLED (case 7).
+//   * POSTED cannot be CANCELLED (case 8) — straight status flip via REVERSED
+//     enum is intentionally NOT introduced here; reversing entries remain
+//     out of scope in this phase.
+//   * CANCELLED cannot be cancelled again (case 9).
+//   * POSTED cannot be posted again (case 6).
+//   * The unbalanced probe (case 3) exercises the centralized
+//     `validateJournalBalances` helper added in 11A-B-2 — path may produce
+//     either 400 (ValidationPipe rejects) or 409 (BadRequestException thrown
+//     by the service after class-validator passes). The test accepts both.
+//
+// Strict scope of this commit (matches the user-stated allowed file):
+//   * JS-only changes inside `backend/test/app.e2e-spec.ts`.
+//   * No production code, no schema, no migration, no frontend, no README,
+//     no docs, no RBAC catalog, no D1 wiring, no deployment touch.
+// =====================================================
+describe('Phase 11A-B-3: GL posting hardening (e2e smoke)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+
+  // Fresh per-run COA fixture codes so this block is independent
+  // from the Phase 6 describe block above (which uses `ACC-*` codes).
+  const unique = Date.now().toString(36);
+  const GL_CASH_CODE = `GL-CASH-${unique}`;
+  const GL_AP_CODE = `GL-AP-${unique}`;
+
+  let glCashAccountId = '';
+  let glApAccountId = '';
+
+  // Describe-locals for cross-test IDs (no module-level mutable required).
+  let smokeDraftId = '';
+  let smokePostedId = '';
+  let smokeCancelableDraftId = '';
+  let smokeCancelledId = '';
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+
+    // Seed two fresh accounts (ASSET/DEBIT and LIABILITY/CREDIT)
+    // so this smoke block has its own fixtures. Idempotent on rerun
+    // via the `[201, 409]` tolerance; the `id` is recovered from
+    // either path.
+    const cashList = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts?search=${encodeURIComponent(GL_CASH_CODE)}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(cashList.status).toBe(200);
+    if (Array.isArray(cashList.body.items) && cashList.body.items.length > 0) {
+      glCashAccountId = cashList.body.items[0].id;
+    } else {
+      const cash = await request(http)
+        .post(`${API_PREFIX}/accounting/accounts`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          code: GL_CASH_CODE,
+          name: 'GL smoke cash',
+          type: 'ASSET',
+          normalBalance: 'DEBIT',
+          isActive: true,
+        });
+      expect([201, 409]).toContain(cash.status);
+      glCashAccountId = cash.body.id ?? '';
+    }
+    expect(glCashAccountId).toBeTruthy();
+
+    const apList = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts?search=${encodeURIComponent(GL_AP_CODE)}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(apList.status).toBe(200);
+    if (Array.isArray(apList.body.items) && apList.body.items.length > 0) {
+      glApAccountId = apList.body.items[0].id;
+    } else {
+      const ap = await request(http)
+        .post(`${API_PREFIX}/accounting/accounts`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          code: GL_AP_CODE,
+          name: 'GL smoke AP',
+          type: 'LIABILITY',
+          normalBalance: 'CREDIT',
+          isActive: true,
+        });
+      expect([201, 409]).toContain(ap.status);
+      glApAccountId = ap.body.id ?? '';
+    }
+    expect(glApAccountId).toBeTruthy();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  // ----- GET surfaces --------------------------------------------
+
+  it('11A-B-3.1) GET /accounting/accounts with valid token => 200 + paginated array', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  it('11A-B-3.2) GET /accounting/journal with valid token => 200 + paginated array', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.total).toBe('number');
+    expect(Array.isArray(res.body.items)).toBe(true);
+  });
+
+  // ----- Balancing validator (Phase 11A-B-2 centralized) ---------
+
+  it('11A-B-3.3) POST /accounting/journal unbalanced (debit != credit) => 400 or 409', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Phase 11A-B-3 unbalanced probe',
+        lines: [
+          {
+            accountId: glCashAccountId,
+            debit: '100.0000',
+            credit: '0.0000',
+          },
+          {
+            accountId: glApAccountId,
+            debit: '0.0000',
+            credit: '50.0000', // 100 vs 50 → unbalanced
+          },
+        ],
+      });
+    // The exact code can be 400 (ValidationPipe rejection on missing
+    // fields / shape) or 409 (service-level BadRequestException once
+    // class-validator accepts the shape and validateJournalBalances
+    // throws). Both are acceptable failure modes. We assert ≥ 400
+    // and < 500 to keep the assertion stable across Phase 6 / 11A
+    // boundary lines and future shape changes.
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+  });
+
+  it('11A-B-3.4) POST /accounting/journal balanced >= 2 lines => 201 DRAFT', async () => {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Phase 11A-B-3 balanced DRAFT (will be POSTED)',
+        lines: [
+          {
+            accountId: glApAccountId,
+            debit: '0.0000',
+            credit: '75.0000',
+          },
+          {
+            accountId: glCashAccountId,
+            debit: '75.0000',
+            credit: '0.0000',
+          },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('DRAFT');
+    expect(String(res.body.totalDebit)).toMatch(/^75/);
+    expect(String(res.body.totalCredit)).toMatch(/^75/);
+    smokeDraftId = res.body.id;
+    expect(smokeDraftId).toBeTruthy();
+  });
+
+  // ----- Posting path (Phase 11A-B-2 `ensureJournalEntryCanPost`) ---
+
+  it('11A-B-3.5) POST /accounting/journal/:id/post on DRAFT => status=POSTED + postedAt set', async () => {
+    expect(smokeDraftId).toBeTruthy();
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${smokeDraftId}/post`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect([200, 201]).toContain(res.status);
+    expect(res.body.status).toBe('POSTED');
+    expect(res.body.postedAt).toBeDefined();
+    expect(res.body.postedById).toBeDefined();
+    smokePostedId = res.body.id;
+  });
+
+  it('11A-B-3.6) POST /accounting/journal/:id/post on already-POSTED => 4xx (no double-post)', async () => {
+    expect(smokePostedId).toBeTruthy();
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${smokePostedId}/post`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    // EnsureJournalEntryCanPost throws ConflictException on non-DRAFT;
+    // service-level message wording matches "Only DRAFT entries can be
+    // posted (current: POSTED)". Accept 4xx (400 / 409) without being
+    // picky on the exact status code.
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+    expect(String(res.body.message ?? '')).toMatch(/draft|posted/i);
+  });
+
+  // ----- Cancel path (Phase 11A-B-2 `ensureJournalEntryCanCancel`,
+  //       Phase 6 contract preserved) ------------------------------
+
+  it('11A-B-3.7) POST /accounting/journal/:id/cancel on POSTED => 4xx with reverse/out-of-scope message', async () => {
+    expect(smokePostedId).toBeTruthy();
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${smokePostedId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'should be refused (reverse out of scope)' });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+    expect(String(res.body.message ?? '')).toMatch(
+      /posted|reverse|out of scope/i,
+    );
+  });
+
+  it('11A-B-3.8) POST /accounting/journal/:id/cancel on DRAFT => 200|201 + status=CANCELLED + cancelledAt + cancelledById', async () => {
+    // Build a fresh balanced DRAFT entry purely for the cancel-on-DRAFT
+    // branch. Kept independent from the post→posted chain so that each
+    // assertion has a clean fixture.
+    const create = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Phase 11A-B-3 DRAFT (will be CANCELLED)',
+        lines: [
+          {
+            accountId: glApAccountId,
+            debit: '0.0000',
+            credit: '40.0000',
+          },
+          {
+            accountId: glCashAccountId,
+            debit: '40.0000',
+            credit: '0.0000',
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    expect(create.body.status).toBe('DRAFT');
+    smokeCancelableDraftId = create.body.id;
+    expect(smokeCancelableDraftId).toBeTruthy();
+
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${smokeCancelableDraftId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'e2e cancel of DRAFT in 11A-B-3 smoke' });
+    expect([200, 201]).toContain(res.status);
+    expect(res.body.status).toBe('CANCELLED');
+    expect(res.body.cancelledAt).toBeDefined();
+    expect(res.body.cancelledById).toBeDefined();
+    smokeCancelledId = res.body.id;
+  });
+
+  it('11A-B-3.9) POST /accounting/journal/:id/cancel on already-CANCELLED => 4xx (no double-cancel)', async () => {
+    expect(smokeCancelledId).toBeTruthy();
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${smokeCancelledId}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    // EnsureJournalEntryCanCancel throws ConflictException on already-CANCELLED.
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+    expect(String(res.body.message ?? '')).toMatch(/already cancelled|already/i);
+  });
+});
