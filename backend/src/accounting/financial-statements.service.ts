@@ -2,14 +2,19 @@
 // Phase 12A: Financial statements.
 //
 // 12A-B-2: real Trial Balance from POSTED JournalEntryLine.
-// 12A-B-1 leftover: Income Statement + Balance Sheet still
-// empty/zero skeletons (no aggregation yet).
+// 12A-B-3: real Income Statement (period-only P&L).
+// 12A-B-1 leftover: Balance Sheet still empty/zero skeleton.
 //
 // No posting / reverse / close. JWT companyId only.
 // Monetary math is Prisma.Decimal — never Number().
 // =====================================================
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { JournalEntryStatus, NormalBalance, Prisma } from '@prisma/client';
+import {
+  AccountType,
+  JournalEntryStatus,
+  NormalBalance,
+  Prisma,
+} from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { DECIMAL_ZERO, toDecimal } from './posting-events/decimal';
 import {
@@ -21,6 +26,7 @@ import type {
   AccountTypeKey,
   BalanceSheetResponse,
   DecimalString,
+  IncomeStatementLine,
   IncomeStatementResponse,
   NormalBalanceKey,
   TrialBalanceAccountRow,
@@ -88,6 +94,30 @@ function endOfTodayUtc(): Date {
   const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
   const dd = String(now.getUTCDate()).padStart(2, '0');
   return new Date(`${yyyy}-${mm}-${dd}T23:59:59.999Z`);
+}
+
+function utcDayString(date: Date): string {
+  const yyyy = String(date.getUTCFullYear()).padStart(4, '0');
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function getDefaultFiscalYearStartDate(
+  fiscalYearStartMonth: number | null | undefined,
+  asOf: Date,
+): Date {
+  const month =
+    fiscalYearStartMonth != null &&
+    fiscalYearStartMonth >= 1 &&
+    fiscalYearStartMonth <= 12
+      ? fiscalYearStartMonth
+      : 1;
+  const asOfMonth = asOf.getUTCMonth() + 1;
+  const year =
+    asOfMonth < month ? asOf.getUTCFullYear() - 1 : asOf.getUTCFullYear();
+  const mm = String(month).padStart(2, '0');
+  return new Date(`${year}-${mm}-01T00:00:00.000Z`);
 }
 
 function emptyBucket(): Bucket {
@@ -300,27 +330,137 @@ export class FinancialStatementsService {
     };
   }
 
-  incomeStatement(
+  async incomeStatement(
     companyId: string,
     q: IncomeStatementQueryDto,
-  ): IncomeStatementResponse {
-    const zero = decimalZeroString();
+  ): Promise<IncomeStatementResponse> {
+    const toEnd = parseDateEndUtc(q.toDate, 'toDate') ?? endOfTodayUtc();
+    let fromStart = parseDateStartUtc(q.fromDate, 'fromDate');
+    if (fromStart == null) {
+      const company = await this.prisma.company.findFirst({
+        where: { id: companyId },
+        select: { fiscalYearStartMonth: true },
+      });
+      fromStart = getDefaultFiscalYearStartDate(
+        company?.fiscalYearStartMonth,
+        toEnd,
+      );
+    }
+
+    const accounts = await this.prisma.account.findMany({
+      where: {
+        companyId,
+        type: { in: [AccountType.REVENUE, AccountType.EXPENSE] },
+      },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        type: true,
+        normalBalance: true,
+      },
+      orderBy: { code: 'asc' },
+    });
+
+    const lines = await this.prisma.journalEntryLine.findMany({
+      where: {
+        companyId,
+        entry: {
+          companyId,
+          status: JournalEntryStatus.POSTED,
+          entryDate: { gte: fromStart, lte: toEnd },
+        },
+      },
+      select: {
+        debit: true,
+        credit: true,
+        debitAccountId: true,
+        creditAccountId: true,
+      },
+    });
+
+    type PeriodBucket = {
+      debitTotal: Prisma.Decimal;
+      creditTotal: Prisma.Decimal;
+    };
+    const buckets = new Map<string, PeriodBucket>();
+    for (const account of accounts) {
+      buckets.set(account.id, {
+        debitTotal: new Prisma.Decimal('0'),
+        creditTotal: new Prisma.Decimal('0'),
+      });
+    }
+
+    const accountIds = new Set(accounts.map((a) => a.id));
+    for (const line of lines) {
+      const debit = toDecimal(line.debit);
+      const credit = toDecimal(line.credit);
+      if (line.debitAccountId && accountIds.has(line.debitAccountId)) {
+        const bucket = buckets.get(line.debitAccountId)!;
+        bucket.debitTotal = addDecimal(bucket.debitTotal, debit);
+      }
+      if (line.creditAccountId && accountIds.has(line.creditAccountId)) {
+        const bucket = buckets.get(line.creditAccountId)!;
+        bucket.creditTotal = addDecimal(bucket.creditTotal, credit);
+      }
+    }
+
+    const revenue: IncomeStatementLine[] = [];
+    const expenses: IncomeStatementLine[] = [];
+    let revenueTotal = new Prisma.Decimal('0');
+    let expenseTotal = new Prisma.Decimal('0');
+
+    for (const account of accounts) {
+      const bucket = buckets.get(account.id)!;
+      if (bucket.debitTotal.isZero() && bucket.creditTotal.isZero()) continue;
+
+      const amount = computeSignedBalance(
+        bucket.debitTotal,
+        bucket.creditTotal,
+        account.normalBalance,
+      );
+      // P&L contribution: credit − debit. CREDIT-normal revenue is
+      // positive; DEBIT-normal contra-revenue (SALES_DISCOUNTS) is
+      // negative and reduces totals.revenue.
+      const pnl = bucket.creditTotal.minus(bucket.debitTotal);
+      const row: IncomeStatementLine = {
+        accountId: account.id,
+        code: account.code,
+        name: account.name,
+        type: account.type as AccountTypeKey,
+        normalBalance: account.normalBalance as NormalBalanceKey,
+        debitTotal: formatDecimal4(bucket.debitTotal),
+        creditTotal: formatDecimal4(bucket.creditTotal),
+        amount: formatDecimal4(amount),
+      };
+
+      if (account.type === AccountType.REVENUE) {
+        revenue.push(row);
+        revenueTotal = addDecimal(revenueTotal, pnl);
+      } else {
+        expenses.push(row);
+        expenseTotal = addDecimal(expenseTotal, amount);
+      }
+    }
+
+    const netIncome = revenueTotal.minus(expenseTotal);
+
     return {
       status: 'ok',
       report: 'income-statement',
       companyId,
       filters: {
-        fromDate: q.fromDate ?? null,
-        toDate: q.toDate ?? null,
+        fromDate: utcDayString(fromStart),
+        toDate: utcDayString(toEnd),
       },
       generatedAt: new Date().toISOString(),
       data: {
-        revenue: [],
-        expenses: [],
+        revenue,
+        expenses,
         totals: {
-          revenue: zero,
-          expenses: zero,
-          netIncome: zero,
+          revenue: formatDecimal4(revenueTotal),
+          expenses: formatDecimal4(expenseTotal),
+          netIncome: formatDecimal4(netIncome),
         },
       },
     };

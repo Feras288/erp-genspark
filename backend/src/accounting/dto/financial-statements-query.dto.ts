@@ -47,7 +47,8 @@ export class TrialBalanceQueryDto {
 export class IncomeStatementQueryDto {
   @ApiPropertyOptional({
     example: '2026-01-01',
-    description: 'Inclusive period start (YYYY-MM-DD). Skeleton only.',
+    description:
+      'Inclusive period start (YYYY-MM-DD). Default: current fiscal YTD start.',
   })
   @IsOptional()
   @IsString()
@@ -56,7 +57,8 @@ export class IncomeStatementQueryDto {
 
   @ApiPropertyOptional({
     example: '2026-12-31',
-    description: 'Inclusive period end (YYYY-MM-DD). Skeleton only.',
+    description:
+      'Inclusive period end (YYYY-MM-DD, through T23:59:59.999Z). Default: end of today UTC.',
   })
   @IsOptional()
   @IsString()
