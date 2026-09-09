@@ -4202,3 +4202,215 @@ describe('Phase 11B-B-6: GL posting consolidation (e2e)', () => {
   });
 });
 
+// =====================================================
+// Phase 12A-B-2 — Trial Balance calculation (e2e smoke).
+//
+// Read-only GET /api/accounting/reports/trial-balance.
+// POSTED lines only. DRAFT / CANCELLED excluded.
+// Decimal strings; closing debit == closing credit.
+// =====================================================
+describe('Phase 12A-B-2: Trial Balance calculation (e2e smoke)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+  let cashierToken: string;
+
+  const unique = Date.now().toString(36);
+  const TB_CASH_CODE = `TB-CASH-${unique}`;
+  const TB_AP_CODE = `TB-AP-${unique}`;
+  const TB_DRAFT_DR = `TB-DRAFT-DR-${unique}`;
+  const TB_DRAFT_CR = `TB-DRAFT-CR-${unique}`;
+  const TB_CANC_DR = `TB-CANC-DR-${unique}`;
+  const TB_CANC_CR = `TB-CANC-CR-${unique}`;
+
+  let cashId = '';
+  let apId = '';
+  let draftDrId = '';
+  let draftCrId = '';
+  let cancDrId = '';
+  let cancCrId = '';
+
+  async function createAccount(
+    code: string,
+    name: string,
+    type: 'ASSET' | 'LIABILITY',
+    normalBalance: 'DEBIT' | 'CREDIT',
+  ): Promise<string> {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code, name, type, normalBalance, isActive: true });
+    expect([201, 409]).toContain(res.status);
+    if (res.body?.id) return res.body.id as string;
+    const list = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts?search=${encodeURIComponent(code)}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(list.status).toBe(200);
+    return list.body.items[0].id as string;
+  }
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+
+    cashId = await createAccount(TB_CASH_CODE, 'TB cash', 'ASSET', 'DEBIT');
+    apId = await createAccount(TB_AP_CODE, 'TB AP', 'LIABILITY', 'CREDIT');
+    draftDrId = await createAccount(TB_DRAFT_DR, 'TB draft dr', 'ASSET', 'DEBIT');
+    draftCrId = await createAccount(TB_DRAFT_CR, 'TB draft cr', 'LIABILITY', 'CREDIT');
+    cancDrId = await createAccount(TB_CANC_DR, 'TB canc dr', 'ASSET', 'DEBIT');
+    cancCrId = await createAccount(TB_CANC_CR, 'TB canc cr', 'LIABILITY', 'CREDIT');
+
+    const posted = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Phase 12A-B-2 posted TB fixture',
+        lines: [
+          { accountId: cashId, debit: '125.5000', credit: '0.0000' },
+          { accountId: apId, debit: '0.0000', credit: '125.5000' },
+        ],
+      });
+    expect(posted.status).toBe(201);
+    const postRes = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${posted.body.id}/post`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect([200, 201]).toContain(postRes.status);
+    expect(postRes.body.status).toBe('POSTED');
+
+    const draft = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Phase 12A-B-2 DRAFT must be excluded',
+        lines: [
+          { accountId: draftDrId, debit: '8888.0000', credit: '0.0000' },
+          { accountId: draftCrId, debit: '0.0000', credit: '8888.0000' },
+        ],
+      });
+    expect(draft.status).toBe(201);
+    expect(draft.body.status).toBe('DRAFT');
+
+    const cancelable = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Phase 12A-B-2 CANCELLED must be excluded',
+        lines: [
+          { accountId: cancDrId, debit: '7777.0000', credit: '0.0000' },
+          { accountId: cancCrId, debit: '0.0000', credit: '7777.0000' },
+        ],
+      });
+    expect(cancelable.status).toBe(201);
+    const cancelled = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${cancelable.body.id}/cancel`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: '12A-B-2 exclude CANCELLED from TB' });
+    expect([200, 201]).toContain(cancelled.status);
+    expect(cancelled.body.status).toBe('CANCELLED');
+
+    const cashierRole = await request(http)
+      .post(`${API_PREFIX}/rbac/roles`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        name: 'Cashier-E2E',
+        key: 'cashier_e2e',
+        description: 'test pos',
+      });
+    expect([201, 409]).toContain(cashierRole.status);
+
+    const cashierUser = await request(http)
+      .post(`${API_PREFIX}/users`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        email: 'cashier-e2e@example.sa',
+        password: 'Cashier@123',
+        fullName: 'Cashier E2E',
+        roleKeys: ['cashier_e2e'],
+      });
+    expect([200, 201, 409]).toContain(cashierUser.status);
+
+    const cashierLogin = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'cashier-e2e@example.sa', password: 'Cashier@123' });
+    expect(cashierLogin.status).toBe(200);
+    cashierToken = cashierLogin.body.accessToken;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('12A-B-2.1) GET trial-balance as admin returns non-empty POSTED accounts', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/trial-balance`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.report).toBe('trial-balance');
+    expect(typeof res.body.companyId).toBe('string');
+    expect(Array.isArray(res.body.data.accounts)).toBe(true);
+    expect(res.body.data.accounts.length).toBeGreaterThan(0);
+
+    const cash = res.body.data.accounts.find((a: { accountId: string }) => a.accountId === cashId);
+    const ap = res.body.data.accounts.find((a: { accountId: string }) => a.accountId === apId);
+    expect(cash).toBeDefined();
+    expect(ap).toBeDefined();
+    expect(cash.periodDebit).toBe('125.5000');
+    expect(ap.periodCredit).toBe('125.5000');
+    expect(cash.closingBalance).toBe('125.5000');
+    expect(ap.closingBalance).toBe('125.5000');
+  });
+
+  it('12A-B-2.2) closing debit equals closing credit (balanced)', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/trial-balance`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.totals.closingDebit).toBe(res.body.data.totals.closingCredit);
+    expect(res.body.data.totals.balanced).toBe(true);
+    expect(String(res.body.data.totals.closingDebit)).toMatch(/^\d+\.\d{4}$/);
+  });
+
+  it('12A-B-2.3) DRAFT and CANCELLED journals are excluded', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/trial-balance`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const ids = new Set(
+      (res.body.data.accounts as { accountId: string }[]).map((a) => a.accountId),
+    );
+    expect(ids.has(draftDrId)).toBe(false);
+    expect(ids.has(draftCrId)).toBe(false);
+    expect(ids.has(cancDrId)).toBe(false);
+    expect(ids.has(cancCrId)).toBe(false);
+  });
+
+  it('12A-B-2.4) GET trial-balance without gl_journal.read => 403', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/trial-balance`)
+      .set('Authorization', `Bearer ${cashierToken}`);
+    expect(res.status).toBe(403);
+  });
+});
+

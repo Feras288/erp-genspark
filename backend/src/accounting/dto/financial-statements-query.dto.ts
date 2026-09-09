@@ -16,7 +16,8 @@ import {
 export class TrialBalanceQueryDto {
   @ApiPropertyOptional({
     example: '2026-01-01',
-    description: 'Inclusive lower-bound ISO date (YYYY-MM-DD). Skeleton only.',
+    description:
+      'Inclusive period start (YYYY-MM-DD). Opening = POSTED lines before this UTC day.',
   })
   @IsOptional()
   @IsString()
@@ -25,7 +26,8 @@ export class TrialBalanceQueryDto {
 
   @ApiPropertyOptional({
     example: '2026-12-31',
-    description: 'Inclusive upper-bound ISO date (YYYY-MM-DD). Skeleton only.',
+    description:
+      'Inclusive period end (YYYY-MM-DD, through T23:59:59.999Z).',
   })
   @IsOptional()
   @IsString()
@@ -34,7 +36,7 @@ export class TrialBalanceQueryDto {
 
   @ApiPropertyOptional({
     description:
-      'When true, later 12A-B-2 includes zero-activity accounts. Default false.',
+      'When true, include company accounts with zero opening and period movement. Default false.',
   })
   @IsOptional()
   @Transform(({ value }) => value === true || value === 'true')

@@ -2,8 +2,8 @@
 // Phase 12A-B-1: Financial statements types (skeleton).
 //
 // Monetary fields are decimal strings (`toFixed(4)`). Internal
-// math in later 12A-B-2+ uses Prisma.Decimal only — never Number().
-// No JournalEntryLine aggregation lives here yet.
+// math uses Prisma.Decimal only — never Number().
+// Trial Balance row shape locked in 12A-B-2.
 // =====================================================
 
 export type DecimalString = string;
@@ -61,11 +61,13 @@ export type TrialBalanceAccountRow = {
   normalBalance: NormalBalanceKey;
   openingDebit: DecimalString;
   openingCredit: DecimalString;
+  openingBalance: DecimalString;
   periodDebit: DecimalString;
   periodCredit: DecimalString;
+  periodBalance: DecimalString;
   closingDebit: DecimalString;
   closingCredit: DecimalString;
-  netBalance: DecimalString;
+  closingBalance: DecimalString;
 };
 
 export type TrialBalanceTotals = {
