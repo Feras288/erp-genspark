@@ -57,6 +57,7 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  NotImplementedException,
 } from '@nestjs/common';
 import { Prisma, PaymentMethod, PaymentStatus, SalesInvoiceStatus } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
@@ -322,5 +323,26 @@ export class PaymentsService {
       idempotencyKey: p.idempotencyKey,
       createdAt: p.createdAt,
     };
+  }
+
+  // --- Phase 10B-B-1: AP payments skeleton (Read+Write stubs) ---
+  async listPurchasePayments(
+    companyId: string,
+    invoiceId: string,
+    _q: PaymentsQueryDto,
+  ): Promise<PaymentResponseRow[]> {
+    if (!companyId) throw new BadRequestException('companyId (jwt) is required');
+    if (!invoiceId) throw new BadRequestException('invoiceId is required');
+    void invoiceId;
+    return [];
+  }
+  async registerPurchasePayment(
+    me: AuthenticatedUser,
+    invoiceId: string,
+    _dto: CreatePaymentDto,
+  ): Promise<PaymentResponseRow> {
+    if (!me?.companyId) throw new BadRequestException('companyId (jwt) is required');
+    void invoiceId;
+    throw new NotImplementedException('AP payment registration arrives in Phase 10B-B-2');
   }
 }

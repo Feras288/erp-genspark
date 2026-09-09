@@ -19,11 +19,11 @@
 //   * No frontend, no README change.
 // =====================================================
 import { Module } from '@nestjs/common';
-import { PaymentsController } from './payments.controller';
+import { ApPaymentsController, PaymentsController } from './payments.controller';
 import { PaymentsService } from './payments.service';
 
 @Module({
-  controllers: [PaymentsController],
+  controllers: [PaymentsController, ApPaymentsController],
   providers: [PaymentsService],
   exports: [PaymentsService],
 })

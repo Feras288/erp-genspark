@@ -118,3 +118,31 @@ export class PaymentsController {
     return this.svc.register(me, invoiceId, body);
   }
 }
+
+// --- Phase 10B-B-1: AP payments skeleton (Read+Write stubs) ---
+@ApiTags('AP Payments')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@Controller('purchase-invoices/:invoiceId/payments')
+export class ApPaymentsController {
+  constructor(private readonly svc: PaymentsService) {}
+  @Get()
+  @RequirePermissions('ap_payments.read')
+  list(
+    @CurrentUser() me: AuthenticatedUser,
+    @Param('invoiceId') invoiceId: string,
+    @Query() q: PaymentsQueryDto,
+  ): Promise<PaymentResponseRow[]> {
+    return this.svc.listPurchasePayments(me.companyId, invoiceId, q);
+  }
+  @Post()
+  @HttpCode(201)
+  @RequirePermissions('ap_payments.write')
+  register(
+    @CurrentUser() me: AuthenticatedUser,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: CreatePaymentDto,
+  ): Promise<PaymentResponseRow> {
+    return this.svc.registerPurchasePayment(me, invoiceId, body);
+  }
+}
