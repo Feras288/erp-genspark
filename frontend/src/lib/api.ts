@@ -518,6 +518,14 @@ export const api = {
     } = {},
   ) => api.listJournalEntries(params),
 
+  // ===== Phase 12A-C: Financial Statements =====
+  getTrialBalance: (params: TrialBalanceQueryParams = {}) =>
+    getTrialBalance(params),
+  getIncomeStatement: (params: IncomeStatementQueryParams = {}) =>
+    getIncomeStatement(params),
+  getBalanceSheet: (params: BalanceSheetQueryParams = {}) =>
+    getBalanceSheet(params),
+
   // ===== Phase 7C: Reports =====
   // Read-only aggregates. All 6 endpoints are gated by `reports.read`
   // server-side; the client passes the query params supported by
@@ -1650,3 +1658,201 @@ export interface ApPaymentListQuery {
   fromDate?: string; // ISO date (yyyy-mm-dd)
   toDate?: string;   // ISO date (yyyy-mm-dd)
 }
+
+// =====================================================
+// Phase 12A-C: Financial Statements types & API functions.
+// =====================================================
+
+export type FinancialStatementReportName =
+  | 'trial-balance'
+  | 'income-statement'
+  | 'balance-sheet';
+
+export type FinancialStatementStatus = 'ok';
+
+export type FinancialStatementEnvelope<
+  TReport extends FinancialStatementReportName,
+  TFilters,
+  TData,
+> = {
+  status: FinancialStatementStatus;
+  report: TReport;
+  companyId: string;
+  filters: TFilters;
+  generatedAt: string;
+  data: TData;
+};
+
+export type TrialBalanceFilters = {
+  fromDate: string | null;
+  toDate: string | null;
+  includeZero: boolean;
+};
+
+export type IncomeStatementFilters = {
+  fromDate: string | null;
+  toDate: string | null;
+};
+
+export type BalanceSheetFilters = {
+  asOfDate: string | null;
+};
+
+export type TrialBalanceAccountRow = {
+  accountId: string;
+  code: string;
+  name: string;
+  nameAr: string | null;
+  type: AccountTypeKey;
+  normalBalance: NormalBalanceKey;
+  openingDebit: string;
+  openingCredit: string;
+  openingBalance: string;
+  periodDebit: string;
+  periodCredit: string;
+  periodBalance: string;
+  closingDebit: string;
+  closingCredit: string;
+  closingBalance: string;
+};
+
+export type TrialBalanceTotals = {
+  openingDebit: string;
+  openingCredit: string;
+  periodDebit: string;
+  periodCredit: string;
+  closingDebit: string;
+  closingCredit: string;
+  balanced: boolean;
+};
+
+export type TrialBalanceData = {
+  accounts: TrialBalanceAccountRow[];
+  totals: TrialBalanceTotals;
+};
+
+export type TrialBalanceReport = FinancialStatementEnvelope<
+  'trial-balance',
+  TrialBalanceFilters,
+  TrialBalanceData
+>;
+
+export type IncomeStatementLine = {
+  accountId: string;
+  code: string;
+  name: string;
+  type: AccountTypeKey;
+  normalBalance: NormalBalanceKey;
+  debitTotal: string;
+  creditTotal: string;
+  amount: string;
+};
+
+export type IncomeStatementTotals = {
+  revenue: string;
+  expenses: string;
+  netIncome: string;
+};
+
+export type IncomeStatementData = {
+  revenue: IncomeStatementLine[];
+  expenses: IncomeStatementLine[];
+  totals: IncomeStatementTotals;
+};
+
+export type IncomeStatementReport = FinancialStatementEnvelope<
+  'income-statement',
+  IncomeStatementFilters,
+  IncomeStatementData
+>;
+
+export type BalanceSheetLine = {
+  accountId: string;
+  code: string;
+  name: string;
+  type: AccountTypeKey;
+  normalBalance: NormalBalanceKey;
+  debitTotal: string;
+  creditTotal: string;
+  amount: string;
+};
+
+export type BalanceSheetSyntheticEquity = {
+  retainedEarningsComputed: string;
+  currentPeriodNetIncome: string;
+};
+
+export type BalanceSheetTotals = {
+  assets: string;
+  liabilities: string;
+  equity: string;
+  liabilitiesAndEquity: string;
+  balanced: boolean;
+};
+
+export type BalanceSheetData = {
+  assets: BalanceSheetLine[];
+  liabilities: BalanceSheetLine[];
+  equity: BalanceSheetLine[];
+  syntheticEquity: BalanceSheetSyntheticEquity;
+  totals: BalanceSheetTotals;
+};
+
+export type BalanceSheetReport = FinancialStatementEnvelope<
+  'balance-sheet',
+  BalanceSheetFilters,
+  BalanceSheetData
+>;
+
+export interface TrialBalanceQueryParams {
+  fromDate?: string;
+  toDate?: string;
+  includeZero?: boolean;
+}
+
+export interface IncomeStatementQueryParams {
+  fromDate?: string;
+  toDate?: string;
+}
+
+export interface BalanceSheetQueryParams {
+  asOfDate?: string;
+}
+
+export function getTrialBalance(
+  params: TrialBalanceQueryParams = {},
+): Promise<TrialBalanceReport> {
+  const q = new URLSearchParams();
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  if (params.includeZero !== undefined)
+    q.set('includeZero', String(params.includeZero));
+  const qs = q.toString();
+  return apiRequest<TrialBalanceReport>(
+    `/accounting/reports/trial-balance${qs ? `?${qs}` : ''}`,
+  );
+}
+
+export function getIncomeStatement(
+  params: IncomeStatementQueryParams = {},
+): Promise<IncomeStatementReport> {
+  const q = new URLSearchParams();
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  const qs = q.toString();
+  return apiRequest<IncomeStatementReport>(
+    `/accounting/reports/income-statement${qs ? `?${qs}` : ''}`,
+  );
+}
+
+export function getBalanceSheet(
+  params: BalanceSheetQueryParams = {},
+): Promise<BalanceSheetReport> {
+  const q = new URLSearchParams();
+  if (params.asOfDate) q.set('asOfDate', params.asOfDate);
+  const qs = q.toString();
+  return apiRequest<BalanceSheetReport>(
+    `/accounting/reports/balance-sheet${qs ? `?${qs}` : ''}`,
+  );
+}
+

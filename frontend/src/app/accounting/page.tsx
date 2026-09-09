@@ -608,17 +608,27 @@ export default function AccountingPage() {
         <div>
           <h1 className="text-3xl font-bold text-slate-800">المحاسبة</h1>
           <p className="text-sm text-slate-500">
-            دليل الحسابات والقيود اليدوية. يعرض البيانات داخل شركتك فقط
-            ({user.companyId}). لا توجد تقارير مالية هنا (ميزان مراجعة / قائمة
-            دخل / ZATCA) — هذه خارج النطاق.
+            دليل الحسابات والقيود اليدوية داخل شركتك ({user.companyId}). للاطلاع
+            على ميزان المراجعة وقائمة الدخل والميزانية العمومية، انتقل إلى صفحة
+            القوائم المالية.
           </p>
         </div>
-        <Link
-          href="/dashboard"
-          className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"
-        >
-          لوحة المعلومات
-        </Link>
+        <div className="flex items-center gap-2">
+          {hasPermission('gl_journal.read') && (
+            <Link
+              href="/accounting/reports"
+              className="rounded-md bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2"
+            >
+              القوائم المالية
+            </Link>
+          )}
+          <Link
+            href="/dashboard"
+            className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"
+          >
+            لوحة المعلومات
+          </Link>
+        </div>
       </header>
 
       {rowActionErr && (
