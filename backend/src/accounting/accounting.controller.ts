@@ -23,6 +23,7 @@ import { RequirePermissions } from '../auth/decorators/require-permissions.decor
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../common/types/auth.types';
 import { AccountingService } from './accounting.service';
+import { FinancialStatementsService } from './financial-statements.service';
 import { CreateAccountDto } from './dto/create-account.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
 import { AccountingQueryDto, JournalEntryQueryDto } from './dto/accounting-query.dto';
@@ -30,13 +31,51 @@ import { CreateJournalEntryDto } from './dto/create-journal-entry.dto';
 import { UpdateJournalEntryDto } from './dto/update-journal-entry.dto';
 import { PostJournalEntryDto } from './dto/post-journal-entry.dto';
 import { CancelJournalEntryDto } from './dto/cancel-journal-entry.dto';
+import {
+  TrialBalanceQueryDto,
+  IncomeStatementQueryDto,
+  BalanceSheetQueryDto,
+} from './dto/financial-statements-query.dto';
 
 @ApiTags('Accounting')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 @Controller('accounting')
 export class AccountingController {
-  constructor(private readonly svc: AccountingService) {}
+  constructor(
+    private readonly svc: AccountingService,
+    private readonly statements: FinancialStatementsService,
+  ) {}
+
+  // ===== Phase 12A-B-1: Financial statements (read-only skeleton) =====
+  // companyId from JWT only. No posting / reverse / close.
+
+  @Get('reports/trial-balance')
+  @RequirePermissions('gl_journal.read')
+  trialBalance(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() q: TrialBalanceQueryDto,
+  ) {
+    return this.statements.trialBalance(me.companyId, q);
+  }
+
+  @Get('reports/income-statement')
+  @RequirePermissions('gl_journal.read')
+  incomeStatement(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() q: IncomeStatementQueryDto,
+  ) {
+    return this.statements.incomeStatement(me.companyId, q);
+  }
+
+  @Get('reports/balance-sheet')
+  @RequirePermissions('gl_journal.read')
+  balanceSheet(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() q: BalanceSheetQueryDto,
+  ) {
+    return this.statements.balanceSheet(me.companyId, q);
+  }
 
   // ===== Chart of Accounts =====
 
