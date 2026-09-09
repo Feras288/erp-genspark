@@ -489,6 +489,35 @@ export const api = {
       body: data,
     }),
 
+  // ===== Phase 11A-C-code: GL minimal read-only wrappers =====
+  // Semantic aliases over the Phase 6 read endpoints. The server-side
+  // wire shape is unchanged (`Paginated<Account>` /
+  // `Paginated<JournalEntry>`); these wrappers give the new read-only
+  // screen a `gl_*` *intent layer* that mirrors the Phase 11A-B-4
+  // server-side permission keys (`gl_accounts.read` / `gl_journal.read`)
+  // without inventing a new DTO shape. They MUST stay in sync with
+  // `listAccounts` / `listJournalEntries` above — these are intentionally
+  // pass-through, not copies, so a backend DTO change propagates
+  // everywhere.
+  listGlAccounts: (
+    params: {
+      page?: number;
+      pageSize?: number;
+      search?: string;
+      type?: AccountTypeKey;
+      includeInactive?: boolean;
+      rootsOnly?: boolean;
+    } = {},
+  ) => api.listAccounts(params),
+  listGlJournalEntries: (
+    params: {
+      page?: number;
+      pageSize?: number;
+      search?: string;
+      status?: JournalEntryStatusKey;
+    } = {},
+  ) => api.listJournalEntries(params),
+
   // ===== Phase 7C: Reports =====
   // Read-only aggregates. All 6 endpoints are gated by `reports.read`
   // server-side; the client passes the query params supported by
@@ -1127,6 +1156,26 @@ export type CancelJournalEntryInput = {
   reason?: string;
   notes?: string;
 };
+
+// =====================================================
+// Phase 11A-C-code types — semantic aliases for GL viewing.
+//
+// Do NOT add fields beyond what the backend contract emits on
+// `Account` / `JournalEntry` / `JournalEntryLine`. These aliases exist
+// so the new read-only screen (`frontend/src/app/accounting/gl/page.tsx`)
+// reads as a `gl_*` reader surface without re-declaring the Prisma
+// selection shapes. The underlying wire payloads are byte-identical
+// between `listAccounts` / `listJournalEntries` and `listGlAccounts` /
+// `listGlJournalEntries` — server is unchanged.
+//
+// Money columns serialize as strings from `Prisma.Decimal @db.Decimal`
+// (no Number coercion client-side).
+// =====================================================
+
+export type GlAccount = Account;
+export type GlJournalEntry = JournalEntry;
+export type GlJournalLine = JournalEntryLine;
+export type GlListResponse<T> = Paginated<T>;
 
 // =====================================================
 // Phase 7C types — Reports endpoints.
