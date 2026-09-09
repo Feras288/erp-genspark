@@ -146,3 +146,41 @@ export interface PeriodCloseValidationResponse {
   companyId: string;
   data: PeriodCloseValidationData;
 }
+
+export interface ClosePeriodResponse {
+  status: 'ok';
+  companyId: string;
+  data: {
+    periodClose: {
+      id: string;
+      periodStart: string;
+      periodEnd: string;
+      fiscalYear: number;
+      periodNumber: number | null;
+      status: PeriodCloseStatus;
+      closedAt: string | null;
+      closedById: string | null;
+      notes: string | null;
+    };
+    validation: {
+      canClose: boolean;
+      blockingFailures: number;
+    };
+  };
+}
+
+export interface ReopenPeriodResponse {
+  status: 'ok';
+  companyId: string;
+  data: {
+    periodClose: {
+      id: string;
+      periodStart: string;
+      periodEnd: string;
+      status: PeriodCloseStatus;
+      reopenedAt: string | null;
+      reopenedById: string | null;
+      reopenReason: string | null;
+    };
+  };
+}

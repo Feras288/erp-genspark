@@ -4,7 +4,15 @@
 // Guarded with JwtAuthGuard, PermissionsGuard, and @RequirePermissions('period_close.read')
 // Tenant isolation via JWT companyId only.
 // =====================================================
-import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../auth/guards/permissions.guard';
@@ -19,6 +27,8 @@ import {
   GetPeriodCloseStatusQueryDto,
 } from './dto/period-close-query.dto';
 import { ValidatePeriodCloseDto } from './dto/validate-period-close.dto';
+import { ClosePeriodDto } from './dto/close-period.dto';
+import { ReopenPeriodDto } from './dto/reopen-period.dto';
 
 @ApiTags('Accounting - Period Close')
 @ApiBearerAuth()
@@ -70,5 +80,24 @@ export class PeriodCloseController {
     @Body() dto: ValidatePeriodCloseDto,
   ) {
     return this.svc.validatePeriod(me.companyId, dto);
+  }
+
+  @Post('periods/close')
+  @RequirePermissions('period_close.close')
+  closePeriod(
+    @CurrentUser() me: AuthenticatedUser,
+    @Body() dto: ClosePeriodDto,
+  ) {
+    return this.svc.closePeriod(me.companyId, me.id, dto);
+  }
+
+  @Post('periods/:id/reopen')
+  @RequirePermissions('period_close.reopen')
+  reopenPeriod(
+    @CurrentUser() me: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: ReopenPeriodDto,
+  ) {
+    return this.svc.reopenPeriod(me.companyId, me.id, id, dto);
   }
 }

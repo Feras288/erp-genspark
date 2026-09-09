@@ -4,9 +4,15 @@
 // Tenant-scoped by companyId (extracted from JWT).
 // Zero mutations, zero GL posting, zero Number() money arithmetic.
 // =====================================================
-import { Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import {
   JournalEntryStatus,
+  PeriodCloseAuditAction,
   PeriodCloseStatus,
   Prisma,
   ReconciliationStatus,
@@ -19,13 +25,17 @@ import {
   GetPeriodCloseStatusQueryDto,
 } from './dto/period-close-query.dto';
 import { ValidatePeriodCloseDto } from './dto/validate-period-close.dto';
+import { ClosePeriodDto } from './dto/close-period.dto';
+import { ReopenPeriodDto } from './dto/reopen-period.dto';
 import {
+  ClosePeriodResponse,
   FiscalYearCloseListResponse,
   PeriodCloseAuditLogListResponse,
   PeriodCloseListResponse,
   PeriodCloseStatusResponse,
   PeriodCloseValidationCheck,
   PeriodCloseValidationResponse,
+  ReopenPeriodResponse,
 } from './types/period-close.types';
 
 function parseDateStartUtc(dateStr?: string | null): Date | null {
@@ -639,6 +649,210 @@ export class PeriodCloseService {
         totals: {
           postedDebitTotal: postedDebitTotal.toFixed(4),
           postedCreditTotal: postedCreditTotal.toFixed(4),
+        },
+      },
+    };
+  }
+
+  /**
+   * 6. POST close an accounting period.
+   * Runs validation, verifies overlap, creates/updates PeriodClose as CLOSED,
+   * writes PeriodCloseAuditLog, all inside a database transaction.
+   */
+  async closePeriod(
+    companyId: string,
+    userId: string,
+    dto: ClosePeriodDto,
+  ): Promise<ClosePeriodResponse> {
+    const startUtc = parseDateStartUtc(dto.periodStart);
+    const endUtc = parseDateEndUtc(dto.periodEnd);
+
+    if (!startUtc || !endUtc || endUtc < startUtc) {
+      throw new BadRequestException(
+        'Invalid date range: periodEnd must be greater than or equal to periodStart',
+      );
+    }
+
+    // Run existing validation logic
+    const validation = await this.validatePeriod(companyId, {
+      periodStart: dto.periodStart,
+      periodEnd: dto.periodEnd,
+      fiscalYear: dto.fiscalYear,
+      periodNumber: dto.periodNumber,
+    });
+
+    if (!validation.data.canClose) {
+      throw new ConflictException({
+        message:
+          'Period close validation failed. Please resolve blocking checks before closing.',
+        validation: validation.data,
+      });
+    }
+
+    // Check if an exact PeriodClose row already exists
+    const existing = await this.prisma.periodClose.findUnique({
+      where: {
+        companyId_periodStart_periodEnd: {
+          companyId,
+          periodStart: startUtc,
+          periodEnd: endUtc,
+        },
+      },
+    });
+
+    if (
+      existing &&
+      (existing.status === PeriodCloseStatus.CLOSED ||
+        existing.status === PeriodCloseStatus.CLOSING)
+    ) {
+      throw new ConflictException('Period is already closed or closing');
+    }
+
+    const closedAt = new Date();
+
+    const periodClose = await this.prisma.$transaction(async (tx) => {
+      let pc;
+      if (existing) {
+        pc = await tx.periodClose.update({
+          where: { id: existing.id },
+          data: {
+            status: PeriodCloseStatus.CLOSED,
+            closedAt,
+            closedById: userId,
+            fiscalYear: dto.fiscalYear ?? existing.fiscalYear,
+            periodNumber: dto.periodNumber ?? existing.periodNumber,
+            notes: dto.notes ?? existing.notes,
+          },
+        });
+      } else {
+        pc = await tx.periodClose.create({
+          data: {
+            companyId,
+            fiscalYear: dto.fiscalYear ?? startUtc.getUTCFullYear(),
+            periodNumber: dto.periodNumber ?? null,
+            periodStart: startUtc,
+            periodEnd: endUtc,
+            status: PeriodCloseStatus.CLOSED,
+            closedAt,
+            closedById: userId,
+            notes: dto.notes ?? null,
+          },
+        });
+      }
+
+      await tx.periodCloseAuditLog.create({
+        data: {
+          companyId,
+          periodCloseId: pc.id,
+          action: PeriodCloseAuditAction.CLOSED,
+          actorUserId: userId,
+          reason: dto.notes ?? null,
+          metadata: {
+            periodStart: startUtc.toISOString(),
+            periodEnd: endUtc.toISOString(),
+            fiscalYear: pc.fiscalYear,
+            periodNumber: pc.periodNumber,
+          },
+        },
+      });
+
+      return pc;
+    });
+
+    return {
+      status: 'ok',
+      companyId,
+      data: {
+        periodClose: {
+          id: periodClose.id,
+          periodStart: periodClose.periodStart.toISOString(),
+          periodEnd: periodClose.periodEnd.toISOString(),
+          fiscalYear: periodClose.fiscalYear,
+          periodNumber: periodClose.periodNumber,
+          status: periodClose.status,
+          closedAt: periodClose.closedAt
+            ? periodClose.closedAt.toISOString()
+            : null,
+          closedById: periodClose.closedById,
+          notes: periodClose.notes,
+        },
+        validation: {
+          canClose: validation.data.canClose,
+          blockingFailures: validation.data.blockingFailures,
+        },
+      },
+    };
+  }
+
+  /**
+   * 7. POST reopen a closed accounting period.
+   * Reopens a CLOSED period back to OPEN status with audit logging.
+   */
+  async reopenPeriod(
+    companyId: string,
+    userId: string,
+    id: string,
+    dto: ReopenPeriodDto,
+  ): Promise<ReopenPeriodResponse> {
+    const existing = await this.prisma.periodClose.findFirst({
+      where: { id, companyId },
+    });
+
+    if (!existing) {
+      throw new NotFoundException('Period close record not found');
+    }
+
+    if (existing.status !== PeriodCloseStatus.CLOSED) {
+      throw new ConflictException(
+        `Only CLOSED periods may be reopened (current status: ${existing.status})`,
+      );
+    }
+
+    const reopenedAt = new Date();
+
+    const reopenedPeriod = await this.prisma.$transaction(async (tx) => {
+      const period = await tx.periodClose.update({
+        where: { id: existing.id },
+        data: {
+          status: PeriodCloseStatus.OPEN,
+          reopenedAt,
+          reopenedById: userId,
+          reopenReason: dto.reason,
+        },
+      });
+
+      await tx.periodCloseAuditLog.create({
+        data: {
+          companyId,
+          periodCloseId: period.id,
+          action: PeriodCloseAuditAction.REOPENED,
+          actorUserId: userId,
+          reason: dto.reason,
+          metadata: {
+            periodStart: period.periodStart.toISOString(),
+            periodEnd: period.periodEnd.toISOString(),
+            reopenedAt: reopenedAt.toISOString(),
+          },
+        },
+      });
+
+      return period;
+    });
+
+    return {
+      status: 'ok',
+      companyId,
+      data: {
+        periodClose: {
+          id: reopenedPeriod.id,
+          periodStart: reopenedPeriod.periodStart.toISOString(),
+          periodEnd: reopenedPeriod.periodEnd.toISOString(),
+          status: reopenedPeriod.status,
+          reopenedAt: reopenedPeriod.reopenedAt
+            ? reopenedPeriod.reopenedAt.toISOString()
+            : null,
+          reopenedById: reopenedPeriod.reopenedById,
+          reopenReason: reopenedPeriod.reopenReason,
         },
       },
     };
