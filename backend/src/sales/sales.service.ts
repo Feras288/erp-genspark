@@ -39,6 +39,7 @@ import { UpdateSalesInvoiceDto } from './dto/update-sales-invoice.dto';
 import { SalesInvoiceQueryDto } from './dto/sales-invoice-query.dto';
 import { IssueSalesInvoiceDto } from './dto/issue-sales-invoice.dto';
 import { CancelSalesInvoiceDto } from './dto/cancel-sales-invoice.dto';
+import { postSalesInvoiceIssued } from '../accounting/posting-events';
 
 const INVOICE_FIELDS = {
   id: true,
@@ -609,7 +610,11 @@ export class SalesService {
    *   - first, validate headers + lines + product/warehouse references;
    *   - then, deduct stock level by level (capture supplier qty for atomic math);
    *   - then, append StockMovement rows (these are append-only);
-   *   - finally, flip the invoice to ISSUED.
+   *   - then, flip the invoice to ISSUED;
+   *   - finally, auto-post one POSTED JournalEntry (Phase 11B-B-2)
+   *     linked by sourceType=SALES_INVOICE / sourceId=invoice.id.
+   *     Unique (companyId, sourceType, sourceId) makes retries
+   *     idempotent. Same $transaction as the status flip.
    */
   async issue(
     companyId: string,
@@ -772,6 +777,19 @@ export class SalesService {
           updatedById: actorUserId,
         } as Prisma.SalesInvoiceUncheckedUpdateInput,
         select: INVOICE_WITH_LINES,
+      });
+
+      await postSalesInvoiceIssued(tx, {
+        companyId,
+        userId: actorUserId,
+        invoice: {
+          id: updated.id,
+          invoiceNumber: updated.invoiceNumber,
+          subtotal: updated.subtotal,
+          vatTotal: updated.vatTotal,
+          discountTotal: updated.discountTotal,
+          total: updated.total,
+        },
       });
 
       return { invoice: updated, productLineCount, serviceLineCount, movements: movements.length };

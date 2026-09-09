@@ -1,5 +1,5 @@
-// Phase 11B-B-1: posting-event templates (read-only).
-// No $transaction, no trigger wiring, no service call sites.
+// Phase 11B-B-1: posting-event templates (read-only builders).
+// Phase 11B-B-2: sales_invoice_issued handler (called from SalesService.issue).
 export {
   assertBalancedLines,
   DECIMAL_ZERO,
@@ -15,6 +15,8 @@ export { buildSalesInvoiceIssuedTemplate } from './sales-invoice-issued.template
 export { buildPurchaseInvoiceReceivedTemplate } from './purchase-invoice-received.template';
 export { buildArPaymentPostedTemplate } from './ar-payment-posted.template';
 export { buildApPaymentPostedTemplate } from './ap-payment-posted.template';
+export { postSalesInvoiceIssued } from './handlers/sales-invoice-issued.handler';
+export type { PostSalesInvoiceIssuedResult } from './handlers/sales-invoice-issued.handler';
 export type {
   ApPaymentPostedSource,
   ArPaymentPostedSource,
