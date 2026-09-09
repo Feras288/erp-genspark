@@ -129,9 +129,15 @@ The immutable binding between a `BankTransaction` and an ERP `Payment`.
 - `matchedById`: String? (foreign key to `User`)
 - `unmatchedAt`: DateTime? (populated if match is reversed)
 - `unmatchedById`: String?
-- **Constraints**:
-  - `@@unique([companyId, bankTransactionId])` (1-to-1 match constraint in initial phase)
-  - `@@unique([companyId, paymentId])`
+- **Constraints & Uniqueness**:
+  - Initial implementation must enforce one active match per bank transaction and one active match per payment.
+  - If the MVP uses hard-delete on unmatch, plain unique constraints are acceptable:
+    - `@@unique([companyId, bankTransactionId])`
+    - `@@unique([companyId, paymentId])`
+  - If soft-unmatch retains historical `ReconciliationMatch` rows, do NOT use plain Prisma `@@unique` for those fields because it would block future re-matching.
+  - In soft-unmatch mode, enforce active uniqueness with PostgreSQL partial unique indexes in the migration SQL:
+    - `CREATE UNIQUE INDEX reconciliation_match_active_bank_tx_uniq ON reconciliation_matches(company_id, bank_transaction_id) WHERE unmatched_at IS NULL;`
+    - `CREATE UNIQUE INDEX reconciliation_match_active_payment_uniq ON reconciliation_matches(company_id, payment_id) WHERE unmatched_at IS NULL;`
   - `@@index([companyId, matchedAt])`
 
 ---
@@ -222,9 +228,10 @@ When evaluating candidates for a `BankTransaction`, the engine ranks potential `
 
 ### 4.4 Unmatching Workflow
 - Either party may unmatch an active pair.
-- The `ReconciliationMatch` record is removed or marked `unmatchedAt` with audit user details.
-- Both the `BankTransaction` and `Payment` revert to status `UNMATCHED`.
-- Posted journal entries in the GL remain completely untouched.
+- The `ReconciliationMatch` is marked as inactive/unmatched with `unmatchedAt` and `unmatchedById`, or hard-deleted in the MVP if audit history is separately captured.
+- The `BankTransaction` returns to `UNMATCHED` status.
+- The `Payment.status` remains unchanged (`POSTED`); reconciliation state is derived from active `ReconciliationMatch` rows.
+- Posted `JournalEntry` and `JournalEntryLine` records remain completely untouched.
 
 ---
 
