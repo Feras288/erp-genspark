@@ -30,6 +30,8 @@ import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 import { ImportStatementCsvDto } from './dto/import-statement-csv.dto';
 import { GetSuggestionsQueryDto } from './dto/get-suggestions-query.dto';
 import { CreateReconciliationMatchDto } from './dto/create-reconciliation-match.dto';
+import { GetUnmatchedReportQueryDto } from './dto/get-unmatched-report-query.dto';
+import { GetSummaryReportQueryDto } from './dto/get-summary-report-query.dto';
 import { UploadedCsvFile } from './types/reconciliation.types';
 
 @ApiTags('Reconciliation')
@@ -106,8 +108,20 @@ export class ReconciliationController {
 
   @Get('reports/unmatched')
   @RequirePermissions('reconciliation.read')
-  unmatchedReport(@CurrentUser() me: AuthenticatedUser) {
-    return this.svc.unmatchedReport(me.companyId);
+  unmatchedReport(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() query: GetUnmatchedReportQueryDto,
+  ) {
+    return this.svc.unmatchedReport(me.companyId, query);
+  }
+
+  @Get('reports/summary')
+  @RequirePermissions('reconciliation.read')
+  summaryReport(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() query: GetSummaryReportQueryDto,
+  ) {
+    return this.svc.summaryReport(me.companyId, query);
   }
 
   @Post('matches')

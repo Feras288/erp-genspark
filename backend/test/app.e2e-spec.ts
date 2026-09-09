@@ -5882,7 +5882,286 @@ describe('Phase 12A-B-5: Financial Statements consolidation (e2e)', () => {
       expect(resNotFound.status).toBe(404);
     });
   });
+
+  // ===== Phase 13A-B-6: Reconciliation reports =====
+  describe('Phase 13A-B-6: Reconciliation reports', () => {
+    let reconToken: string;
+    let cashierToken: string;
+    let adminCompanyId: string;
+    let testBankAccountId: string;
+    let reportInflowTxId: string;
+    let reportOutflowTxId: string;
+    let reportArPaymentId: string;
+    let reportApPaymentId: string;
+    let otherCompanyId: string;
+    let otherBankAccountId: string;
+    let otherTxId: string;
+    const unique = Date.now().toString().slice(-6);
+
+    beforeAll(async () => {
+      const prisma = app.get(PrismaService);
+
+      const loginRes = await request(http)
+        .post(`${API_PREFIX}/auth/login`)
+        .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+      reconToken = loginRes.body.accessToken;
+      adminCompanyId = loginRes.body.user.companyId;
+
+      const cashierLogin = await request(http)
+        .post(`${API_PREFIX}/auth/login`)
+        .send({ email: 'cashier-e2e@example.sa', password: 'Cashier@123' });
+      if (cashierLogin.status === 200) {
+        cashierToken = cashierLogin.body.accessToken;
+      }
+
+      // 1. Create a bank account without linked GL account
+      const createAccRes = await request(http)
+        .post(`${API_PREFIX}/reconciliation/bank-accounts`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankName: 'Riyad Bank',
+          accountName: 'Reports Test Account',
+          accountNumber: `ACC-REP-${unique}`,
+          iban: `SA55667788990011223344${unique}`,
+          currency: 'SAR',
+          openingBalance: '25000.0000',
+        });
+      expect(createAccRes.status).toBe(201);
+      testBankAccountId = createAccRes.body.data.id;
+
+      // Invoices for Payment FK constraint
+      const salesInv = await prisma.salesInvoice.findFirst({
+        where: { companyId: adminCompanyId },
+      });
+      const purchInv = await prisma.purchaseInvoice.findFirst({
+        where: { companyId: adminCompanyId },
+      });
+
+      const now = new Date();
+
+      // 2. Unmatched AR payment (SALES)
+      const arPayment = await prisma.payment.create({
+        data: {
+          companyId: adminCompanyId,
+          salesInvoiceId: salesInv?.id || null,
+          purchaseInvoiceId: null,
+          invoiceType: 'SALES',
+          paymentMethod: 'TRANSFER',
+          amount: new Prisma.Decimal('5000.0000'),
+          paidAt: now,
+          reference: `AR-REP-${unique}`,
+          status: 'POSTED',
+        },
+      });
+      reportArPaymentId = arPayment.id;
+
+      // 3. Unmatched AP payment (PURCHASE)
+      const apPayment = await prisma.payment.create({
+        data: {
+          companyId: adminCompanyId,
+          salesInvoiceId: null,
+          purchaseInvoiceId: purchInv?.id || null,
+          invoiceType: 'PURCHASE',
+          paymentMethod: 'TRANSFER',
+          amount: new Prisma.Decimal('1200.0000'),
+          paidAt: now,
+          reference: `AP-REP-${unique}`,
+          status: 'POSTED',
+        },
+      });
+      reportApPaymentId = apPayment.id;
+
+      // 4. Unmatched INFLOW bank transaction
+      const inflow = await prisma.bankTransaction.create({
+        data: {
+          companyId: adminCompanyId,
+          bankAccountId: testBankAccountId,
+          transactionDate: now,
+          type: 'INFLOW',
+          amount: new Prisma.Decimal('5000.0000'),
+          reference: `AR-REP-${unique}`,
+          description: 'Client payment',
+          fingerprint: `fp-inflow-rep-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      reportInflowTxId = inflow.id;
+
+      // 5. Unmatched OUTFLOW bank transaction
+      const outflow = await prisma.bankTransaction.create({
+        data: {
+          companyId: adminCompanyId,
+          bankAccountId: testBankAccountId,
+          transactionDate: now,
+          type: 'OUTFLOW',
+          amount: new Prisma.Decimal('1200.0000'),
+          reference: `AP-REP-${unique}`,
+          description: 'Supplier wire',
+          fingerprint: `fp-outflow-rep-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      reportOutflowTxId = outflow.id;
+
+      // 6. Create another company for tenant scoping test
+      const otherCompany = await prisma.company.create({
+        data: { name: `Isolation Corp ${unique}` },
+      });
+      otherCompanyId = otherCompany.id;
+
+      const otherBankAcc = await prisma.bankAccount.create({
+        data: {
+          companyId: otherCompanyId,
+          bankName: 'SNB Bank',
+          accountName: 'Other Corp Account',
+          accountNumber: `ACC-OTHER-${unique}`,
+          iban: `SA99887711223344556677${unique}`,
+          currency: 'SAR',
+        },
+      });
+      otherBankAccountId = otherBankAcc.id;
+
+      const otherTx = await prisma.bankTransaction.create({
+        data: {
+          companyId: otherCompanyId,
+          bankAccountId: otherBankAccountId,
+          transactionDate: new Date('2026-09-08T00:00:00.000Z'),
+          type: 'INFLOW',
+          amount: new Prisma.Decimal('9999.0000'),
+          reference: `OTHER-TX-${unique}`,
+          fingerprint: `fp-other-tx-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      otherTxId = otherTx.id;
+    });
+
+    it('13A-B-6.1) unmatched report returns unmatched bank transactions and unmatched payments', async () => {
+      const res = await request(http)
+        .get(`${API_PREFIX}/reconciliation/reports/unmatched`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankAccountId: testBankAccountId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.companyId).toBe(adminCompanyId);
+
+      const txIds = res.body.data.bankTransactions.map((t: any) => t.id);
+      expect(txIds).toContain(reportInflowTxId);
+      expect(txIds).toContain(reportOutflowTxId);
+
+      const payIds = res.body.data.payments.map((p: any) => p.id);
+      expect(payIds).toContain(reportArPaymentId);
+      expect(payIds).toContain(reportApPaymentId);
+
+      expect(res.body.data.totals.unmatchedBankCount).toBeGreaterThanOrEqual(2);
+      expect(res.body.data.totals.unmatchedPaymentCount).toBeGreaterThanOrEqual(2);
+      expect(typeof res.body.data.totals.unmatchedBankInflow).toBe('string');
+      expect(typeof res.body.data.totals.unmatchedBankOutflow).toBe('string');
+      expect(typeof res.body.data.totals.unmatchedArPayments).toBe('string');
+      expect(typeof res.body.data.totals.unmatchedApPayments).toBe('string');
+    });
+
+    it('13A-B-6.2) matched records disappear from unmatched report', async () => {
+      // Match reportInflowTxId with reportArPaymentId
+      const matchRes = await request(http)
+        .post(`${API_PREFIX}/reconciliation/matches`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankTransactionId: reportInflowTxId,
+          paymentId: reportArPaymentId,
+          matchType: 'EXACT',
+        });
+      expect(matchRes.status).toBe(201);
+
+      // Now query unmatched report again
+      const res = await request(http)
+        .get(`${API_PREFIX}/reconciliation/reports/unmatched`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankAccountId: testBankAccountId });
+
+      expect(res.status).toBe(200);
+      const txIds = res.body.data.bankTransactions.map((t: any) => t.id);
+      expect(txIds).not.toContain(reportInflowTxId);
+      expect(txIds).toContain(reportOutflowTxId);
+
+      const payIds = res.body.data.payments.map((p: any) => p.id);
+      expect(payIds).not.toContain(reportArPaymentId);
+      expect(payIds).toContain(reportApPaymentId);
+    });
+
+    it('13A-B-6.3) summary returns bankBalance/bookBalance/variance as decimal strings and warning if no linked GL account', async () => {
+      const res = await request(http)
+        .get(`${API_PREFIX}/reconciliation/reports/summary`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankAccountId: testBankAccountId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.companyId).toBe(adminCompanyId);
+
+      expect(typeof res.body.data.bankBalance).toBe('string');
+      expect(typeof res.body.data.bookBalance).toBe('string');
+      expect(typeof res.body.data.variance).toBe('string');
+
+      // Since testBankAccountId has no linked GL account: bookBalance is 0.0000 and warnings has warning
+      expect(res.body.data.bookBalance).toBe('0.0000');
+      expect(res.body.data.warnings.length).toBeGreaterThanOrEqual(1);
+
+      expect(res.body.data.unmatchedCounts).toBeDefined();
+      expect(typeof res.body.data.unmatchedCounts.bankTransactions).toBe('number');
+      expect(typeof res.body.data.unmatchedCounts.payments).toBe('number');
+
+      expect(res.body.data.unmatchedAmounts).toBeDefined();
+      expect(typeof res.body.data.unmatchedAmounts.bankInflow).toBe('string');
+      expect(typeof res.body.data.unmatchedAmounts.bankOutflow).toBe('string');
+      expect(typeof res.body.data.unmatchedAmounts.arPayments).toBe('string');
+      expect(typeof res.body.data.unmatchedAmounts.apPayments).toBe('string');
+    });
+
+    it('13A-B-6.4) reports are tenant scoped', async () => {
+      // 1. Unmatched report for adminCompanyId never contains transactions from otherCompany
+      const resUnmatched = await request(http)
+        .get(`${API_PREFIX}/reconciliation/reports/unmatched`)
+        .set('Authorization', `Bearer ${reconToken}`);
+
+      expect(resUnmatched.status).toBe(200);
+      const txIds = resUnmatched.body.data.bankTransactions.map((t: any) => t.id);
+      expect(txIds).not.toContain(otherTxId);
+
+      // 2. Summary request specifying otherCompany's bankAccountId returns 404
+      const resSummaryOther = await request(http)
+        .get(`${API_PREFIX}/reconciliation/reports/summary`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankAccountId: otherBankAccountId });
+
+      expect(resSummaryOther.status).toBe(404);
+    });
+
+    it('13A-B-6.5) endpoints require reconciliation.read', async () => {
+      // GET unmatched without token -> 401
+      const unauthUnmatched = await request(http).get(`${API_PREFIX}/reconciliation/reports/unmatched`);
+      expect(unauthUnmatched.status).toBe(401);
+
+      // GET unmatched with cashier token -> 403
+      const forbiddenUnmatched = await request(http)
+        .get(`${API_PREFIX}/reconciliation/reports/unmatched`)
+        .set('Authorization', `Bearer ${cashierToken}`);
+      expect(forbiddenUnmatched.status).toBe(403);
+
+      // GET summary without token -> 401
+      const unauthSummary = await request(http).get(`${API_PREFIX}/reconciliation/reports/summary`);
+      expect(unauthSummary.status).toBe(401);
+
+      // GET summary with cashier token -> 403
+      const forbiddenSummary = await request(http)
+        .get(`${API_PREFIX}/reconciliation/reports/summary`)
+        .set('Authorization', `Bearer ${cashierToken}`);
+      expect(forbiddenSummary.status).toBe(403);
+    });
+  });
 });
+
 
 
 

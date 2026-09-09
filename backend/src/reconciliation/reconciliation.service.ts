@@ -9,7 +9,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AccountType, BankTransactionType, MatchType, Prisma } from '@prisma/client';
+import { AccountType, BankTransactionType, JournalEntryStatus, MatchType, Prisma } from '@prisma/client';
 import * as crypto from 'crypto';
 import { PrismaService } from '../database/prisma.service';
 import { CreateBankAccountDto } from './dto/create-bank-account.dto';
@@ -17,6 +17,8 @@ import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 import { ImportStatementCsvDto } from './dto/import-statement-csv.dto';
 import { GetSuggestionsQueryDto } from './dto/get-suggestions-query.dto';
 import { CreateReconciliationMatchDto } from './dto/create-reconciliation-match.dto';
+import { GetUnmatchedReportQueryDto } from './dto/get-unmatched-report-query.dto';
+import { GetSummaryReportQueryDto } from './dto/get-summary-report-query.dto';
 import { UploadedCsvFile } from './types/reconciliation.types';
 import { computeMatchScore, isDirectionCompatible } from './utils/matching-scorer';
 import {
@@ -39,6 +41,26 @@ const BANK_ACCOUNT_INCLUDE = {
     },
   },
 } as const;
+
+function parseDateStartUtc(dateStr?: string | null): Date | null {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+  if (dateStr.length === 10) {
+    return new Date(`${dateStr}T00:00:00.000Z`);
+  }
+  return d;
+}
+
+function parseDateEndUtc(dateStr?: string | null): Date | null {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+  if (dateStr.length === 10) {
+    return new Date(`${dateStr}T23:59:59.999Z`);
+  }
+  return d;
+}
 
 @Injectable()
 export class ReconciliationService {
@@ -266,15 +288,317 @@ export class ReconciliationService {
   }
 
   /**
-   * Stub: Unmatched reconciliation report.
+   * Unmatched reconciliation report: returns unmatched bank transactions,
+   * unmatched posted ERP payments, and summary totals.
+   * Read-only. Does not mutate database records.
    */
-  async unmatchedReport(companyId: string) {
+  async unmatchedReport(companyId: string, dto?: GetUnmatchedReportQueryDto) {
+    const limit = Math.min(dto?.limit ?? 100, 200);
+    const fromStart = parseDateStartUtc(dto?.fromDate);
+    const toEnd = parseDateEndUtc(dto?.toDate);
+
+    // 1. Unmatched bank transactions
+    const bankTransactions = await this.prisma.bankTransaction.findMany({
+      where: {
+        companyId,
+        status: 'UNMATCHED',
+        ...(dto?.bankAccountId && { bankAccountId: dto.bankAccountId }),
+        ...((fromStart || toEnd) && {
+          transactionDate: {
+            ...(fromStart && { gte: fromStart }),
+            ...(toEnd && { lte: toEnd }),
+          },
+        }),
+      },
+      orderBy: [{ transactionDate: 'desc' }, { createdAt: 'desc' }],
+      take: limit,
+    });
+
+    // 2. Exclude actively matched payments (unmatchedAt IS NULL)
+    const activeMatches = await this.prisma.reconciliationMatch.findMany({
+      where: {
+        companyId,
+        unmatchedAt: null,
+      },
+      select: { paymentId: true },
+    });
+    const matchedPaymentIds = new Set(activeMatches.map((m) => m.paymentId));
+
+    // 3. Unmatched posted ERP payments
+    const payments = await this.prisma.payment.findMany({
+      where: {
+        companyId,
+        status: 'POSTED',
+        deletedAt: null,
+        id: { notIn: Array.from(matchedPaymentIds) },
+        ...((fromStart || toEnd) && {
+          paidAt: {
+            ...(fromStart && { gte: fromStart }),
+            ...(toEnd && { lte: toEnd }),
+          },
+        }),
+      },
+      orderBy: [{ paidAt: 'desc' }, { createdAt: 'desc' }],
+      take: limit,
+    });
+
+    // 4. Compute totals
+    let unmatchedBankInflow = new Prisma.Decimal('0.0000');
+    let unmatchedBankOutflow = new Prisma.Decimal('0.0000');
+    let unmatchedArPayments = new Prisma.Decimal('0.0000');
+    let unmatchedApPayments = new Prisma.Decimal('0.0000');
+
+    for (const tx of bankTransactions) {
+      if (tx.type === 'INFLOW') {
+        unmatchedBankInflow = unmatchedBankInflow.plus(tx.amount);
+      } else {
+        unmatchedBankOutflow = unmatchedBankOutflow.plus(tx.amount);
+      }
+    }
+
+    for (const p of payments) {
+      if (p.invoiceType === 'SALES') {
+        unmatchedArPayments = unmatchedArPayments.plus(p.amount);
+      } else {
+        unmatchedApPayments = unmatchedApPayments.plus(p.amount);
+      }
+    }
+
+    const filters = {
+      bankAccountId: dto?.bankAccountId || null,
+      fromDate: dto?.fromDate || null,
+      toDate: dto?.toDate || null,
+      limit,
+    };
+
     return {
       status: 'ok',
       companyId,
+      filters,
       data: {
-        unmatchedTransactions: [],
-        unmatchedPayments: [],
+        bankTransactions: bankTransactions.map((tx) => ({
+          id: tx.id,
+          bankAccountId: tx.bankAccountId,
+          transactionDate: tx.transactionDate.toISOString(),
+          type: tx.type,
+          amount: tx.amount.toFixed(4),
+          reference: tx.reference,
+          description: tx.description,
+          payerPayee: tx.payerPayee,
+          status: tx.status,
+        })),
+        payments: payments.map((p) => ({
+          id: p.id,
+          invoiceType: p.invoiceType,
+          amount: p.amount.toFixed(4),
+          paidAt: p.paidAt.toISOString(),
+          reference: p.reference,
+          status: p.status,
+        })),
+        totals: {
+          unmatchedBankInflow: unmatchedBankInflow.toFixed(4),
+          unmatchedBankOutflow: unmatchedBankOutflow.toFixed(4),
+          unmatchedArPayments: unmatchedArPayments.toFixed(4),
+          unmatchedApPayments: unmatchedApPayments.toFixed(4),
+          unmatchedBankCount: bankTransactions.length,
+          unmatchedPaymentCount: payments.length,
+        },
+      },
+    };
+  }
+
+  /**
+   * Reconciliation summary report:
+   * Computes bankBalance (from latest bank statements or opening/current balance),
+   * bookBalance (from linked GL accounts in posted journal entries),
+   * variance (bookBalance - bankBalance),
+   * and unmatched counts & amounts.
+   * Read-only. Does not mutate database records.
+   */
+  async summaryReport(companyId: string, dto?: GetSummaryReportQueryDto) {
+    const asOfEnd = parseDateEndUtc(dto?.asOfDate) ?? new Date();
+    const warnings: string[] = [];
+
+    // 1. Fetch target bank accounts
+    const bankAccounts = await this.prisma.bankAccount.findMany({
+      where: {
+        companyId,
+        deletedAt: null,
+        isActive: true,
+        ...(dto?.bankAccountId && { id: dto.bankAccountId }),
+      },
+      include: {
+        glAccount: { select: { id: true, code: true, name: true } },
+      },
+    });
+
+    if (dto?.bankAccountId && bankAccounts.length === 0) {
+      throw new NotFoundException(
+        `Bank account with id "${dto.bankAccountId}" not found for this company`,
+      );
+    }
+
+    // 2. Bank balance calculation
+    let bankBalance = new Prisma.Decimal('0.0000');
+
+    for (const acc of bankAccounts) {
+      const latestStatement = await this.prisma.bankStatement.findFirst({
+        where: {
+          companyId,
+          bankAccountId: acc.id,
+          endDate: { lte: asOfEnd },
+        },
+        orderBy: [{ endDate: 'desc' }, { importedAt: 'desc' }],
+      });
+
+      if (latestStatement) {
+        bankBalance = bankBalance.plus(latestStatement.closingBalance);
+      } else {
+        const fallback = !acc.currentBalance.isZero()
+          ? acc.currentBalance
+          : acc.openingBalance;
+        bankBalance = bankBalance.plus(fallback);
+      }
+    }
+
+    // 3. Book balance calculation from linked GL accounts
+    let bookBalance = new Prisma.Decimal('0.0000');
+    const linkedGlAccounts = bankAccounts.filter((a) => Boolean(a.glAccountId));
+    const unlinkedAccounts = bankAccounts.filter((a) => !a.glAccountId);
+
+    if (unlinkedAccounts.length > 0) {
+      if (bankAccounts.length === 1) {
+        warnings.push(
+          `Bank account "${bankAccounts[0].accountName}" has no linked GL account; book balance is 0.0000`,
+        );
+      } else {
+        warnings.push(
+          `${unlinkedAccounts.length} bank account(s) have no linked GL account`,
+        );
+      }
+    }
+
+    if (linkedGlAccounts.length > 0) {
+      const glAccountIds = linkedGlAccounts.map((a) => a.glAccountId as string);
+
+      const lines = await this.prisma.journalEntryLine.findMany({
+        where: {
+          companyId,
+          entry: {
+            companyId,
+            status: JournalEntryStatus.POSTED,
+            entryDate: { lte: asOfEnd },
+          },
+          OR: [
+            { debitAccountId: { in: glAccountIds } },
+            { creditAccountId: { in: glAccountIds } },
+          ],
+        },
+        select: {
+          debit: true,
+          credit: true,
+          debitAccountId: true,
+          creditAccountId: true,
+        },
+      });
+
+      const glAccountSet = new Set(glAccountIds);
+      let totalDebits = new Prisma.Decimal('0.0000');
+      let totalCredits = new Prisma.Decimal('0.0000');
+
+      for (const line of lines) {
+        if (line.debitAccountId && glAccountSet.has(line.debitAccountId)) {
+          totalDebits = totalDebits.plus(line.debit);
+        }
+        if (line.creditAccountId && glAccountSet.has(line.creditAccountId)) {
+          totalCredits = totalCredits.plus(line.credit);
+        }
+      }
+
+      // Cash/Bank is an Asset with normal balance DEBIT: Debits - Credits
+      bookBalance = totalDebits.minus(totalCredits);
+    }
+
+    // 4. Variance = bookBalance - bankBalance
+    const variance = bookBalance.minus(bankBalance);
+
+    // 5. Unmatched items up to asOfEnd
+    const targetAccountIds = bankAccounts.map((a) => a.id);
+
+    const activeMatches = await this.prisma.reconciliationMatch.findMany({
+      where: {
+        companyId,
+        unmatchedAt: null,
+      },
+      select: { paymentId: true },
+    });
+    const matchedPaymentIds = new Set(activeMatches.map((m) => m.paymentId));
+
+    const [unmatchedTxs, unmatchedPayments] = await Promise.all([
+      this.prisma.bankTransaction.findMany({
+        where: {
+          companyId,
+          status: 'UNMATCHED',
+          bankAccountId: { in: targetAccountIds },
+          transactionDate: { lte: asOfEnd },
+        },
+      }),
+      this.prisma.payment.findMany({
+        where: {
+          companyId,
+          status: 'POSTED',
+          deletedAt: null,
+          id: { notIn: Array.from(matchedPaymentIds) },
+          paidAt: { lte: asOfEnd },
+        },
+      }),
+    ]);
+
+    let bankInflow = new Prisma.Decimal('0.0000');
+    let bankOutflow = new Prisma.Decimal('0.0000');
+    let arPayments = new Prisma.Decimal('0.0000');
+    let apPayments = new Prisma.Decimal('0.0000');
+
+    for (const tx of unmatchedTxs) {
+      if (tx.type === 'INFLOW') {
+        bankInflow = bankInflow.plus(tx.amount);
+      } else {
+        bankOutflow = bankOutflow.plus(tx.amount);
+      }
+    }
+
+    for (const p of unmatchedPayments) {
+      if (p.invoiceType === 'SALES') {
+        arPayments = arPayments.plus(p.amount);
+      } else {
+        apPayments = apPayments.plus(p.amount);
+      }
+    }
+
+    const filters = {
+      bankAccountId: dto?.bankAccountId || null,
+      asOfDate: dto?.asOfDate || null,
+    };
+
+    return {
+      status: 'ok',
+      companyId,
+      filters,
+      data: {
+        bankBalance: bankBalance.toFixed(4),
+        bookBalance: bookBalance.toFixed(4),
+        variance: variance.toFixed(4),
+        unmatchedCounts: {
+          bankTransactions: unmatchedTxs.length,
+          payments: unmatchedPayments.length,
+        },
+        unmatchedAmounts: {
+          bankInflow: bankInflow.toFixed(4),
+          bankOutflow: bankOutflow.toFixed(4),
+          arPayments: arPayments.toFixed(4),
+          apPayments: apPayments.toFixed(4),
+        },
+        warnings,
       },
     };
   }
