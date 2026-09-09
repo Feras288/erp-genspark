@@ -41,7 +41,7 @@ export class AccountingController {
   // ===== Chart of Accounts =====
 
   @Get('accounts')
-  @RequirePermissions('accounting.read')
+  @RequirePermissions('gl_accounts.read')
   listAccounts(
     @CurrentUser() me: AuthenticatedUser,
     @Query() q: AccountingQueryDto,
@@ -90,7 +90,7 @@ export class AccountingController {
   // ===== Manual Journal Entries =====
 
   @Get('journal')
-  @RequirePermissions('accounting.read')
+  @RequirePermissions('gl_journal.read')
   listJournalEntries(
     @CurrentUser() me: AuthenticatedUser,
     @Query() q: JournalEntryQueryDto,
@@ -108,7 +108,7 @@ export class AccountingController {
   }
 
   @Post('journal')
-  @RequirePermissions('accounting.journal.update')
+  @RequirePermissions('gl_journal.write')
   @HttpCode(201)
   createJournalEntry(
     @CurrentUser() me: AuthenticatedUser,
@@ -118,7 +118,7 @@ export class AccountingController {
   }
 
   @Patch('journal/:id')
-  @RequirePermissions('accounting.journal.update')
+  @RequirePermissions('gl_journal.write')
   updateJournalEntry(
     @CurrentUser() me: AuthenticatedUser,
     @Param('id') id: string,
@@ -128,7 +128,7 @@ export class AccountingController {
   }
 
   @Post('journal/:id/post')
-  @RequirePermissions('accounting.journal.post')
+  @RequirePermissions('gl_journal.write')
   postJournalEntry(
     @CurrentUser() me: AuthenticatedUser,
     @Param('id') id: string,
@@ -138,7 +138,7 @@ export class AccountingController {
   }
 
   @Post('journal/:id/cancel')
-  @RequirePermissions('accounting.journal.cancel')
+  @RequirePermissions('gl_journal.write')
   cancelJournalEntry(
     @CurrentUser() me: AuthenticatedUser,
     @Param('id') id: string,
