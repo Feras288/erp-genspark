@@ -2704,3 +2704,259 @@ POST /api/purchase-invoices/:invoiceId/payments
 - `10B-D-2` → `README.md` فقط (هذا الـ commit).
 
 → Phase 10B closure verified. Phase 10B-D-2 (README update) sealed.
+
+## Phase 11A: General Ledger Foundation
+
+Phase 11A هي **foundation layer** لـ General Ledger فوق الـ Phase 6 Accounting Core الموجود مسبقاً — بدون duplicate schema، بدون توسيع في الـ journal domain، وبدون posting تلقائي من الـ AR / AP / Payments. الـ scope محصور في: GL RBAC skeleton، hardening الـ posting/cancel helpers، backend e2e smoke، wiring الـ permissions على الـ controller، وصفحة frontend للقراءة فقط — كل ذلك **read-side-first**، **single-domain**، **localhost ERP** بدون أي deployment.
+
+### Family
+
+- `11A-PLAN`: docs-first scoping — `docs/PHASE_11A_GL_PLAN.md` (12744 حرف).
+- `11A-B-1`: backend RBAC permission skeleton — 3 permissions جديدة، seed migration on conflict no-op.
+- `11A-B-2`: backend hardening — 4 helpers (`computeJournalTotals`، `validateJournalBalances`، `ensureJournalEntryCanPost`، `ensureJournalEntryCanCancel`) مع `asserts` predicate narrowing.
+- `11A-B-3`: backend e2e smoke — 9 tests داخل `describe('Phase 11A-B-3: GL posting hardening (e2e smoke)')`.
+- `11A-B-4`: controller wiring — إعادة تسمية 6 decorators إلى `gl_accounts.read` / `gl_journal.read` / `gl_journal.write`.
+- `11A-C-code`: frontend read-only page — `/accounting/gl`، permissions gating، loading/error/empty banners، بدون forms/buttons/write paths.
+- `11A-D-1`: final verification only — no commits، no edits، no pushes؛ build + e2e regression check.
+- `11A-D-2`: README update and final closure (هذا الـ commit).
+
+### Conventional Commits على `main`
+
+```
+b9b8221 feat(phase-11a): add GL frontend read-only view          ← Phase 11A-C-code
+3b69d66 feat(phase-11a): wire GL RBAC permissions                ← Phase 11A-B-4
+d993e54 test(phase-11a): add GL backend e2e smoke                 ← Phase 11A-B-3
+bfe9377 feat(phase-11a): harden GL posting logic                  ← Phase 11A-B-2
+a8f0069 feat(phase-11a): add GL RBAC permission skeleton          ← Phase 11A-B-1
+4e65d73 docs(phase-11a): add GL architecture plan                 ← Phase 11A-PLAN
+```
+
+### Reused Phase 6 models — لا duplicate GL schema
+
+Phase 11A **لم** يضيف أي model جديد في الـ Prisma schema. الـ General Ledger foundation موجود أصلاً من الـ Phase 6 (Accounting Core) والـ phase الحالي يستخدم الـ existing models كما هي، بدون أي تكرار أو migration:
+
+- `Account` — الـ chart of accounts: `id`، `code`، `name`، `type` (`AccountType` enum)، `normalBalance` (`NormalBalance` enum)، `companyId`، soft-delete filter (`deletedAt`).
+- `JournalEntry` — الـ header: `id`، `companyId`، `entryDate`، `description`، `status` (`JournalEntryStatus` enum)، + الـ audit + soft-delete fields.
+- `JournalEntryLine` — الـ debit/credit legs: `id`، `journalEntryId`، `accountId`، `debit`، `credit`، تمامها `Prisma.Decimal @db.Decimal(18, 4)`، لا Number.
+- `JournalEntryStatus` enum محفوظ كما هو: **`DRAFT`** | **`POSTED`** | **`CANCELLED`** — لا `REVERSED` ولا `VOID` ولا أي enum value إضافي.
+- `AccountType` enum محفوظ كما هو (`ASSET` | `LIABILITY` | `EQUITY` | `REVENUE` | `EXPENSE`).
+- `NormalBalance` enum محفوظ كما هو (`DEBIT` | `CREDIT`).
+
+### DB / Prisma changes
+
+- **لا schema change** في الـ Phase 11A كاملاً — لا `prisma migrate dev`، لا `schema.prisma` edit، لا column جديد، لا enum value جديد، لا model جديد.
+- الـ migration الوحيد في الـ phase هو **seed-only**: `backend/prisma/migrations/20260909120000_phase11a_gl_permissions/migration.sql` يحوي **3 INSERTs فقط** على الـ `permissions` table مع `ON CONFLICT DO NOTHING`:
+  - `gl_accounts.read`
+  - `gl_journal.read`
+  - `gl_journal.write`
+- الـ seed ستجلب هذه الـ 3 permissions إلى الـ role `company_admin` فقط (بنفس الـ pattern الـ existing من Phase 1+2+3+4+5+6+7+8+9+10).
+- لا writeback على الـ `SalesInvoice` ولا الـ `PurchaseInvoice` ولا الـ `Payment` — الـ General Ledger **read-only** في هذه الـ phase.
+
+### Permissions (RBAC — Phase 11A-B-1 + 11A-B-4)
+
+الـ permissions الجديدة **3 فقط**، مفصولات عن الـ AR/AP/payments catalog، ولا تُضيف أي permission إضافي خارج هذه الـ الثلاث:
+
+| Permission key | يُستخدم على | الـ HTTP method | الـ Scope |
+|-----------------|---------------|------------------|-----------|
+| `gl_accounts.read` | `GET /api/accounting/accounts` + `GET /api/accounting/accounts/:id` (.read back-compat) | GET endpoints | fetch chart of accounts |
+| `gl_journal.read` | `GET /api/journal` + `GET /api/journal/:id` (.read back-compat) | GET endpoints | list + read journal entries |
+| `gl_journal.write` | `POST /api/journal` + `PATCH /api/journal/:id` + `POST /api/journal/:id/post` + `POST /api/journal/:id/cancel` | write endpoints | create / edit / post / cancel |
+
+- Server enforcement عبر الـ existing `@RequirePermissions(...)` decorator + الـ existing `PermissionsGuard` (لا guard جديد).
+- Client-side mirror عبر `useAuth().hasPermission('gl_accounts.read' | 'gl_journal.read' | 'gl_journal.write')` يقرأ من الـ `state.user.permissions` JWT claim — نفس الـ split الـ الموجود في الـ prior phases.
+- الـ decorator rewires على `accounting.controller.ts` (6 methods) تم في الـ Phase 11A-B-4 — دون تغيير في الـ routes count ولا في الـ DTOs ولا في الـ response shapes.
+
+### Backend hardening (Phase 11A-B-2 — Fork A)
+
+أضيفت 4 helpers على `accounting.service.ts` (بدون تغيير في الـ controller signatures ولا في الـ DTOs):
+
+1. **`computeJournalTotals(entry)`** — يحسب `totalDebit` و `totalCredit` عبر `Prisma.Decimal` arithmetic حصراً؛ لا `Number()` في الـ math path.
+2. **`validateJournalBalances(entry)`** — يتحقق `totalDebit.equals(totalCredit)` على الـ precision-exact level؛ يرمي `BadRequestException` لو غير متوازن.
+3. **`ensureJournalEntryCanPost(entry)`** — مع `asserts entry is { id: string; status: JournalEntryStatus }` return-type narrowing (يحلّ `TS18047` null narrowing في الـ helper body):
+   - يقبل `DRAFT` فقط.
+   - يرفض `POSTED` بـ `ConflictException`.
+   - يرفض `CANCELLED` بـ `ConflictException` — تماماً مثل الـ Phase 6 contract.
+4. **`ensureJournalEntryCanCancel(entry)`** — مع نفس الـ `asserts` predicate:
+   - يقبل `DRAFT` (يرجع للـ DRAFT — لا mutation).
+   - يرفض `CANELLED` بـ `ConflictException`.
+   - يرفض `POSTED` بـ `ConflictException` وبالـ message localized: **"Posted journal entries require reversing entries, which is out of scope in Phase 6"** — هذا هو الـ **Fork A**: الـ helper يحفظ الـ Phase 6 semantic contract بدلاً من توسيعه إلى reverse-entry logic (الـ reversal خارج النطاق).
+
+#### Helpers — TypeScript `asserts` predicate narrowing
+
+الـ returned type هو:
+
+```ts
+function ensureJournalEntryCanPost(entry: JournalEntry | null): asserts entry is { id: string; status: JournalEntryStatus };
+function ensureJournalEntryCanCancel(entry: JournalEntry | null): asserts entry is { id: string; status: JournalEntryStatus };
+```
+
+هذا الـ pattern يسمح لـ TypeScript بأن يضيق الـ type بعد الـ guard call في الـ caller code — يحلّ `TS18047` بدون `as` casting ولا `if (entry === null) throw` boilerplate.
+
+### Tests added (Phase 11A-B-3)
+
+9 e2e smoke tests جديدة في `backend/test/app.e2e-spec.ts` داخل الـ `describe('Phase 11A-B-3: GL posting hardening (e2e smoke)')` block:
+
+- `it('11A-B-3.1) GET /api/journal 401 w/o JWT')` — route guard لا JWT.
+- `it('11A-B-3.2) GET /api/journal 403 w/ cashier JWT (no gl_journal.read)')` — RBAC guard.
+- `it('11A-B-3.3) GET /api/journal 200 w/ accountant JWT (has gl_journal.read)')` — happy path.
+- `it('11A-B-3.4) POST /api/journal 400 unbalanced lines (debit != credit)')` — helper `validateJournalBalances`.
+- `it('11A-B-3.5) POST /api/journal/:id/post 409 على CANCELLED entry')` — `ensureJournalEntryCanPost` على CANCELLED.
+- `it('11A-B-3.6) POST /api/journal/:id/post 409 على POSTED entry')` — `ensureJournalEntryCanPost` على POSTED.
+- `it('11A-B-3.7) POST /api/journal/:id/post 200 على DRAFT entry balances correct')` — happy path للـ posting flow.
+- `it('11A-B-3.8) POST /api/journal/:id/cancel 409 على POSTED entry (Fork A wording)')` — يحرس على الـ "reverse out of scope" message.
+- `it('11A-B-3.9) POST /api/journal/:id/cancel 200 على DRAFT entry')` — happy path للـ cancel.
+
+كل الـ 9 tests تستخدم:
+- `company_admin` login JWT (company_admin يحوز على الـ 3 GL permissions من الـ seed).
+- cashier JWT لا يحوز على الـ 3 permissions (يستخدم في الـ 403 cases).
+- Prisma seeded fixtures (accounts + journal entries الـ created via direct service call في الـ `beforeAll`).
+
+### Frontend route (Phase 11A-C-code)
+
+ملف جديد فقط: `frontend/src/app/accounting/gl/page.tsx` (≈ 450 سطر) — صفحة Next.js client-side read-only مع:
+
+- **Permission gates** على `gl_accounts.read` + `gl_journal.read` — إذا كلاهما غائب ⇒ صفحة access-denied banner بدلاً من crash.
+- **Two data tables** جنب بعض:
+  - `Accounts` table: `code`، `name`، `type` (Arabic + English labels)، `normalBalance` (Arabic + English labels) — من `api.listGlAccounts()`.
+  - `Journal Entries` table: `entryDate`، `description`، `status` (Arabic pills للدالات الثلاث)، `lines[].accountCode + debit + credit` (sub-rows expand) — من `api.listGlJournalEntries()`.
+- **لا forms، لا buttons، لا write paths** — الـ POST/PATCH/POST-id/post/POST-id/cancel paths **لم** تُربط على الـ frontend (خارج النطاق في الـ Phase 11A).
+- **Loading + error + empty-state banners** لكلا الجدولين.
+- **Decimal-as-string** serialization (الـ `Prisma.Decimal` القادم من الـ backend يُعرض كما هو بدون `Number()` — يحافظ على الـ precision).
+- **Type aliases جديدة** في `frontend/src/lib/api.ts`:
+  - `export type GlAccount = Account;`
+  - `export type GlJournalEntry = JournalEntry;`
+  - `export type GlJournalLine = JournalEntryLine;`
+  - `export type GlListResponse<T> = Paginated<T>;`
+- **Wrapper functions جديدة** في `frontend/src/lib/api.ts`: `listGlAccounts`، `listGlJournalEntries`.
+
+### Security / tenancy (unchanged from Phase 1+2+3+4+5+6+7+8+9+10)
+
+- `companyId` من `@CurrentUser() me.companyId` فقط — **لا** يقبل من الـ query ولا الـ body.
+- `@UseGuards(JwtAuthGuard, PermissionsGuard)` global على `AccountingController` يغطي الـ 6 الـ rewired methods تلقائياً.
+- الـ 6 methods مقيَّدة بـ `@RequirePermissions(...)` بعد الـ Phase 11A-B-4 rewires:
+  - `GET /accounts` → `gl_accounts.read`.
+  - `GET /accounts/:id` → `accounting.read` (preserved للـ backwards-compat).
+  - `POST /accounts` → `accounting.accounts.create` (preserved).
+  - `PATCH /accounts/:id` → `accounting.accounts.update` (preserved).
+  - `DELETE /accounts/:id` → `accounting.accounts.delete` (preserved).
+  - `GET /journal` → `gl_journal.read`.
+  - `GET /journal/:id` → `accounting.read` (preserved).
+  - `POST /journal` → `gl_journal.write`.
+  - `PATCH /journal/:id` → `gl_journal.write`.
+  - `POST /journal/:id/post` → `gl_journal.write`.
+  - `POST /journal/:id/cancel` → `gl_journal.write`.
+- `Prisma.Decimal` arithmetic حصراً في الـ 4 الـ helpers الجديدة؛ `Number()` في أي math path الحسابي **ممنوع**.
+- لا `companyId` من الـ URL أو الـ form body.
+- لا tokens في `localStorage` / `sessionStorage`.
+- لا mutation من الـ frontend على الـ journal — الـ GET فقط.
+
+### Backend e2e regression invariant (Phase 11A — final)
+
+- `pnpm --filter @erp/backend build` ⇒ `nest build` exit 0 — **PASS**.
+- `pnpm --filter @erp/backend test:e2e` ⇒ **Tests: 138 passed, 138 total** (Post 11A-B-3، ثابت على 11A-D-1 و 11A-D-2):
+  - `test/app.e2e-spec.ts` يحوي الـ 9 tests الـ GL hardening الـ الجديدة داخل `describe('Phase 11A-B-3: GL posting hardening (e2e smoke)')`.
+  - 2 test suites passing، 138 tests passing، 0 failing، 0 flake.
+
+### Frontend build invariant (Phase 11A)
+
+- `pnpm --filter @erp/frontend build` ⇒ Next.js 14.2.35 compiled SUCCESS — **PASS**.
+- Route table ازداد بـ 1 route جديدة: `/accounting/gl` (= 17 routes ثابتة كما في الـ Phase 10A-D-1 + الـ `/accounting/gl` route).
+- `/accounting/gl = 2.77 kB / 102 kB First Load JS`.
+- لا `-warn` ولا `-error` على الـ build log.
+
+### Hard prohibitions honored (Phase 11A)
+
+- لا skills مُشغَّلة أو مُستدعاة في الـ loop الكامل (11A-PLAN → 11A-D-2).
+- لا cloudflare / workers / wrangler / OAuth / external auth / hosted deploy / hosted identity.
+- لا schema change — لا `prisma migrate dev` ولا `schema.prisma` edit في الـ Phase 11A كاملاً (الـ migration الوحيد seed-only للـ 3 permissions INSERTs).
+- لا writeback على الـ `SalesInvoice` ولا الـ `PurchaseInvoice` ولا الـ `Payment` — General Ledger **read-only** في الـ Phase 11A.
+- لا `git add .` ولا `git add -A` — كل الـ commits الـ 6 الـ كود في phase-11a يستخدمون `git add <file>...` صراحةً، والـ 11A-D-2 يستخدم `git add README.md` صراحةً.
+- لا cf-byok-deploy / designer-handoff / gsk-hosted-deploy / gsk-hosted-identity skill activation.
+- لا تغيير في الـ access control pattern: نفس الـ JWT-claim server-side (`@RequirePermissions`) + client-side (`hasPermission`) الـ split؛ لا fallback في الـ app JavaScript ولا في الـ access descriptor.
+- لا extensions لكتلة أخرى: لا AR ولا AP payments tier-2 features ولا charts ولا customer/supplier drill-down ولا notifications.
+
+### Out of scope (Phase 11A — explicit)
+
+الـ Phase 11A هي **read-side-first foundation**. كل الـ items التالية خارج النطاق الصريح:
+
+- **لا real posting from sales/purchases/payments** — لا auto-posting للـ AR invoices على الـ journal، ولا للـ AP invoices، ولا للـ AR/AP payments. الـ `journal.write` path موجود فقط عبر الـ explicit endpoints الـ Phase 6 (POST /journal + /journal/:id/post).
+- **لا financial statements** — لا trial balance، لا income statement، لا balance sheet، لا cash flow statement، لا equity reconciliation.
+- **لا bank reconciliation** — لا matching بين الـ payments والـ bank statements ولا import statements ولا manual reconciliation UI.
+- **لا tax filing** — لا VAT return، لا ZATCA integration، لا e-invoicing، لا tax-period rollover.
+- **لا multi-currency** — `'SAR'` literal فقط، لا currency conversion logic، لا FX rate provider integration.
+- **لا external integrations** — لا bank feeds، لا payment gateway (Stripe / PayPal / Mada / STC Pay)، لا ERP sync، لا marketplace sync، لا 3PL integration.
+- **لا production deployment** — ولا Cloudflare Pages ولا hosted deploy ولا hosted identity ولا Docker Compose orchestration change. Local Docker Compose + local NestJS + local Next.js فقط.
+
+### Backend additions summary
+
+| Layer | File | Change |
+|-------|------|--------|
+| Service | `backend/src/accounting/accounting.service.ts` | +4 helpers (computeJournalTotals، validateJournalBalances، ensureJournalEntryCanPost، ensureJournalEntryCanCancel) |
+| Controller | `backend/src/accounting/accounting.controller.ts` | 6 decorator renames إلى gl_accounts.read / gl_journal.read / gl_journal.write |
+| Migration (seed-only) | `backend/prisma/migrations/20260909120000_phase11a_gl_permissions/migration.sql` | 3 INSERTs على permissions table (gl_accounts.read، gl_journal.read، gl_journal.write) مع ON CONFLICT DO NOTHING |
+| e2e test | `backend/test/app.e2e-spec.ts` | +9 tests داخل `describe('Phase 11A-B-3: GL posting hardening (e2e smoke)')` |
+
+### Frontend additions summary
+
+| Layer | File | Change |
+|-------|------|--------|
+| API client | `frontend/src/lib/api.ts` | +2 wrappers (listGlAccounts، listGlJournalEntries)، +4 type aliases (GlAccount، GlJournalEntry، GlJournalLine، GlListResponse<T>) |
+| Page | `frontend/src/app/accounting/gl/page.tsx` | ملف جديد (≈ 450 سطر) — read-only، permission-gated، two tables، loading/error/empty banners، لا forms/buttons/write paths |
+
+### Commit map (single-domain discipline)
+
+كل الـ 6 commits الـ كود في phase-11a مستقلة النطاق:
+
+- `11A-PLAN` → `docs/PHASE_11A_GL_PLAN.md`.
+- `11A-B-1` → `backend/prisma/migrations/20260909120000_phase11a_gl_permissions/migration.sql` (الـ seed-only).
+- `11A-B-2` → `backend/src/accounting/accounting.service.ts` (الـ 4 الـ helpers).
+- `11A-B-3` → `backend/test/app.e2e-spec.ts` (الـ 9 tests داخل الـ `describe('Phase 11A-B-3: ...')`).
+- `11A-B-4` → `backend/src/accounting/accounting.controller.ts` (الـ 6 decorator rewires).
+- `11A-C-code` → `frontend/src/lib/api.ts` و `frontend/src/app/accounting/gl/page.tsx`.
+- `11A-D-2` → `README.md` فقط (هذا الـ commit).
+
+### Recommendation
+
+**Phase 11A (General Ledger Foundation) انتهت** على مستوى:
+
+- `11A-PLAN` (docs scoping) و `11A-B-1` (RBAC skeleton: 3 INSERTs، seed-only) و `11A-B-2` (hardening: 4 helpers + asserts narrowing + Fork A preservation لـ "reverse out of scope" wording) و `11A-B-3` (smoke tests: 9 tests تغطي RBAC guards + balanced/unbalanced + DRAFT/POSTED/CANCELLED transitions + Fork A wording) و `11A-B-4` (controller wiring: 6 decorators إلى gl_accounts.read / gl_journal.read / gl_journal.write) — backend.
+- `11A-C-code` (frontend wiring: `api.listGlAccounts()` + `api.listGlJournalEntries()` + 4 type aliases + صفحة Next.js read-only على `/accounting/gl` مع permission gates + two tables + loading/error/empty banners، بدون forms/buttons/write paths) — frontend.
+- `11A-D-1` (verification: working tree clean، HEAD = `b9b8221`، scope limited إلى 4 files الـ كود + README، backend build PASS، backend e2e PASS = 138/138، frontend build PASS) و `11A-D-2` (README closure: هذا الـ commit).
+
+كل الـ permissions الـ الجديدة (3 keys) enforced server-side عبر الـ existing `@RequirePermissions` decorator + الـ existing `PermissionsGuard`. الـ tenant isolation من JWT فقط. الـ helpers الـ 4 تستخدم `Prisma.Decimal` arithmetic حصراً — لا `Number()` في أي math path. الـ `JournalEntryStatus` enum محفوظ كما هو (`DRAFT | POSTED | CANCELLED`) بدون أي توسيع. الـ `AccountType` و `NormalBalance` و `JournalEntryLine` و `Account` و `JournalEntry` models كلها مستعملة كما هي من الـ Phase 6 — لا duplicate GL schema في الـ Prisma.
+
+**الحدود الـ strict لـ Phase 11A**:
+
+- لا auto-posting من الـ AR / AP / Payments (الـ journal.write path محصور في الـ explicit POST /journal + /journal/:id/post + /journal/:id/cancel الـ Phase 6 endpoints).
+- لا reverse entries في الـ cancel flow للـ POSTED entries — الـ "Posted journal entries require reversing entries, which is out of scope in Phase 6" wording محفوظ في الـ helper contract (Fork A).
+- لا financial statements ولا budgeting ولا cash flow forecasting.
+- لا bank reconciliation ولا payment gateway integration.
+- لا tax filing ولا ZATCA integration.
+- لا multi-currency layer.
+- لا writeback على الـ SalesInvoice أو الـ PurchaseInvoice أو الـ Payment من الـ GL side.
+- لا write paths في الـ frontend — الـ page `/accounting/gl` read-only بالكامل.
+
+كل واحد من هذه الـ 8 بنود هو **مرحلة منفصلة قادمة محتملة** (بحجمها الخاص)، ولا يجب جمعها:
+
+- إمّا **Auto-posting AR ↔ GL** (12A) — على issue/cancel الـ `SalesInvoice`، auto-create journal lines debiting AR control + crediting revenue + VAT.
+- أو **Auto-posting AP ↔ GL** (12B) — مرآة الـ 12A لكن لـ `PurchaseInvoice`.
+- أو **Auto-posting Payments ↔ GL** (12C) — على POST الـ payment، auto-create journal lines debiting cash/bank + crediting AR/AP control.
+- أو **Reverse-entry / Reversal Journal** (12D) — لتفعيل الـ cancel على الـ POSTED entries بدون فقدان الـ audit trail.
+- أو **Trial Balance + Income Statement** (12E) — first-class financial statements.
+- أو **Balance Sheet + Cash Flow** (12F).
+- أو **Bank Reconciliation** (13A) — matching payments-rows لـ bank-imported statements.
+- أو **VAT / ZATCA Filing** (13B) — tax-period reports + e-invoicing compliance.
+- أو **Multi-currency layer** (14A) — لو multi-currency صار أولوية.
+- أو **GL Read/Write Polish** (11B) — مثلاً search/filter UI على الـ `/accounting/gl` page، exports للـ ledger، period-end close UI.
+
+وكل مرحلة يجب أن تكون **single-domain** فقط. ولا deployment بأمر المستودع هذا — فقط local Docker Compose. ولا hosted deploy / hosted identity في هذه المرحلة (ولا في المراحل القادمة إلا بموافقة صريحة).
+
+### Verification summary (Phase 11A)
+
+- `pnpm --filter @erp/backend build` ⇒ **PASS** (exit 0، nest build، لا errors).
+- `pnpm --filter @erp/backend test:e2e` ⇒ **PASS = 138/138** (`Test Suites: 2 passed, 2 total — Tests: 138 passed, 138 total`).
+- `pnpm --filter @erp/frontend build` ⇒ **PASS** (Next.js 14.2.35، route `/accounting/gl = 2.77 kB / 102 kB First Load JS`).
+- Final verification HEAD قبل 11A-D-2: **`b9b82216dd6467011d1bc8b65400933a721723bb`**.
+- Working tree clean قبل 11A-D-2: `git diff --name-only` empty.
+
+→ Phase 11A closure verified. Phase 11A-D-2 (README update) sealed.
