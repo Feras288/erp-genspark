@@ -3,7 +3,7 @@
 //
 // 12A-B-2: real Trial Balance from POSTED JournalEntryLine.
 // 12A-B-3: real Income Statement (period-only P&L).
-// 12A-B-1 leftover: Balance Sheet still empty/zero skeleton.
+// 12A-B-4: real Balance Sheet (as-of + synthetic RE / current NI).
 //
 // No posting / reverse / close. JWT companyId only.
 // Monetary math is Prisma.Decimal — never Number().
@@ -16,7 +16,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
-import { DECIMAL_ZERO, toDecimal } from './posting-events/decimal';
+import { toDecimal } from './posting-events/decimal';
 import {
   TrialBalanceQueryDto,
   IncomeStatementQueryDto,
@@ -24,6 +24,7 @@ import {
 } from './dto/financial-statements-query.dto';
 import type {
   AccountTypeKey,
+  BalanceSheetLine,
   BalanceSheetResponse,
   DecimalString,
   IncomeStatementLine,
@@ -39,10 +40,6 @@ type Bucket = {
   periodDebit: Prisma.Decimal;
   periodCredit: Prisma.Decimal;
 };
-
-function decimalZeroString(): DecimalString {
-  return DECIMAL_ZERO.toFixed(4);
-}
 
 function formatDecimal4(value: Prisma.Decimal): DecimalString {
   return value.toFixed(4);
@@ -104,6 +101,13 @@ function utcDayString(date: Date): string {
 }
 
 function getDefaultFiscalYearStartDate(
+  fiscalYearStartMonth: number | null | undefined,
+  asOf: Date,
+): Date {
+  return resolveFiscalYearStartForDate(fiscalYearStartMonth, asOf);
+}
+
+function resolveFiscalYearStartForDate(
   fiscalYearStartMonth: number | null | undefined,
   asOf: Date,
 ): Date {
@@ -466,35 +470,264 @@ export class FinancialStatementsService {
     };
   }
 
-  balanceSheet(
+  async balanceSheet(
     companyId: string,
     q: BalanceSheetQueryDto,
-  ): BalanceSheetResponse {
-    const zero = decimalZeroString();
+  ): Promise<BalanceSheetResponse> {
+    const asOfEnd =
+      parseDateEndUtc(q.asOfDate, 'asOfDate') ?? endOfTodayUtc();
+    const company = await this.prisma.company.findFirst({
+      where: { id: companyId },
+      select: { fiscalYearStartMonth: true },
+    });
+    const fiscalYearStart = resolveFiscalYearStartForDate(
+      company?.fiscalYearStartMonth,
+      asOfEnd,
+    );
+
+    const [priorNi, currentNi, bsAccounts, lines] = await Promise.all([
+      this.computeIncomeStatementTotalsForWindow(companyId, null, {
+        lt: fiscalYearStart,
+      }),
+      this.computeIncomeStatementTotalsForWindow(companyId, fiscalYearStart, {
+        lte: asOfEnd,
+      }),
+      this.prisma.account.findMany({
+        where: {
+          companyId,
+          type: {
+            in: [
+              AccountType.ASSET,
+              AccountType.LIABILITY,
+              AccountType.EQUITY,
+            ],
+          },
+        },
+        select: {
+          id: true,
+          code: true,
+          name: true,
+          type: true,
+          normalBalance: true,
+        },
+        orderBy: { code: 'asc' },
+      }),
+      this.prisma.journalEntryLine.findMany({
+        where: {
+          companyId,
+          entry: {
+            companyId,
+            status: JournalEntryStatus.POSTED,
+            entryDate: { lte: asOfEnd },
+          },
+        },
+        select: {
+          debit: true,
+          credit: true,
+          debitAccountId: true,
+          creditAccountId: true,
+        },
+      }),
+    ]);
+
+    type PeriodBucket = {
+      debitTotal: Prisma.Decimal;
+      creditTotal: Prisma.Decimal;
+    };
+    const buckets = new Map<string, PeriodBucket>();
+    for (const account of bsAccounts) {
+      buckets.set(account.id, {
+        debitTotal: new Prisma.Decimal('0'),
+        creditTotal: new Prisma.Decimal('0'),
+      });
+    }
+    const accountIds = new Set(bsAccounts.map((a) => a.id));
+    for (const line of lines) {
+      const debit = toDecimal(line.debit);
+      const credit = toDecimal(line.credit);
+      if (line.debitAccountId && accountIds.has(line.debitAccountId)) {
+        const bucket = buckets.get(line.debitAccountId)!;
+        bucket.debitTotal = addDecimal(bucket.debitTotal, debit);
+      }
+      if (line.creditAccountId && accountIds.has(line.creditAccountId)) {
+        const bucket = buckets.get(line.creditAccountId)!;
+        bucket.creditTotal = addDecimal(bucket.creditTotal, credit);
+      }
+    }
+
+    const assets: BalanceSheetLine[] = [];
+    const liabilities: BalanceSheetLine[] = [];
+    const equity: BalanceSheetLine[] = [];
+    let assetsTotal = new Prisma.Decimal('0');
+    let liabilitiesTotal = new Prisma.Decimal('0');
+    let equityTotal = new Prisma.Decimal('0');
+
+    for (const account of bsAccounts) {
+      const bucket = buckets.get(account.id)!;
+      if (bucket.debitTotal.isZero() && bucket.creditTotal.isZero()) continue;
+
+      const amount = computeSignedBalance(
+        bucket.debitTotal,
+        bucket.creditTotal,
+        account.normalBalance,
+      );
+      const row: BalanceSheetLine = {
+        accountId: account.id,
+        code: account.code,
+        name: account.name,
+        type: account.type as AccountTypeKey,
+        normalBalance: account.normalBalance as NormalBalanceKey,
+        debitTotal: formatDecimal4(bucket.debitTotal),
+        creditTotal: formatDecimal4(bucket.creditTotal),
+        amount: formatDecimal4(amount),
+      };
+
+      if (account.type === AccountType.ASSET) {
+        assets.push(row);
+        assetsTotal = addDecimal(assetsTotal, amount);
+      } else if (account.type === AccountType.LIABILITY) {
+        liabilities.push(row);
+        liabilitiesTotal = addDecimal(liabilitiesTotal, amount);
+      } else {
+        equity.push(row);
+        equityTotal = addDecimal(equityTotal, amount);
+      }
+    }
+
+    const retainedEarningsComputed = priorNi.netIncome;
+    const currentPeriodNetIncome = currentNi.netIncome;
+    const liabilitiesAndEquity = liabilitiesTotal
+      .add(equityTotal)
+      .add(retainedEarningsComputed)
+      .add(currentPeriodNetIncome);
+
     return {
       status: 'ok',
       report: 'balance-sheet',
       companyId,
       filters: {
-        asOfDate: q.asOfDate ?? null,
+        asOfDate: utcDayString(asOfEnd),
       },
       generatedAt: new Date().toISOString(),
       data: {
-        assets: [],
-        liabilities: [],
-        equity: [],
+        assets,
+        liabilities,
+        equity,
         syntheticEquity: {
-          retainedEarningsComputed: zero,
-          currentPeriodNetIncome: zero,
+          retainedEarningsComputed: formatDecimal4(retainedEarningsComputed),
+          currentPeriodNetIncome: formatDecimal4(currentPeriodNetIncome),
         },
         totals: {
-          assets: zero,
-          liabilities: zero,
-          equity: zero,
-          liabilitiesAndEquity: zero,
-          balanced: true,
+          assets: formatDecimal4(assetsTotal),
+          liabilities: formatDecimal4(liabilitiesTotal),
+          equity: formatDecimal4(equityTotal),
+          liabilitiesAndEquity: formatDecimal4(liabilitiesAndEquity),
+          balanced: assetsTotal.equals(liabilitiesAndEquity),
         },
       },
+    };
+  }
+
+  /**
+   * Same P&L totals as Income Statement for a POSTED window:
+   * revenue = sum(credit − debit) on REVENUE (contra-revenue reduces),
+   * expenses = sum(signed DEBIT-normal amounts) on EXPENSE,
+   * netIncome = revenue − expenses.
+   */
+  private async computeIncomeStatementTotalsForWindow(
+    companyId: string,
+    fromStart: Date | null,
+    toBound: { lte: Date } | { lt: Date },
+  ): Promise<{
+    revenue: Prisma.Decimal;
+    expenses: Prisma.Decimal;
+    netIncome: Prisma.Decimal;
+  }> {
+    const accounts = await this.prisma.account.findMany({
+      where: {
+        companyId,
+        type: { in: [AccountType.REVENUE, AccountType.EXPENSE] },
+      },
+      select: {
+        id: true,
+        type: true,
+        normalBalance: true,
+      },
+    });
+
+    const entryDateFilter: Prisma.DateTimeFilter = {
+      ...(fromStart ? { gte: fromStart } : {}),
+      ...toBound,
+    };
+
+    const lines = await this.prisma.journalEntryLine.findMany({
+      where: {
+        companyId,
+        entry: {
+          companyId,
+          status: JournalEntryStatus.POSTED,
+          entryDate: entryDateFilter,
+        },
+      },
+      select: {
+        debit: true,
+        credit: true,
+        debitAccountId: true,
+        creditAccountId: true,
+      },
+    });
+
+    type PeriodBucket = {
+      debitTotal: Prisma.Decimal;
+      creditTotal: Prisma.Decimal;
+    };
+    const buckets = new Map<string, PeriodBucket>();
+    for (const account of accounts) {
+      buckets.set(account.id, {
+        debitTotal: new Prisma.Decimal('0'),
+        creditTotal: new Prisma.Decimal('0'),
+      });
+    }
+    const accountIds = new Set(accounts.map((a) => a.id));
+    for (const line of lines) {
+      const debit = toDecimal(line.debit);
+      const credit = toDecimal(line.credit);
+      if (line.debitAccountId && accountIds.has(line.debitAccountId)) {
+        const bucket = buckets.get(line.debitAccountId)!;
+        bucket.debitTotal = addDecimal(bucket.debitTotal, debit);
+      }
+      if (line.creditAccountId && accountIds.has(line.creditAccountId)) {
+        const bucket = buckets.get(line.creditAccountId)!;
+        bucket.creditTotal = addDecimal(bucket.creditTotal, credit);
+      }
+    }
+
+    let revenueTotal = new Prisma.Decimal('0');
+    let expenseTotal = new Prisma.Decimal('0');
+    for (const account of accounts) {
+      const bucket = buckets.get(account.id)!;
+      if (bucket.debitTotal.isZero() && bucket.creditTotal.isZero()) continue;
+      if (account.type === AccountType.REVENUE) {
+        revenueTotal = addDecimal(
+          revenueTotal,
+          bucket.creditTotal.minus(bucket.debitTotal),
+        );
+      } else {
+        expenseTotal = addDecimal(
+          expenseTotal,
+          computeSignedBalance(
+            bucket.debitTotal,
+            bucket.creditTotal,
+            account.normalBalance,
+          ),
+        );
+      }
+    }
+
+    return {
+      revenue: revenueTotal,
+      expenses: expenseTotal,
+      netIncome: revenueTotal.minus(expenseTotal),
     };
   }
 }

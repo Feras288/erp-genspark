@@ -69,7 +69,8 @@ export class IncomeStatementQueryDto {
 export class BalanceSheetQueryDto {
   @ApiPropertyOptional({
     example: '2026-12-31',
-    description: 'As-of ISO date (YYYY-MM-DD). Skeleton only.',
+    description:
+      'As-of ISO date (YYYY-MM-DD, through T23:59:59.999Z). Default: end of today UTC.',
   })
   @IsOptional()
   @IsString()

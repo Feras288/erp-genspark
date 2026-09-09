@@ -5,6 +5,7 @@
 // math uses Prisma.Decimal only — never Number().
 // Trial Balance row shape locked in 12A-B-2.
 // Income Statement line shape locked in 12A-B-3.
+// Balance Sheet line shape locked in 12A-B-4.
 // =====================================================
 
 export type DecimalString = string;
@@ -125,7 +126,10 @@ export type BalanceSheetLine = {
   accountId: string;
   code: string;
   name: string;
-  nameAr: string | null;
+  type: AccountTypeKey;
+  normalBalance: NormalBalanceKey;
+  debitTotal: DecimalString;
+  creditTotal: DecimalString;
   amount: DecimalString;
 };
 

@@ -4652,3 +4652,205 @@ describe('Phase 12A-B-3: Income Statement calculation (e2e smoke)', () => {
   });
 });
 
+// =====================================================
+// Phase 12A-B-4 — Balance Sheet calculation (e2e smoke).
+//
+// As-of POSTED balances + synthetic RE / current NI.
+// No close journals. Equation: assets = L + E + RE + NI.
+// =====================================================
+describe('Phase 12A-B-4: Balance Sheet calculation (e2e smoke)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+  let cashierToken: string;
+
+  const unique = Date.now().toString(36);
+  const BS_CASH_CODE = `BS-CASH-${unique}`;
+  const BS_AP_CODE = `BS-AP-${unique}`;
+  const BS_EQ_CODE = `BS-EQ-${unique}`;
+  const BS_REV_CODE = `BS-REV-${unique}`;
+  const BS_EXP_CODE = `BS-EXP-${unique}`;
+
+  let cashId = '';
+  let apId = '';
+  let eqId = '';
+  let revId = '';
+  let expId = '';
+
+  async function createAccount(
+    code: string,
+    name: string,
+    type: 'ASSET' | 'LIABILITY' | 'EQUITY' | 'REVENUE' | 'EXPENSE',
+    normalBalance: 'DEBIT' | 'CREDIT',
+  ): Promise<string> {
+    const res = await request(http)
+      .post(`${API_PREFIX}/accounting/accounts`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code, name, type, normalBalance, isActive: true });
+    expect([201, 409]).toContain(res.status);
+    if (res.body?.id) return res.body.id as string;
+    const list = await request(http)
+      .get(`${API_PREFIX}/accounting/accounts?search=${encodeURIComponent(code)}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(list.status).toBe(200);
+    return list.body.items[0].id as string;
+  }
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+
+    cashId = await createAccount(BS_CASH_CODE, 'BS cash', 'ASSET', 'DEBIT');
+    apId = await createAccount(BS_AP_CODE, 'BS AP', 'LIABILITY', 'CREDIT');
+    eqId = await createAccount(BS_EQ_CODE, 'BS equity', 'EQUITY', 'CREDIT');
+    revId = await createAccount(BS_REV_CODE, 'BS revenue', 'REVENUE', 'CREDIT');
+    expId = await createAccount(BS_EXP_CODE, 'BS expense', 'EXPENSE', 'DEBIT');
+
+    const posted = await request(http)
+      .post(`${API_PREFIX}/accounting/journal`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        description: 'Phase 12A-B-4 posted BS fixture',
+        lines: [
+          { accountId: cashId, debit: '100.0000', credit: '0.0000' },
+          { accountId: expId, debit: '20.0000', credit: '0.0000' },
+          { accountId: apId, debit: '0.0000', credit: '30.0000' },
+          { accountId: eqId, debit: '0.0000', credit: '20.0000' },
+          { accountId: revId, debit: '0.0000', credit: '70.0000' },
+        ],
+      });
+    expect(posted.status).toBe(201);
+    const postRes = await request(http)
+      .post(`${API_PREFIX}/accounting/journal/${posted.body.id}/post`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect([200, 201]).toContain(postRes.status);
+    expect(postRes.body.status).toBe('POSTED');
+
+    const cashierRole = await request(http)
+      .post(`${API_PREFIX}/rbac/roles`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        name: 'Cashier-E2E',
+        key: 'cashier_e2e',
+        description: 'test pos',
+      });
+    expect([201, 409]).toContain(cashierRole.status);
+
+    const cashierUser = await request(http)
+      .post(`${API_PREFIX}/users`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        email: 'cashier-e2e@example.sa',
+        password: 'Cashier@123',
+        fullName: 'Cashier E2E',
+        roleKeys: ['cashier_e2e'],
+      });
+    expect([200, 201, 409]).toContain(cashierUser.status);
+
+    const cashierLogin = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'cashier-e2e@example.sa', password: 'Cashier@123' });
+    expect(cashierLogin.status).toBe(200);
+    cashierToken = cashierLogin.body.accessToken;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('12A-B-4.1) GET balance-sheet returns asset / liability / equity sections', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/balance-sheet`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.report).toBe('balance-sheet');
+    expect(Array.isArray(res.body.data.assets)).toBe(true);
+    expect(Array.isArray(res.body.data.liabilities)).toBe(true);
+    expect(Array.isArray(res.body.data.equity)).toBe(true);
+    expect(res.body.data.assets.length).toBeGreaterThan(0);
+    expect(res.body.data.assets.find((a: { accountId: string }) => a.accountId === cashId)).toBeDefined();
+    expect(res.body.data.liabilities.find((a: { accountId: string }) => a.accountId === apId)).toBeDefined();
+    expect(res.body.data.equity.find((a: { accountId: string }) => a.accountId === eqId)).toBeDefined();
+  });
+
+  it('12A-B-4.2) assets equals liabilitiesAndEquity including synthetic RE / NI', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/balance-sheet`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const assets = new Prisma.Decimal(res.body.data.totals.assets);
+    const liabilitiesAndEquity = new Prisma.Decimal(
+      res.body.data.totals.liabilitiesAndEquity,
+    );
+    const reconstructed = new Prisma.Decimal(res.body.data.totals.liabilities)
+      .add(res.body.data.totals.equity)
+      .add(res.body.data.syntheticEquity.retainedEarningsComputed)
+      .add(res.body.data.syntheticEquity.currentPeriodNetIncome);
+    expect(res.body.data.totals.liabilitiesAndEquity).toBe(
+      reconstructed.toFixed(4),
+    );
+    expect(assets.equals(liabilitiesAndEquity)).toBe(true);
+    expect(res.body.data.totals.balanced).toBe(true);
+  });
+
+  it('12A-B-4.3) currentPeriodNetIncome matches income-statement netIncome for fiscal YTD', async () => {
+    const bs = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/balance-sheet`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    const is = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/income-statement`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(bs.status).toBe(200);
+    expect(is.status).toBe(200);
+    expect(bs.body.data.syntheticEquity.currentPeriodNetIncome).toBe(
+      is.body.data.totals.netIncome,
+    );
+  });
+
+  it('12A-B-4.4) excludes REVENUE / EXPENSE from direct BS sections', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/balance-sheet`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const rows = [
+      ...(res.body.data.assets as { accountId: string; type: string }[]),
+      ...(res.body.data.liabilities as { accountId: string; type: string }[]),
+      ...(res.body.data.equity as { accountId: string; type: string }[]),
+    ];
+    expect(rows.some((r) => r.accountId === revId)).toBe(false);
+    expect(rows.some((r) => r.accountId === expId)).toBe(false);
+    for (const row of rows) {
+      expect(['ASSET', 'LIABILITY', 'EQUITY']).toContain(row.type);
+    }
+  });
+
+  it('12A-B-4.5) GET balance-sheet without gl_journal.read => 403', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/accounting/reports/balance-sheet`)
+      .set('Authorization', `Bearer ${cashierToken}`);
+    expect(res.status).toBe(403);
+  });
+});
+
