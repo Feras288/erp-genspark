@@ -1140,3 +1140,405 @@ describe('Phase 10A-B-3: AR Payments backend (e2e smoke)', () => {
     expect(postRes.status).toBe(404);
   });
 });
+
+// =====================================================
+// Phase 10B-B-3: AP Payments (e2e smoke).
+//
+// Coverage (mirrors Phase 10A-B-3 AR smoke; differentiated
+// for PURCHASE — no paidAmount writeback, no status mutation):
+//
+//   1) GET/POST return 401 without Authorization.
+//   2) Cashier (without ap_payments.*) gets 403 on both.
+//   3) GET as admin returns 200 + array (empty on fresh
+//      RECEIVED fixture).
+//   4) POST as admin with partial valid amount returns
+//      201 + full response shape (id, invoiceId,
+//      invoiceType='PURCHASE', amount string, paymentMethod,
+//      paidAt, reference, notes, status='POSTED',
+//      idempotencyKey, createdAt).
+//   5) Idempotency replay — same key returns same payment,
+//      exactly one matching GET row.
+//   6) Overpayment guard — dto.amount > outstanding → 409.
+//   7) After successful POST(4), GET shows the created row.
+//   8) GET/POST on non-existent invoiceId → 404.
+//
+// NOT testing (commit decision / out of scope):
+//   * PurchaseInvoice.paidAmount does not exist (commit
+//     decision — no writeback assertion).
+//   * PurchaseInvoice.status (RECEIVED stays RECEIVED — no
+//     status mutation after POST).
+//   * AR payments (Phase 10A — covered by its own describe).
+//   * GL/bank reconciliation/drill-down.
+//
+// Tenant/Auth:
+//   * JwtAuthGuard + PermissionsGuard at controller level.
+//   * All companyIds from JWT (Phase 7B-1 contract).
+//   * ap_payments.{read,write} seeded by migration
+//     `20260908233949_phase10b_ap_payments_permissions` —
+//     no runtime permission upsert needed.
+// =====================================================
+describe('Phase 10B-B-3: AP Payments (e2e smoke)', () => {
+  let app2: INestApplication;
+  let http2: ReturnType<INestApplication['getHttpServer']>;
+
+  // Reusable supertest agents — keep Authorization pre-set
+  // so the JWT isn't re-minted per `it()` (avoids socket
+  // pool fragmentation matching the AR describe pattern).
+  let adminAgent2: ReturnType<typeof request.agent>;
+  let apAgent: ReturnType<typeof request.agent>;
+  let cashierToken2: string;
+
+  // Random suffix avoids collisions with previous test
+  // runs that may have left rows behind in the same DB
+  // when tests are interrupted before the soft-delete GC.
+  const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // RBAC + JWT mirror fixtures for AR smoke:
+  //   role key  : ap_payments_e2e
+  //   user email: ap-payments-e2e@example.sa
+  //   password  : ApPayments@123
+  // Permissions (already in catalog from migration
+  // 20260908233949):
+  //   ap_payments.read
+  //   ap_payments.write
+  const apRoleKey = 'ap_payments_e2e';
+  const apUserEmail = 'ap-payments-e2e@example.sa';
+  const apUserPassword = 'ApPayments@123';
+
+  // Phase 5B pattern: a SERVICE-only purchase invoice with
+  // discountAmount + vatRate, total = 690.0000. We DRAFT
+  // it, then `/receive` to flip status to RECEIVED — the
+  // only status that accepts AP payments (commit decision;
+  // DRAFT/CANCELLED → 409, mirror of AR ISSUED gate).
+  const SKU_SVC_10B = `SKU-SVC-10B-${unique}`;
+
+  // tracked across tests:
+  let apReceivedInvoiceId: string;
+  let supplierId: string;
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app2 = moduleRef.createNestApplication();
+    app2.use(helmet());
+    app2.use(cookieParser());
+    app2.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app2.setGlobalPrefix('api');
+    await app2.init();
+    http2 = app2.getHttpServer();
+
+    // ---- bootstrap admin agent (full reports.read + db-owner) ----
+    const adminLogin = await request(http2)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(adminLogin.status).toBe(200);
+    adminAgent2 = request.agent(http2);
+    adminAgent2.set('Authorization', `Bearer ${adminLogin.body.accessToken}`);
+
+    // ---- bootstrap cashier (no ap_payments.*) ----
+    // The cashier role + user were created by the
+    // outermost beforeAll. Re-trigger that login here
+    // because each AppModule instantiation owns its own
+    // JWT + bcrypt cache state, and Phase 1 may have
+    // already closed `app` by the time this describe runs.
+    const cashierLogin = await request(http2)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'cashier-e2e@example.sa', password: 'Cashier@123' });
+    expect(cashierLogin.status).toBe(200);
+    cashierToken2 = cashierLogin.body.accessToken;
+
+    const { PrismaService } = await import('../src/database/prisma.service');
+    const prisma = app2.get(PrismaService);
+
+    // ---- role + rolePermission for ap_payments_e2e ----
+    // Use defensive idempotent `permission.upsert` mirroring
+    // the AR smoke pattern — works whether the test DB has
+    // migration `20260908233949` applied or not. The `key`
+    // column is `@@unique`, so the where-clause is keyed on
+    // a stable column.
+    const apPermRead = await prisma.permission.upsert({
+      where: { key: 'ap_payments.read' },
+      update: {},
+      create: {
+        key: 'ap_payments.read',
+        module: 'ap_payments',
+        action: 'read',
+        description: 'List / get payments on a purchase invoice',
+      },
+    });
+    const apPermWrite = await prisma.permission.upsert({
+      where: { key: 'ap_payments.write' },
+      update: {},
+      create: {
+        key: 'ap_payments.write',
+        module: 'ap_payments',
+        action: 'write',
+        description: 'Register / soft-cancel a payment on a purchase invoice',
+      },
+    });
+    expect(apPermRead).toBeDefined();
+    expect(apPermWrite).toBeDefined();
+
+    const apRoleRes = await adminAgent2
+      .post(`${API_PREFIX}/rbac/roles`)
+      .send({
+        name: 'Accounts-Payable-E2E',
+        key: apRoleKey,
+        description: 'AP payments e2e',
+      });
+    expect([201, 409]).toContain(apRoleRes.status);
+
+    const apRole = await prisma.role.findFirst({
+      where: { key: apRoleKey },
+    });
+    expect(apRole).toBeDefined();
+
+    await prisma.rolePermission.upsert({
+      where: {
+        roleId_permissionId: { roleId: apRole!.id, permissionId: apPermRead.id },
+      },
+      update: {},
+      create: { roleId: apRole!.id, permissionId: apPermRead.id },
+    });
+    await prisma.rolePermission.upsert({
+      where: {
+        roleId_permissionId: { roleId: apRole!.id, permissionId: apPermWrite.id },
+      },
+      update: {},
+      create: { roleId: apRole!.id, permissionId: apPermWrite.id },
+    });
+
+    const apUserRes = await adminAgent2.post(`${API_PREFIX}/users`).send({
+      email: apUserEmail,
+      password: apUserPassword,
+      fullName: 'مدير حسابات دائنة',
+      roleKeys: [apRoleKey],
+    });
+    expect([200, 201, 409]).toContain(apUserRes.status);
+
+    // Defensive re-bind (idempotent on the
+    // `@@id([userId, roleId])` composite PK) so the JWT
+    // minted on the very next login carries the freshly
+    // updated permissions[] claim.
+    const apUserRow = await prisma.user.findFirst({
+      where: { email: apUserEmail, deletedAt: null },
+    });
+    if (apUserRow) {
+      await prisma.userRole.upsert({
+        where: { userId_roleId: { userId: apUserRow.id, roleId: apRole!.id } },
+        update: {},
+        create: { userId: apUserRow.id, roleId: apRole!.id },
+      });
+    }
+
+    const apLogin = await request(http2)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: apUserEmail, password: apUserPassword });
+    expect(apLogin.status).toBe(200);
+    apAgent = request.agent(http2);
+    apAgent.set('Authorization', `Bearer ${apLogin.body.accessToken}`);
+
+    // ---- Purchase-invoice fixture (status=RECEIVED) ----
+    // 1) SERVICE-only product (no warehouse required):
+    const pSvc = await adminAgent2.post(`${API_PREFIX}/products`).send({
+      sku: SKU_SVC_10B,
+      name: 'Phase 10B-B-3 AP service',
+      type: 'SERVICE',
+    });
+    expect(pSvc.status).toBe(201);
+
+    // 2) Supplier (BOTH type so it's also valid as
+    //    CUSTOMER, satisfying the supplier-validation
+    //    guard in the purchase-invoices POST DTO):
+    const supRes = await adminAgent2.post(`${API_PREFIX}/partners`).send({
+      code: `SUP-10B-${unique}`,
+      name: 'Phase 10B-B-3 supplier',
+      type: 'BOTH',
+    });
+    expect(supRes.status).toBe(201);
+    supplierId = supRes.body.id;
+
+    // 3) DRAFT purchase-invoice, computed total = 690:
+    //    3 * 200 = 600 subtotal, 15% vat = 90, total 690.
+    //    NOTE: Phase 5 purchase-line DTO uses `unitCost` (not
+    //    `unitPrice` like the sales line DTO).
+    const draftRes = await adminAgent2
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .send({
+        supplierId,
+        notes: 'phase 10b-b-3 ap fixture',
+        lines: [
+          {
+            productId: pSvc.body.id,
+            quantity: '3.0000',
+            unitCost: '200.0000',
+            discountAmount: '0.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(draftRes.status).toBe(201);
+    expect(draftRes.body.status).toBe('DRAFT');
+    expect(Number(draftRes.body.total)).toBe(690);
+
+    // 4) Receive (DRAFT → RECEIVED) so the AP payments
+    //    status gate (RECEIVED only) is satisfied.
+    const receiveRes = await adminAgent2
+      .post(`${API_PREFIX}/purchases/invoices/${draftRes.body.id}/receive`)
+      .send({ notes: 'issuing for 10b-b-3' });
+    expect(receiveRes.status).toBe(201);
+    expect(receiveRes.body.status).toBe('RECEIVED');
+    apReceivedInvoiceId = receiveRes.body.id;
+  });
+
+  afterAll(async () => {
+    await app2.close();
+  });
+
+  // -------- 1. Auth: 401 without Authorization on GET + POST --------
+  it('1) GET/POST AP payments return 401 without Authorization', async () => {
+    const url = `${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`;
+    const getRes = await request(http2).get(url);
+    expect(getRes.status).toBe(401);
+    const postRes = await request(http2)
+      .post(url)
+      .send({ paymentMethod: 'CASH', amount: '100.0000' });
+    expect(postRes.status).toBe(401);
+  });
+
+  // -------- 2. RBAC: cashier (no ap_payments.*) → 403 on both --------
+  it('2) cashier (without ap_payments.*) gets 403 on GET and POST', async () => {
+    expect(cashierToken2).toBeDefined();
+    const url = `${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`;
+    const getRes = await request(http2)
+      .get(url)
+      .set('Authorization', `Bearer ${cashierToken2}`);
+    expect(getRes.status).toBe(403);
+    const postRes = await request(http2)
+      .post(url)
+      .set('Authorization', `Bearer ${cashierToken2}`)
+      .send({ paymentMethod: 'CASH', amount: '100.0000' });
+    expect(postRes.status).toBe(403);
+  });
+
+  // -------- 3. GET admin → 200 + array (fresh fixture initially empty) --------
+  it('3) GET as admin returns 200 + array (initially empty for fresh fixture)', async () => {
+    const res = await adminAgent2.get(
+      `${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body.length).toBe(0);
+  });
+
+  // -------- 4. POST admin partial valid → 201 + full response shape --------
+  it('4) POST as admin with partial valid amount returns 201 + full response shape', async () => {
+    const idemKey = `phase10b-b3-${unique}`;
+    const res = await apAgent
+      .post(`${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`)
+      .send({
+        paymentMethod: 'CASH',
+        amount: '100.0000',
+        reference: 'phase-10b-b3-ref',
+        notes: 'phase-10b-b3 smoke partial',
+        idempotencyKey: idemKey,
+      });
+    expect(res.status).toBe(201);
+    // Phase 10B-B-2 response contract:
+    expect(res.body.id).toEqual(expect.any(String));
+    expect(res.body.invoiceId).toBe(apReceivedInvoiceId);
+    expect(res.body.invoiceType).toBe('PURCHASE');
+    expect(typeof res.body.amount).toBe('string');
+    expect(Number(res.body.amount)).toBe(100);
+    expect(res.body.paymentMethod).toBe('CASH');
+    expect(typeof res.body.paidAt).toBe('string');
+    expect(res.body.reference).toBe('phase-10b-b3-ref');
+    expect(res.body.notes).toBe('phase-10b-b3 smoke partial');
+    expect(res.body.status).toBe('POSTED');
+    expect(res.body.idempotencyKey).toBe(idemKey);
+    expect(typeof res.body.createdAt).toBe('string');
+  });
+
+  // -------- 5. Idempotency replay — same key returns same payment, no duplicate --------
+  it('5) POST same idempotencyKey returns same payment and does not duplicate', async () => {
+    const idemKey = `phase10b-b3-${unique}`;
+    const res = await apAgent
+      .post(`${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`)
+      .send({
+        paymentMethod: 'CASH',
+        amount: '100.0000',
+        reference: 'phase-10b-b3-ref',
+        notes: 'phase-10b-b3 smoke partial',
+        idempotencyKey: idemKey,
+      });
+    // Same idempotencyKey: server returns the existing row.
+    // Status remains 201 (replay = successful lookup of the
+    // original POST result).
+    expect(res.status).toBe(201);
+    expect(res.body.idempotencyKey).toBe(idemKey);
+
+    // GET must show EXACTLY ONE matching row.
+    const listRes = await apAgent.get(
+      `${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`,
+    );
+    expect(listRes.status).toBe(200);
+    const matches = listRes.body.filter(
+      (p: { idempotencyKey: string | null }) => p.idempotencyKey === idemKey,
+    );
+    expect(matches.length).toBe(1);
+  });
+
+  // -------- 6. Overpayment guard → 409 Conflict --------
+  it('6) POST amount greater than outstanding returns 409 Conflict', async () => {
+    // Total is 690; tests 4+5 paid 100; remaining outstanding is
+    // 590. Asking for 9999 must trigger the overpayment 409.
+    const res = await apAgent
+      .post(`${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`)
+      .send({
+        paymentMethod: 'CARD',
+        amount: '9999.0000',
+        idempotencyKey: `phase10b-b3-overpay-${unique}`,
+      });
+    expect(res.status).toBe(409);
+    const msg = String((res.body && res.body.message) ?? '');
+    expect(msg.toLowerCase()).toMatch(/overpayment|outstanding|amount/);
+  });
+
+  // -------- 7. After successful POST(4), GET shows the created row --------
+  it('7) GET after POST(4) returns the created payment row', async () => {
+    const idemKey = `phase10b-b3-${unique}`;
+    const listRes = await apAgent.get(
+      `${API_PREFIX}/purchase-invoices/${apReceivedInvoiceId}/payments`,
+    );
+    expect(listRes.status).toBe(200);
+    expect(Array.isArray(listRes.body)).toBe(true);
+    const created = listRes.body.find(
+      (p: { idempotencyKey: string | null }) => p.idempotencyKey === idemKey,
+    );
+    expect(created).toBeDefined();
+    expect(created.invoiceId).toBe(apReceivedInvoiceId);
+    expect(created.invoiceType).toBe('PURCHASE');
+    expect(created.status).toBe('POSTED');
+    expect(Number(created.amount)).toBe(100);
+  });
+
+  // -------- 8. Tenant isolation: unknown invoiceId in JWT tenant → 404 --------
+  it('8) GET/POST on non-existent purchase invoiceId returns 404 (tenant isolation)', async () => {
+    const url = `${API_PREFIX}/purchase-invoices/00000000-0000-0000-0000-000000000000/payments`;
+    const getRes = await apAgent.get(url);
+    expect(getRes.status).toBe(404);
+    const postRes = await apAgent.post(url).send({
+      paymentMethod: 'CASH',
+      amount: '1.0000',
+      idempotencyKey: `phase10b-b3-404-${unique}`,
+    });
+    expect(postRes.status).toBe(404);
+  });
+});
