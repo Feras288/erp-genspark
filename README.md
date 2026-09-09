@@ -2960,3 +2960,109 @@ function ensureJournalEntryCanCancel(entry: JournalEntry | null): asserts entry 
 - Working tree clean قبل 11A-D-2: `git diff --name-only` empty.
 
 → Phase 11A closure verified. Phase 11A-D-2 (README update) sealed.
+
+---
+
+## Phase 11B: Real GL Posting
+
+> تم تنفيذ المرحلة 11B بالكامل مع **164/164 e2e tests passing** عبر test suites كاملة، مع builds نظيفة تماماً للـ backend والـ frontend. تربط هذه المرحلة دورات الأعمال الأربع الأساسية (المبيعات، المشتريات، تحصيلات الذمم المدينة، مدفوعات الذمم الدائنة) بدفتر الأستاذ العام (General Ledger) تلقائياً وذرياً (Atomically) وبشكل متزن وغير قابل للتكرار (Idempotent).
+
+### Completed Commits (Phase 11B)
+
+- `a08bb0e` — `feat(phase-11b): add GL posting linkage skeleton`
+- `065b51c` — `feat(phase-11b): auto-post sales invoices to GL`
+- `1265b8d` — `feat(phase-11b): auto-post purchase invoices to GL`
+- `8447711` — `feat(phase-11b): auto-post AR payments to GL`
+- `f47fdaa` — `feat(phase-11b): auto-post AP payments to GL`
+- `799f510` — `test(phase-11b): add GL posting consolidation e2e`
+- `49eca7e` — `feat(phase-11b): show GL posting sources in frontend`
+
+---
+
+### 1. JournalEntry Source Linkage
+تمت إضافة أعمدة الربط البوليمورفي إلى نموذج `JournalEntry` لربط قيود اليومية بمستندات المصدر مباشرة وحمايتها من التكرار:
+- **`sourceType: JournalEntrySourceType?`**: نوع المستند المصدر (`SALES_INVOICE` | `PURCHASE_INVOICE` | `AR_PAYMENT` | `AP_PAYMENT` | `null` للقيود اليدوية).
+- **`sourceId: String?`**: المعرّف الفريد للمستند المصدر داخل الشركة.
+- **`reversalOf: String?`**: حقل محجوز للربط الذاتي لقيود الإلغاء/العكس المستقبلية (`JournalEntryReversal`).
+- **`@@unique([companyId, sourceType, sourceId])`**: قيد فريد يمنع إنشاء أكثر من قيد مرحّل لنفس المستند المصدر داخل الشركة نفسها، مما يضمن معالجة متكررة آمنة (Idempotent replay).
+
+---
+
+### 2. Required Account Mappings
+تعتمد قيود الترحيل على خريطة الحسابات الأساسية الثمانية الإلزامية بالـ `code` لكل شركة (`companyId`):
+1. **`AR_CONTROL`**: حساب المدينين / مراقبة العملاء (Asset, Debit)
+2. **`AP_CONTROL`**: حساب الدائنين / مراقبة الموردين (Liability, Credit)
+3. **`CASH_OR_BANK`**: النقدية وما في حكمها / البنك (Asset, Debit)
+4. **`SALES_REVENUE`**: إيرادات المبيعات (Revenue, Credit)
+5. **`INVENTORY_OR_EXPENSE`**: المخزون أو المصروف للمشتريات (Asset/Expense, Debit)
+6. **`VAT_OUTPUT`**: ضريبة القيمة المضافة للمبيعات (Liability, Credit)
+7. **`VAT_INPUT`**: ضريبة القيمة المضافة للمشتريات (Asset, Debit)
+8. **`SALES_DISCOUNTS`**: خصومات المبيعات الممنوحة (Contra-Revenue/Expense, Debit)
+
+يتم التأكد من وجود هذه الحسابات وتوليدها تلقائياً عبر `ensureRequiredGlAccounts(tx, companyId)` لضمان عدم وجود قيود معلقة بدون حسابات معتمدة.
+
+---
+
+### 3. Auto-Posting Flows
+الترحيل يتم تلقائياً داخل نفس الـ Prisma `$transaction` الخاصة بالعملية التجارية لضمان الذرية (Atomic Execution):
+1. **`SalesInvoice ISSUED`**: عند ترحيل/إصدار فاتورة المبيعات (`SalesService.issue`).
+2. **`PurchaseInvoice RECEIVED`**: عند استلام فاتورة المشتريات واعتمادها (`PurchasesService.receive`).
+3. **`AR Payment POSTED`**: عند تسجيل وقبض دفعة مبيعات (`PaymentsService.register`).
+4. **`AP Payment POSTED`**: عند تسجيل وصرف دفعة مشتريات (`PaymentsService.registerPurchasePayment`).
+
+---
+
+### 4. Posting Templates (قوالب الترحيل المحاسبي)
+جميع العمليات الحسابية تتم باستخدام `Prisma.Decimal` حصراً دون أي تحويل إلى `Number()`:
+
+#### أ. فاتورة المبيعات (Sales Invoice ISSUED):
+- **مدين (Dr)**: `AR_CONTROL` (صافي المستحق على العميل = الإجمالي بعد الخصم والضريبة)
+- **مدين (Dr)**: `SALES_DISCOUNTS` (إجمالي الخصم الممنوح إن وجد)
+- **دائن (Cr)**: `SALES_REVENUE` (إجمالي قيمة البضاعة/الخدمة قبل الخصم)
+- **دائن (Cr)**: `VAT_OUTPUT` (إجمالي ضريبة المخرجات 15%)
+
+#### ب. فاتورة المشتريات (Purchase Invoice RECEIVED):
+- **مدين (Dr)**: `INVENTORY_OR_EXPENSE` (صافي تكلفة البضاعة أو الخدمة بعد الخصم)
+- **مدين (Dr)**: `VAT_INPUT` (إجمالي ضريبة المدخلات 15%)
+- **دائن (Cr)**: `AP_CONTROL` (إجمالي المستحق للمورد)
+
+#### ج. سند قبض دفعة مبيعات (AR Payment POSTED):
+- **مدين (Dr)**: `CASH_OR_BANK` = قيمة الدفعة المحصلة
+- **دائن (Cr)**: `AR_CONTROL` = قيمة الدفعة المسددة من حساب العميل
+
+#### د. سند صرف دفعة مشتريات (AP Payment POSTED):
+- **مدين (Dr)**: `AP_CONTROL` = قيمة الدفعة المسددة لحساب المورد
+- **دائن (Cr)**: `CASH_OR_BANK` = قيمة الدفعة المنصرفة
+
+---
+
+### 5. Idempotency & Safety
+- **حماية تامة من التكرار**: لا يمكن بأي حال توليد أكثر من قيد لنفس المستند داخل نفس الشركة بفضل الفهرس الفريد `@@unique([companyId, sourceType, sourceId])`.
+- **معالجة تكرار الطلب**: في حال إعادة محاولة الطلب (Retry / Idempotent replay)، تلتقط المعالجات خطأ `P2002` وتعيد القيد القائم فوراً (`{ reused: true }`) دون توليد قيود مكررة أو التسبب بخلل في التوازن المحاسبي.
+
+---
+
+### 6. Frontend Source Visibility
+تم تعزيز شاشة دفتر الأستاذ العام القراءة-فقط (`frontend/src/app/accounting/gl/page.tsx`):
+- إضافة عمود **نوع المصدر** مع شارات ملونة وتسميات عربية/إنجليزية واضحة (`فاتورة مبيعات / Sales Invoice`، `فاتورة مشتريات / Purchase Invoice`، `سند قبض / AR Payment`، `سند صرف / AP Payment`، `قيد يدوي / Manual Journal`).
+- إضافة عمود **معرّف المصدر** لعرض معرّف المستند المرتبط به القيد.
+- الحفاظ على الحظر الصارم لأي تعديل: لا أزرار إنشاء، تعديل، ترحيل، أو إلغاء في الواجهة.
+
+---
+
+### 7. Verification Summary
+- **Backend Build (`pnpm --filter @erp/backend build`)**: **PASS** (NestJS compiled successfully).
+- **Backend E2E Tests (`pnpm --filter @erp/backend test:e2e`)**: **PASS = 164/164 tests** (2 suites: `reports.e2e-spec.ts` + `app.e2e-spec.ts`).
+- **Frontend Build (`pnpm --filter @erp/frontend build`)**: **PASS** (Next.js compiled, type-checked, 16 static routes generated).
+- **Final Verification HEAD**: `49eca7e9d34cee92775244f55e28fc529a6cfec7`.
+- **Working Tree**: Clean.
+
+---
+
+### 8. Out of Scope (صريح للمراحل المستقبلية)
+- ❌ **القوائم المالية الكاملة**: لا ميزان مراجعة، لا قائمة دخل، لا ميزانية عمومية، لا قائمة تدفقات نقدية.
+- ❌ **التسوية البنكية**: لا مطابقة مع كشوفات البنك، ولا استيراد ملفات بنكية.
+- ❌ **الإقرارات الضريبية والـ ZATCA**: لا إقرارات ضريبية آلية ولا ربط إلكتروني للمرحلة الثانية مع هيئة الزكاة والضريبة والجمارك.
+- ❌ **تعدد العملات**: العملة الأساسية الوحيدة هي الريال السعودي (`SAR`).
+- ❌ **التكاملات الخارجية**: لا بوابات دفع ولا ربط مع أنظمة محاسبية خارجية.
+- ❌ **النشر السحابي/الإنتاجي**: البيئة قيد التطوير المحلي والاختبار الكامل فقط.
