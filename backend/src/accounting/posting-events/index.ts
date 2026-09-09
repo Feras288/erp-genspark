@@ -2,6 +2,7 @@
 // Phase 11B-B-2: sales_invoice_issued handler (called from SalesService.issue).
 // Phase 11B-B-3: purchase_invoice_received handler (called from PurchasesService.receive).
 // Phase 11B-B-4: ar_payment_posted handler (called from PaymentsService.register).
+// Phase 11B-B-5: ap_payment_posted handler (called from PaymentsService.registerPurchasePayment).
 export {
   assertBalancedLines,
   DECIMAL_ZERO,
@@ -23,6 +24,8 @@ export { postPurchaseInvoiceReceived } from './handlers/purchase-invoice-receive
 export type { PostPurchaseInvoiceReceivedResult } from './handlers/purchase-invoice-received.handler';
 export { postArPaymentPosted } from './handlers/ar-payment-posted.handler';
 export type { PostArPaymentPostedResult } from './handlers/ar-payment-posted.handler';
+export { postApPaymentPosted } from './handlers/ap-payment-posted.handler';
+export type { PostApPaymentPostedResult } from './handlers/ap-payment-posted.handler';
 export type {
   ApPaymentPostedSource,
   ArPaymentPostedSource,

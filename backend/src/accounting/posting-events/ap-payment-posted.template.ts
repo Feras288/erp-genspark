@@ -36,6 +36,9 @@ export function buildApPaymentPostedTemplate(
   ];
 
   const totals = assertBalancedLines(lines);
+  const refNote = source.reference ? ` ref ${source.reference}` : '';
+  const description = `AP payment ${source.id}${refNote}${invoiceNote} (${methodLabel})`;
+
   return {
     sourceType: JournalEntrySourceType.AP_PAYMENT,
     sourceId: source.id,
@@ -43,7 +46,7 @@ export function buildApPaymentPostedTemplate(
       JournalEntrySourceType.AP_PAYMENT,
       source.id,
     ),
-    description: `AP payment posted (${methodLabel})`,
+    description,
     memo: methodLabel,
     lines,
     totalDebit: totals.totalDebit,
