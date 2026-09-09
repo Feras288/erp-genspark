@@ -1,5 +1,6 @@
 // Phase 11B-B-1: posting-event templates (read-only builders).
 // Phase 11B-B-2: sales_invoice_issued handler (called from SalesService.issue).
+// Phase 11B-B-3: purchase_invoice_received handler (called from PurchasesService.receive).
 export {
   assertBalancedLines,
   DECIMAL_ZERO,
@@ -17,6 +18,8 @@ export { buildArPaymentPostedTemplate } from './ar-payment-posted.template';
 export { buildApPaymentPostedTemplate } from './ap-payment-posted.template';
 export { postSalesInvoiceIssued } from './handlers/sales-invoice-issued.handler';
 export type { PostSalesInvoiceIssuedResult } from './handlers/sales-invoice-issued.handler';
+export { postPurchaseInvoiceReceived } from './handlers/purchase-invoice-received.handler';
+export type { PostPurchaseInvoiceReceivedResult } from './handlers/purchase-invoice-received.handler';
 export type {
   ApPaymentPostedSource,
   ArPaymentPostedSource,

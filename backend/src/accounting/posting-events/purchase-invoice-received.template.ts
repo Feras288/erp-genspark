@@ -7,23 +7,27 @@ import type {
 } from './types';
 
 /**
- * purchase_invoice_received template (plan §4.2).
+ * purchase_invoice_received template (Phase 11B-B-3).
  *
- * Dr INVENTORY_OR_EXPENSE  invoice.total
- * Dr VAT_INPUT             invoice.vatTotal
- * Cr AP_CONTROL            invoice.total + invoice.vatTotal
+ * Existing PurchaseInvoice fields (do not invent):
+ *   subtotal, discountTotal, vatTotal, total
+ * where total = sum(lineTotal) = net-of-discount + VAT.
+ *
+ * Dr INVENTORY_OR_EXPENSE  total - vatTotal   // net purchase (after discount)
+ * Dr VAT_INPUT             vatTotal           // omitted when 0
+ * Cr AP_CONTROL            total
  */
 export function buildPurchaseInvoiceReceivedTemplate(
   source: PurchaseInvoiceReceivedSource,
 ): PostingTemplate {
   const vatTotal = toDecimal(source.vatTotal);
   const total = toDecimal(source.total);
-  const apCredit = total.add(vatTotal);
+  const inventoryOrExpense = total.minus(vatTotal);
 
   const lines = [
     {
       accountCode: 'INVENTORY_OR_EXPENSE' as const,
-      debit: total,
+      debit: inventoryOrExpense,
       credit: DECIMAL_ZERO,
       description: `Inventory / purchases expense — ${source.invoiceNumber}`,
     },
@@ -36,7 +40,7 @@ export function buildPurchaseInvoiceReceivedTemplate(
     {
       accountCode: 'AP_CONTROL' as const,
       debit: DECIMAL_ZERO,
-      credit: apCredit,
+      credit: total,
       description: `AP control — ${source.invoiceNumber}`,
     },
   ];

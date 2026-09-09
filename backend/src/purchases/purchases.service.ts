@@ -57,6 +57,7 @@ import { UpdatePurchaseInvoiceDto } from './dto/update-purchase-invoice.dto';
 import { PurchaseInvoiceQueryDto } from './dto/purchase-invoice-query.dto';
 import { ReceivePurchaseInvoiceDto } from './dto/receive-purchase-invoice.dto';
 import { CancelPurchaseInvoiceDto } from './dto/cancel-purchase-invoice.dto';
+import { postPurchaseInvoiceReceived } from '../accounting/posting-events';
 
 const INVOICE_FIELDS = {
   id: true,
@@ -609,7 +610,11 @@ export class PurchasesService {
    *   - validate headers + lines + product/warehouse references first;
    *   - then upsert stock levels (capture current qty for atomic math);
    *   - then append StockMovement rows (these are append-only);
-   *   - finally flip the invoice to RECEIVED.
+   *   - then flip the invoice to RECEIVED;
+   *   - finally auto-post one POSTED JournalEntry (Phase 11B-B-3)
+   *     linked by sourceType=PURCHASE_INVOICE / sourceId=invoice.id.
+   *     Unique (companyId, sourceType, sourceId) makes retries
+   *     idempotent. Same $transaction as the status flip.
    */
   async receive(
     companyId: string,
@@ -792,6 +797,19 @@ export class PurchasesService {
           updatedById: actorUserId,
         } as Prisma.PurchaseInvoiceUncheckedUpdateInput,
         select: INVOICE_WITH_LINES,
+      });
+
+      await postPurchaseInvoiceReceived(tx, {
+        companyId,
+        userId: actorUserId,
+        invoice: {
+          id: updated.id,
+          invoiceNumber: updated.invoiceNumber,
+          subtotal: updated.subtotal,
+          vatTotal: updated.vatTotal,
+          discountTotal: updated.discountTotal,
+          total: updated.total,
+        },
       });
 
       return {

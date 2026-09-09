@@ -19,7 +19,7 @@ import helmet from 'helmet';
 import { AppModule } from '../src/app.module';
 import { JournalEntrySourceType, Prisma } from '@prisma/client';
 import { PrismaService } from '../src/database/prisma.service';
-import { postSalesInvoiceIssued } from '../src/accounting/posting-events';
+import { postPurchaseInvoiceReceived, postSalesInvoiceIssued } from '../src/accounting/posting-events';
 
 // Helper: extract the value of `name=...;...` from the first Set-Cookie header.
 function readCookie(setCookieHeader: string | string[] | undefined, name: string): string | undefined {
@@ -2835,6 +2835,252 @@ describe('Phase 11B-B-2: SalesInvoice ISSUED auto-post (e2e smoke)', () => {
     });
     expect(owned?.id).toBe(journalId);
     expect(owned?.sourceType).toBe(JournalEntrySourceType.SALES_INVOICE);
+    expect(owned?.sourceId).toBe(invoiceId);
+  });
+});
+
+// =====================================================
+// Phase 11B-B-3 — Auto-post PurchaseInvoice RECEIVED to GL.
+//
+// One POSTED JournalEntry per (companyId, PURCHASE_INVOICE, invoice.id).
+// Amounts compared as Decimal strings (no Number() posting math).
+// =====================================================
+describe('Phase 11B-B-3: PurchaseInvoice RECEIVED auto-post (e2e smoke)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let adminToken: string;
+  let companyId: string;
+  let adminUserId: string;
+  let prisma: PrismaService;
+
+  const unique = Date.now().toString(36);
+  const SKU_SVC = `GL11B-P-SVC-${unique}`;
+  const SUPP_CODE = `GL11B-P-SUP-${unique}`;
+
+  let productSvcId = '';
+  let invoiceId = '';
+  let invoiceNumber = '';
+  let invoiceVatTotal = '';
+  let invoiceTotal = '';
+  let inventoryAmount = '';
+  let journalId = '';
+
+  async function loadSourceJournals() {
+    return prisma.journalEntry.findMany({
+      where: {
+        companyId,
+        sourceType: JournalEntrySourceType.PURCHASE_INVOICE,
+        sourceId: invoiceId,
+      },
+      include: { lines: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+    prisma = app.get(PrismaService);
+
+    const login = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    expect(login.status).toBe(200);
+    adminToken = login.body.accessToken;
+    companyId = login.body.user.companyId;
+    adminUserId = login.body.user.id;
+    expect(companyId).toBeTruthy();
+
+    const supplier = await request(http)
+      .post(`${API_PREFIX}/partners`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        code: SUPP_CODE,
+        name: 'Phase 11B-B-3 GL supplier',
+        type: 'SUPPLIER',
+      });
+    expect(supplier.status).toBe(201);
+
+    const product = await request(http)
+      .post(`${API_PREFIX}/products`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        sku: SKU_SVC,
+        name: 'Phase 11B-B-3 GL service',
+        type: 'SERVICE',
+      });
+    expect(product.status).toBe(201);
+    productSvcId = product.body.id;
+
+    const created = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        supplierId: supplier.body.id,
+        notes: 'Phase 11B-B-3 auto-post fixture',
+        lines: [
+          {
+            productId: productSvcId,
+            quantity: '2.0000',
+            unitCost: '100.0000',
+            discountAmount: '10.0000',
+            vatRate: '15.00',
+          },
+        ],
+      });
+    expect(created.status).toBe(201);
+    expect(created.body.status).toBe('DRAFT');
+    invoiceId = created.body.id;
+    invoiceNumber = created.body.invoiceNumber;
+    const subtotal = new Prisma.Decimal(created.body.subtotal);
+    const discountTotal = new Prisma.Decimal(created.body.discountTotal);
+    const vatTotal = new Prisma.Decimal(created.body.vatTotal);
+    const total = new Prisma.Decimal(created.body.total);
+    invoiceVatTotal = vatTotal.toFixed(4);
+    invoiceTotal = total.toFixed(4);
+    inventoryAmount = total.minus(vatTotal).toFixed(4);
+    // 2 * 100 = 200 subtotal; discount 10; taxable 190; vat 28.5000; total 218.5000
+    expect(subtotal.toFixed(4)).toBe('200.0000');
+    expect(discountTotal.toFixed(4)).toBe('10.0000');
+    expect(invoiceVatTotal).toBe('28.5000');
+    expect(invoiceTotal).toBe('218.5000');
+    expect(inventoryAmount).toBe('190.0000');
+
+    const received = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices/${invoiceId}/receive`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ notes: 'receive for GL auto-post' });
+    expect(received.status).toBe(201);
+    expect(received.body.status).toBe('RECEIVED');
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('11B-B-3.1) receiving a purchase invoice creates one POSTED journal entry', async () => {
+    const entries = await loadSourceJournals();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].status).toBe('POSTED');
+    expect(entries[0].postedAt).toBeTruthy();
+    expect(String(entries[0].description ?? '')).toContain(invoiceNumber);
+    journalId = entries[0].id;
+  });
+
+  it('11B-B-3.2) debit total equals credit total', async () => {
+    const entries = await loadSourceJournals();
+    expect(entries).toHaveLength(1);
+    const entry = entries[0];
+    const td = new Prisma.Decimal(entry.totalDebit);
+    const tc = new Prisma.Decimal(entry.totalCredit);
+    expect(td.equals(tc)).toBe(true);
+    expect(td.toFixed(4)).toBe(invoiceTotal);
+
+    let lineDebit = new Prisma.Decimal(0);
+    let lineCredit = new Prisma.Decimal(0);
+    for (const line of entry.lines) {
+      lineDebit = lineDebit.add(new Prisma.Decimal(line.debit));
+      lineCredit = lineCredit.add(new Prisma.Decimal(line.credit));
+    }
+    expect(lineDebit.equals(lineCredit)).toBe(true);
+    expect(lineDebit.equals(td)).toBe(true);
+
+    const codesBySide: Record<string, string> = {};
+    for (const line of entry.lines) {
+      const accountId = line.debitAccountId ?? line.creditAccountId;
+      expect(accountId).toBeTruthy();
+      const acc = await prisma.account.findFirst({
+        where: { id: accountId!, companyId },
+        select: { code: true },
+      });
+      expect(acc?.code).toBeTruthy();
+      const amt = new Prisma.Decimal(line.debit).gt(0)
+        ? new Prisma.Decimal(line.debit).toFixed(4)
+        : new Prisma.Decimal(line.credit).toFixed(4);
+      codesBySide[acc!.code] = amt;
+    }
+    expect(codesBySide.INVENTORY_OR_EXPENSE).toBe(inventoryAmount);
+    expect(codesBySide.VAT_INPUT).toBe(invoiceVatTotal);
+    expect(codesBySide.AP_CONTROL).toBe(invoiceTotal);
+  });
+
+  it('11B-B-3.3) sourceType/sourceId are set correctly', async () => {
+    const entries = await loadSourceJournals();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].sourceType).toBe(JournalEntrySourceType.PURCHASE_INVOICE);
+    expect(entries[0].sourceId).toBe(invoiceId);
+    expect(entries[0].companyId).toBe(companyId);
+  });
+
+  it('11B-B-3.4) retry/handler repeat does not create duplicate journal entries', async () => {
+    const retryReceive = await request(http)
+      .post(`${API_PREFIX}/purchases/invoices/${invoiceId}/receive`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({});
+    expect(retryReceive.status).toBeGreaterThanOrEqual(400);
+    expect(retryReceive.status).toBeLessThan(500);
+
+    const afterHttp = await loadSourceJournals();
+    expect(afterHttp).toHaveLength(1);
+
+    await prisma.$transaction(async (tx) => {
+      const result = await postPurchaseInvoiceReceived(tx, {
+        companyId,
+        userId: adminUserId,
+        invoice: {
+          id: invoiceId,
+          invoiceNumber,
+          subtotal: '200.0000',
+          vatTotal: invoiceVatTotal,
+          discountTotal: '10.0000',
+          total: invoiceTotal,
+        },
+      });
+      expect(result.reused).toBe(true);
+      expect(result.id).toBe(journalId);
+    });
+
+    const afterHandler = await loadSourceJournals();
+    expect(afterHandler).toHaveLength(1);
+    expect(afterHandler[0].id).toBe(journalId);
+  });
+
+  it('11B-B-3.5) tenant isolation remains intact', async () => {
+    expect(journalId).toBeTruthy();
+    const unauth = await request(http).get(
+      `${API_PREFIX}/accounting/journal/${journalId}`,
+    );
+    expect(unauth.status).toBe(401);
+
+    const cross = await prisma.journalEntry.findFirst({
+      where: {
+        id: journalId,
+        companyId: 'not-this-company',
+      },
+      select: { id: true },
+    });
+    expect(cross).toBeNull();
+
+    const owned = await prisma.journalEntry.findFirst({
+      where: { id: journalId, companyId },
+      select: { id: true, sourceType: true, sourceId: true },
+    });
+    expect(owned?.id).toBe(journalId);
+    expect(owned?.sourceType).toBe(JournalEntrySourceType.PURCHASE_INVOICE);
     expect(owned?.sourceId).toBe(invoiceId);
   });
 });
