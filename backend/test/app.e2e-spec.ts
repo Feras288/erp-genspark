@@ -5260,6 +5260,12 @@ describe('Phase 12A-B-5: Financial Statements consolidation (e2e)', () => {
         }
       }
 
+      if (adminUser) {
+        await prisma.bankStatement.deleteMany({
+          where: { companyId: adminUser.companyId },
+        });
+      }
+
       const loginRes = await request(http)
         .post(`${API_PREFIX}/auth/login`)
         .send({ email: 'admin@example.sa', password: 'Admin@12345' });
@@ -5363,6 +5369,212 @@ describe('Phase 12A-B-5: Financial Statements consolidation (e2e)', () => {
         .set('Authorization', `Bearer ${cashierToken}`)
         .field('bankAccountId', testBankAccountId)
         .attach('file', Buffer.from(csvContent, 'utf-8'), 'statement_forbidden.csv');
+      expect(forbidden.status).toBe(403);
+    });
+  });
+
+  // ===== Phase 13A-B-4: Reconciliation matching suggestions =====
+  describe('Phase 13A-B-4: Reconciliation matching suggestions engine', () => {
+    let reconToken: string;
+    let cashierToken: string;
+    let adminCompanyId: string;
+    let testBankAccountId: string;
+    let inflowTxId: string;
+    let outflowTxId: string;
+    let arPaymentId: string;
+    let apPaymentId: string;
+    const unique = Date.now().toString().slice(-6);
+
+    beforeAll(async () => {
+      const prisma = app.get(PrismaService);
+
+      const loginRes = await request(http)
+        .post(`${API_PREFIX}/auth/login`)
+        .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+      reconToken = loginRes.body.accessToken;
+      adminCompanyId = loginRes.body.user.companyId;
+
+      const cashierLogin = await request(http)
+        .post(`${API_PREFIX}/auth/login`)
+        .send({ email: 'cashier-e2e@example.sa', password: 'Cashier@123' });
+      if (cashierLogin.status === 200) {
+        cashierToken = cashierLogin.body.accessToken;
+      }
+
+      // 1. Create a dedicated bank account
+      const createAccRes = await request(http)
+        .post(`${API_PREFIX}/reconciliation/bank-accounts`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .send({
+          bankName: 'Al Rajhi Bank',
+          accountName: 'Suggestions Testing Account',
+          accountNumber: `ACC-SUGG-${unique}`,
+          iban: `SA88776655443322110099${unique}`,
+          currency: 'SAR',
+        });
+      expect(createAccRes.status).toBe(201);
+      testBankAccountId = createAccRes.body.data.id;
+
+      // 2. Fetch or create invoice references to satisfy payment check constraint
+      const salesInv = await prisma.salesInvoice.findFirst({
+        where: { companyId: adminCompanyId },
+      });
+      const purchInv = await prisma.purchaseInvoice.findFirst({
+        where: { companyId: adminCompanyId },
+      });
+
+      // 3. Create AR Payment (SALES)
+      const arPayment = await prisma.payment.create({
+        data: {
+          companyId: adminCompanyId,
+          salesInvoiceId: salesInv?.id || null,
+          purchaseInvoiceId: null,
+          invoiceType: 'SALES',
+          paymentMethod: 'TRANSFER',
+          amount: new Prisma.Decimal('3300.0000'),
+          paidAt: new Date('2026-09-08T00:00:00.000Z'),
+          reference: `AR-MATCH-${unique}`,
+          status: 'POSTED',
+        },
+      });
+      arPaymentId = arPayment.id;
+
+      // 4. Create AP Payment (PURCHASE)
+      const apPayment = await prisma.payment.create({
+        data: {
+          companyId: adminCompanyId,
+          salesInvoiceId: null,
+          purchaseInvoiceId: purchInv?.id || null,
+          invoiceType: 'PURCHASE',
+          paymentMethod: 'TRANSFER',
+          amount: new Prisma.Decimal('1850.0000'),
+          paidAt: new Date('2026-09-08T00:00:00.000Z'),
+          reference: `AP-MATCH-${unique}`,
+          status: 'POSTED',
+        },
+      });
+      apPaymentId = apPayment.id;
+
+      // 5. Create INFLOW bank transaction
+      const inflow = await prisma.bankTransaction.create({
+        data: {
+          companyId: adminCompanyId,
+          bankAccountId: testBankAccountId,
+          transactionDate: new Date('2026-09-08T00:00:00.000Z'),
+          type: 'INFLOW',
+          amount: new Prisma.Decimal('3300.0000'),
+          reference: `AR-MATCH-${unique}`,
+          description: 'Payment from client',
+          fingerprint: `fp-inflow-sugg-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      inflowTxId = inflow.id;
+
+      // 6. Create OUTFLOW bank transaction
+      const outflow = await prisma.bankTransaction.create({
+        data: {
+          companyId: adminCompanyId,
+          bankAccountId: testBankAccountId,
+          transactionDate: new Date('2026-09-08T00:00:00.000Z'),
+          type: 'OUTFLOW',
+          amount: new Prisma.Decimal('1850.0000'),
+          reference: `AP-MATCH-${unique}`,
+          description: 'Payment to vendor',
+          fingerprint: `fp-outflow-sugg-${unique}`,
+          status: 'UNMATCHED',
+        },
+      });
+      outflowTxId = outflow.id;
+    });
+
+    it('13A-B-4.1) INFLOW bank transaction suggests matching AR payment with score >= 80', async () => {
+      const res = await request(http)
+        .get(`${API_PREFIX}/reconciliation/suggestions`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankTransactionId: inflowTxId, minScore: 80 });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.data).toHaveLength(1);
+      const matchGroup = res.body.data[0];
+      expect(matchGroup.bankTransaction.id).toBe(inflowTxId);
+      expect(matchGroup.candidates.length).toBeGreaterThanOrEqual(1);
+
+      const topCandidate = matchGroup.candidates[0];
+      expect(topCandidate.paymentId).toBe(arPaymentId);
+      expect(topCandidate.invoiceType).toBe('SALES');
+      expect(topCandidate.score).toBe(100);
+      expect(topCandidate.matchType).toBe('EXACT');
+    });
+
+    it('13A-B-4.2) OUTFLOW bank transaction suggests matching AP payment with score >= 80', async () => {
+      const res = await request(http)
+        .get(`${API_PREFIX}/reconciliation/suggestions`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankTransactionId: outflowTxId, minScore: 80 });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('ok');
+      expect(res.body.data).toHaveLength(1);
+      const matchGroup = res.body.data[0];
+      expect(matchGroup.bankTransaction.id).toBe(outflowTxId);
+      expect(matchGroup.candidates.length).toBeGreaterThanOrEqual(1);
+
+      const topCandidate = matchGroup.candidates[0];
+      expect(topCandidate.paymentId).toBe(apPaymentId);
+      expect(topCandidate.invoiceType).toBe('PURCHASE');
+      expect(topCandidate.score).toBe(100);
+      expect(topCandidate.matchType).toBe('EXACT');
+    });
+
+    it('13A-B-4.3) Mismatched direction is not suggested', async () => {
+      const res = await request(http)
+        .get(`${API_PREFIX}/reconciliation/suggestions`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankTransactionId: inflowTxId, minScore: 0 });
+
+      expect(res.status).toBe(200);
+      const candidates = res.body.data[0]?.candidates || [];
+      const suggestedPaymentIds = candidates.map((c: any) => c.paymentId);
+      expect(suggestedPaymentIds).not.toContain(apPaymentId);
+    });
+
+    it('13A-B-4.4) Already actively matched payment is excluded from suggestions', async () => {
+      const prisma = app.get(PrismaService);
+      // Create an active ReconciliationMatch linking inflowTxId to arPaymentId
+      await prisma.reconciliationMatch.create({
+        data: {
+          companyId: adminCompanyId,
+          bankTransactionId: inflowTxId,
+          paymentId: arPaymentId,
+          amount: new Prisma.Decimal('3300.0000'),
+          matchType: 'EXACT',
+          confidenceScore: 100,
+        },
+      });
+
+      // Now suggestions should exclude arPaymentId
+      const res = await request(http)
+        .get(`${API_PREFIX}/reconciliation/suggestions`)
+        .set('Authorization', `Bearer ${reconToken}`)
+        .query({ bankTransactionId: inflowTxId, minScore: 80 });
+
+      expect(res.status).toBe(200);
+      const candidates = res.body.data[0]?.candidates || [];
+      const paymentIds = candidates.map((c: any) => c.paymentId);
+      expect(paymentIds).not.toContain(arPaymentId);
+    });
+
+    it('13A-B-4.5) endpoint requires reconciliation.read', async () => {
+      // Without token -> 401
+      const unauth = await request(http).get(`${API_PREFIX}/reconciliation/suggestions`);
+      expect(unauth.status).toBe(401);
+
+      // With cashier token (lacks reconciliation.read) -> 403
+      const forbidden = await request(http)
+        .get(`${API_PREFIX}/reconciliation/suggestions`)
+        .set('Authorization', `Bearer ${cashierToken}`);
       expect(forbidden.status).toBe(403);
     });
   });

@@ -15,7 +15,9 @@ import { PrismaService } from '../database/prisma.service';
 import { CreateBankAccountDto } from './dto/create-bank-account.dto';
 import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 import { ImportStatementCsvDto } from './dto/import-statement-csv.dto';
+import { GetSuggestionsQueryDto } from './dto/get-suggestions-query.dto';
 import { UploadedCsvFile } from './types/reconciliation.types';
+import { computeMatchScore, isDirectionCompatible } from './utils/matching-scorer';
 import {
   buildBankTransactionFingerprint,
   cleanDecimalString,
@@ -572,5 +574,175 @@ export class ReconciliationService {
       }
       throw err;
     }
+  }
+
+  /**
+   * Deterministic matching suggestions between unmatched bank transactions
+   * and posted payments for the company.
+   * Read-only. Does not mutate or create matches.
+   */
+  async getMatchingSuggestions(
+    companyId: string,
+    dto: GetSuggestionsQueryDto,
+  ) {
+    const minScore = dto.minScore ?? 80;
+    const limit = Math.min(dto.limit ?? 50, 100);
+
+    // 1. Fetch target unmatched bank transactions
+    const bankTransactions = await this.prisma.bankTransaction.findMany({
+      where: {
+        companyId,
+        status: 'UNMATCHED',
+        ...(dto.bankAccountId && { bankAccountId: dto.bankAccountId }),
+        ...(dto.bankTransactionId && { id: dto.bankTransactionId }),
+        ...((dto.fromDate || dto.toDate) && {
+          transactionDate: {
+            ...(dto.fromDate && { gte: new Date(dto.fromDate) }),
+            ...(dto.toDate && { lte: new Date(dto.toDate) }),
+          },
+        }),
+      },
+      orderBy: { transactionDate: 'desc' },
+      take: limit,
+    });
+
+    const filters = {
+      bankAccountId: dto.bankAccountId || null,
+      bankTransactionId: dto.bankTransactionId || null,
+      fromDate: dto.fromDate || null,
+      toDate: dto.toDate || null,
+      minScore,
+      limit,
+    };
+
+    if (bankTransactions.length === 0) {
+      return {
+        status: 'ok',
+        companyId,
+        filters,
+        data: [],
+      };
+    }
+
+    // 2. Determine payments already actively matched (unmatchedAt IS NULL)
+    const activeMatches = await this.prisma.reconciliationMatch.findMany({
+      where: {
+        companyId,
+        unmatchedAt: null,
+      },
+      select: { paymentId: true },
+    });
+    const matchedPaymentIds = new Set(activeMatches.map((m) => m.paymentId));
+
+    // 3. Fetch candidate posted payments
+    const payments = await this.prisma.payment.findMany({
+      where: {
+        companyId,
+        status: 'POSTED',
+        deletedAt: null,
+        id: { notIn: Array.from(matchedPaymentIds) },
+      },
+      include: {
+        salesInvoice: { select: { invoiceNumber: true } },
+        purchaseInvoice: { select: { invoiceNumber: true } },
+      },
+      orderBy: { paidAt: 'desc' },
+      take: 500,
+    });
+
+    // 4. Calculate score for each compatible transaction/payment pair
+    const results: Array<{
+      bankTransaction: {
+        id: string;
+        transactionDate: string;
+        type: string;
+        amount: string;
+        reference: string | null;
+        description: string | null;
+        payerPayee: string | null;
+      };
+      candidates: Array<{
+        paymentId: string;
+        invoiceType: string;
+        amount: string;
+        paidAt: string;
+        reference: string | null;
+        score: number;
+        matchType: 'EXACT' | 'SUGGESTED';
+        reasons: string[];
+      }>;
+    }> = [];
+
+    for (const bankTx of bankTransactions) {
+      const candidates: Array<{
+        paymentId: string;
+        invoiceType: string;
+        amount: string;
+        paidAt: string;
+        reference: string | null;
+        score: number;
+        matchType: 'EXACT' | 'SUGGESTED';
+        reasons: string[];
+      }> = [];
+
+      for (const payment of payments) {
+        if (!isDirectionCompatible(bankTx.type, payment.invoiceType)) {
+          continue;
+        }
+
+        const scoreResult = computeMatchScore({
+          bankAmount: bankTx.amount,
+          paymentAmount: payment.amount,
+          bankDate: bankTx.transactionDate,
+          paymentDate: payment.paidAt,
+          bankReference: bankTx.reference,
+          bankDescription: bankTx.description,
+          bankPayerPayee: bankTx.payerPayee,
+          paymentReference: payment.reference,
+          paymentNotes: payment.notes,
+          invoiceNumber:
+            payment.salesInvoice?.invoiceNumber ||
+            payment.purchaseInvoice?.invoiceNumber,
+        });
+
+        if (scoreResult.score >= minScore) {
+          candidates.push({
+            paymentId: payment.id,
+            invoiceType: payment.invoiceType,
+            amount: payment.amount.toFixed(4),
+            paidAt: payment.paidAt.toISOString(),
+            reference: payment.reference,
+            score: scoreResult.score,
+            matchType: scoreResult.matchType,
+            reasons: scoreResult.reasons,
+          });
+        }
+      }
+
+      // Sort candidates by score descending
+      candidates.sort((a, b) => b.score - a.score);
+
+      if (candidates.length > 0 || dto.bankTransactionId) {
+        results.push({
+          bankTransaction: {
+            id: bankTx.id,
+            transactionDate: bankTx.transactionDate.toISOString(),
+            type: bankTx.type,
+            amount: bankTx.amount.toFixed(4),
+            reference: bankTx.reference,
+            description: bankTx.description,
+            payerPayee: bankTx.payerPayee,
+          },
+          candidates,
+        });
+      }
+    }
+
+    return {
+      status: 'ok',
+      companyId,
+      filters,
+      data: results,
+    };
   }
 }

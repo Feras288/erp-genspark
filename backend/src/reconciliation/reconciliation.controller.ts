@@ -28,6 +28,7 @@ import { ReconciliationService } from './reconciliation.service';
 import { CreateBankAccountDto } from './dto/create-bank-account.dto';
 import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 import { ImportStatementCsvDto } from './dto/import-statement-csv.dto';
+import { GetSuggestionsQueryDto } from './dto/get-suggestions-query.dto';
 import { UploadedCsvFile } from './types/reconciliation.types';
 
 @ApiTags('Reconciliation')
@@ -85,6 +86,15 @@ export class ReconciliationController {
   ) {
     const bankAccountId = dto.bankAccountId || queryBankAccountId;
     return this.svc.importStatementCsv(me.companyId, me.id, file, bankAccountId, dto);
+  }
+
+  @Get('suggestions')
+  @RequirePermissions('reconciliation.read')
+  getSuggestions(
+    @CurrentUser() me: AuthenticatedUser,
+    @Query() query: GetSuggestionsQueryDto,
+  ) {
+    return this.svc.getMatchingSuggestions(me.companyId, query);
   }
 
   @Get('bank-transactions')
