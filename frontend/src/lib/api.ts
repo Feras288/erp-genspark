@@ -49,14 +49,20 @@ interface RequestOptions {
 
 async function rawRequest<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = {};
-  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+  const isFormData = typeof FormData !== 'undefined' && opts.body instanceof FormData;
+  if (opts.body !== undefined && !isFormData) headers['Content-Type'] = 'application/json';
   if (_accessToken) headers.Authorization = `Bearer ${_accessToken}`;
 
   const res = await fetch(`${BASE}${path}`, {
     method: opts.method || 'GET',
     credentials: 'include',
     headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    body:
+      opts.body !== undefined
+        ? isFormData
+          ? (opts.body as FormData)
+          : JSON.stringify(opts.body)
+        : undefined,
     signal: opts.signal,
   });
 
@@ -670,6 +676,27 @@ export const api = {
       `/purchase-invoices/${invoiceId}/payments`,
       { method: 'POST', body: data },
     ),
+
+  // ===== Phase 13A: Bank Reconciliation =====
+  getReconciliationBankAccounts: () => getReconciliationBankAccounts(),
+  createReconciliationBankAccount: (data: CreateBankAccountInput) =>
+    createReconciliationBankAccount(data),
+  updateReconciliationBankAccount: (id: string, data: UpdateBankAccountInput) =>
+    updateReconciliationBankAccount(id, data),
+  deleteReconciliationBankAccount: (id: string) =>
+    deleteReconciliationBankAccount(id),
+  importBankStatementCsv: (formData: FormData) =>
+    importBankStatementCsv(formData),
+  getReconciliationSuggestions: (params?: ReconciliationSuggestionsParams) =>
+    getReconciliationSuggestions(params),
+  createReconciliationMatch: (data: CreateReconciliationMatchInput) =>
+    createReconciliationMatch(data),
+  deleteReconciliationMatch: (id: string) =>
+    deleteReconciliationMatch(id),
+  getReconciliationUnmatchedReport: (params?: ReconciliationUnmatchedReportParams) =>
+    getReconciliationUnmatchedReport(params),
+  getReconciliationSummaryReport: (params?: ReconciliationSummaryReportParams) =>
+    getReconciliationSummaryReport(params),
 };
 
 // =====================================================
@@ -1855,4 +1882,374 @@ export function getBalanceSheet(
     `/accounting/reports/balance-sheet${qs ? `?${qs}` : ''}`,
   );
 }
+
+// =====================================================
+// Phase 13A: Bank Reconciliation types & wrappers
+// =====================================================
+
+export type ReconciliationBankAccount = {
+  id: string;
+  companyId: string;
+  bankName: string;
+  accountName: string;
+  accountNumber: string;
+  iban: string;
+  currency: string;
+  glAccountId: string | null;
+  openingBalance: string;
+  currentBalance: string;
+  isActive: boolean;
+  deletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  glAccount?: {
+    id: string;
+    code: string;
+    name: string;
+    nameAr: string | null;
+    type: AccountTypeKey;
+  } | null;
+};
+
+export interface CreateBankAccountInput {
+  bankName: string;
+  accountName: string;
+  accountNumber: string;
+  iban: string;
+  currency?: string;
+  glAccountId?: string;
+  openingBalance?: string;
+  isActive?: boolean;
+}
+
+export interface UpdateBankAccountInput {
+  bankName?: string;
+  accountName?: string;
+  accountNumber?: string;
+  iban?: string;
+  currency?: string;
+  glAccountId?: string | null;
+  isActive?: boolean;
+}
+
+export interface ReconciliationStatementImportResult {
+  statementId: string;
+  bankAccountId: string;
+  fileHash: string;
+  importedRows: number;
+  skippedRows: number;
+  duplicateRows: number;
+  totalInflow: string;
+  totalOutflow: string;
+  startDate: string;
+  endDate: string;
+}
+
+export interface ReconciliationImportResponse {
+  status: 'ok';
+  companyId: string;
+  data: ReconciliationStatementImportResult;
+}
+
+export interface ReconciliationBankTransactionSuggestion {
+  id: string;
+  transactionDate: string;
+  type: string;
+  amount: string;
+  reference: string | null;
+  description: string | null;
+  payerPayee: string | null;
+}
+
+export interface ReconciliationCandidatePayment {
+  paymentId: string;
+  invoiceType: string;
+  amount: string;
+  paidAt: string;
+  reference: string | null;
+  score: number;
+  matchType: 'EXACT' | 'SUGGESTED';
+  reasons: string[];
+}
+
+export interface ReconciliationSuggestionPair {
+  bankTransaction: ReconciliationBankTransactionSuggestion;
+  candidates: ReconciliationCandidatePayment[];
+}
+
+export interface ReconciliationSuggestionsResponse {
+  status: 'ok';
+  companyId: string;
+  filters: {
+    bankAccountId: string | null;
+    bankTransactionId: string | null;
+    fromDate: string | null;
+    toDate: string | null;
+    minScore: number;
+    limit: number;
+  };
+  data: ReconciliationSuggestionPair[];
+}
+
+export interface ReconciliationSuggestionsParams {
+  bankAccountId?: string;
+  bankTransactionId?: string;
+  fromDate?: string;
+  toDate?: string;
+  minScore?: number;
+  limit?: number;
+}
+
+export interface CreateReconciliationMatchInput {
+  bankTransactionId: string;
+  paymentId: string;
+  matchType?: 'MANUAL' | 'EXACT' | 'SUGGESTED';
+  notes?: string;
+}
+
+export interface ReconciliationMatchResponse {
+  status: 'ok';
+  companyId: string;
+  data: {
+    matchId: string;
+    bankTransactionId: string;
+    paymentId: string;
+    amount: string;
+    matchType: string;
+    confidenceScore: number | null;
+    matchedAt: string;
+  };
+}
+
+export interface ReconciliationUnmatchResponse {
+  status: 'ok';
+  companyId: string;
+  data: {
+    matchId: string;
+    bankTransactionId: string;
+    paymentId: string;
+    unmatchedAt: string;
+  };
+}
+
+export interface UnmatchedBankTransactionItem {
+  id: string;
+  bankAccountId: string;
+  transactionDate: string;
+  type: string;
+  amount: string;
+  reference: string | null;
+  description: string | null;
+  payerPayee: string | null;
+  status: string;
+}
+
+export interface UnmatchedPaymentItem {
+  id: string;
+  invoiceType: string;
+  amount: string;
+  paidAt: string;
+  reference: string | null;
+  status: string;
+}
+
+export interface ReconciliationUnmatchedTotals {
+  unmatchedBankInflow: string;
+  unmatchedBankOutflow: string;
+  unmatchedArPayments: string;
+  unmatchedApPayments: string;
+  unmatchedBankCount: number;
+  unmatchedPaymentCount: number;
+}
+
+export interface ReconciliationUnmatchedReportResponse {
+  status: 'ok';
+  companyId: string;
+  filters: {
+    bankAccountId: string | null;
+    fromDate: string | null;
+    toDate: string | null;
+    limit: number;
+  };
+  data: {
+    bankTransactions: UnmatchedBankTransactionItem[];
+    payments: UnmatchedPaymentItem[];
+    totals: ReconciliationUnmatchedTotals;
+  };
+}
+
+export interface ReconciliationUnmatchedReportParams {
+  bankAccountId?: string;
+  fromDate?: string;
+  toDate?: string;
+  limit?: number;
+}
+
+export interface ReconciliationSummaryReportResponse {
+  status: 'ok';
+  companyId: string;
+  filters: {
+    bankAccountId: string | null;
+    asOfDate: string | null;
+  };
+  data: {
+    bankBalance: string;
+    bookBalance: string;
+    variance: string;
+    unmatchedCounts: {
+      bankTransactions: number;
+      payments: number;
+    };
+    unmatchedAmounts: {
+      bankInflow: string;
+      bankOutflow: string;
+      arPayments: string;
+      apPayments: string;
+    };
+    warnings: string[];
+  };
+}
+
+export interface ReconciliationSummaryReportParams {
+  bankAccountId?: string;
+  asOfDate?: string;
+}
+
+export function getReconciliationBankAccounts(): Promise<{
+  status: 'ok';
+  companyId: string;
+  data: ReconciliationBankAccount[];
+}> {
+  return apiRequest<{
+    status: 'ok';
+    companyId: string;
+    data: ReconciliationBankAccount[];
+  }>('/reconciliation/bank-accounts');
+}
+
+export function createReconciliationBankAccount(
+  data: CreateBankAccountInput,
+): Promise<{
+  status: 'ok';
+  companyId: string;
+  data: ReconciliationBankAccount;
+}> {
+  return apiRequest<{
+    status: 'ok';
+    companyId: string;
+    data: ReconciliationBankAccount;
+  }>('/reconciliation/bank-accounts', {
+    method: 'POST',
+    body: data,
+  });
+}
+
+export function updateReconciliationBankAccount(
+  id: string,
+  data: UpdateBankAccountInput,
+): Promise<{
+  status: 'ok';
+  companyId: string;
+  data: ReconciliationBankAccount;
+}> {
+  return apiRequest<{
+    status: 'ok';
+    companyId: string;
+    data: ReconciliationBankAccount;
+  }>(`/reconciliation/bank-accounts/${id}`, {
+    method: 'PATCH',
+    body: data,
+  });
+}
+
+export function deleteReconciliationBankAccount(
+  id: string,
+): Promise<{
+  status: 'ok';
+  companyId: string;
+  data: { id: string; deleted: boolean };
+}> {
+  return apiRequest<{
+    status: 'ok';
+    companyId: string;
+    data: { id: string; deleted: boolean };
+  }>(`/reconciliation/bank-accounts/${id}`, {
+    method: 'DELETE',
+  });
+}
+
+export function importBankStatementCsv(
+  formData: FormData,
+): Promise<ReconciliationImportResponse> {
+  return apiRequest<ReconciliationImportResponse>(
+    '/reconciliation/statements/import-csv',
+    {
+      method: 'POST',
+      body: formData,
+    },
+  );
+}
+
+export function getReconciliationSuggestions(
+  params: ReconciliationSuggestionsParams = {},
+): Promise<ReconciliationSuggestionsResponse> {
+  const q = new URLSearchParams();
+  if (params.bankAccountId) q.set('bankAccountId', params.bankAccountId);
+  if (params.bankTransactionId) q.set('bankTransactionId', params.bankTransactionId);
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  if (params.minScore !== undefined) q.set('minScore', String(params.minScore));
+  if (params.limit !== undefined) q.set('limit', String(params.limit));
+  const qs = q.toString();
+  return apiRequest<ReconciliationSuggestionsResponse>(
+    `/reconciliation/suggestions${qs ? `?${qs}` : ''}`,
+  );
+}
+
+export function createReconciliationMatch(
+  data: CreateReconciliationMatchInput,
+): Promise<ReconciliationMatchResponse> {
+  return apiRequest<ReconciliationMatchResponse>('/reconciliation/matches', {
+    method: 'POST',
+    body: data,
+  });
+}
+
+export function deleteReconciliationMatch(
+  id: string,
+): Promise<ReconciliationUnmatchResponse> {
+  return apiRequest<ReconciliationUnmatchResponse>(
+    `/reconciliation/matches/${id}`,
+    {
+      method: 'DELETE',
+    },
+  );
+}
+
+export function getReconciliationUnmatchedReport(
+  params: ReconciliationUnmatchedReportParams = {},
+): Promise<ReconciliationUnmatchedReportResponse> {
+  const q = new URLSearchParams();
+  if (params.bankAccountId) q.set('bankAccountId', params.bankAccountId);
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  if (params.limit !== undefined) q.set('limit', String(params.limit));
+  const qs = q.toString();
+  return apiRequest<ReconciliationUnmatchedReportResponse>(
+    `/reconciliation/reports/unmatched${qs ? `?${qs}` : ''}`,
+  );
+}
+
+export function getReconciliationSummaryReport(
+  params: ReconciliationSummaryReportParams = {},
+): Promise<ReconciliationSummaryReportResponse> {
+  const q = new URLSearchParams();
+  if (params.bankAccountId) q.set('bankAccountId', params.bankAccountId);
+  if (params.asOfDate) q.set('asOfDate', params.asOfDate);
+  const qs = q.toString();
+  return apiRequest<ReconciliationSummaryReportResponse>(
+    `/reconciliation/reports/summary${qs ? `?${qs}` : ''}`,
+  );
+}
+
 

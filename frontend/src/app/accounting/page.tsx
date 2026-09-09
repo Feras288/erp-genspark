@@ -622,6 +622,14 @@ export default function AccountingPage() {
               القوائم المالية
             </Link>
           )}
+          {hasPermission('reconciliation.read') && (
+            <Link
+              href="/accounting/reconciliation"
+              className="rounded-md bg-teal-600 hover:bg-teal-700 text-white text-sm px-4 py-2"
+            >
+              المطابقة البنكية
+            </Link>
+          )}
           <Link
             href="/dashboard"
             className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"
