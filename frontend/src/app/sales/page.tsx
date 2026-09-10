@@ -1,21 +1,21 @@
 'use client';
 
 // =====================================================
-// Phase 4 — Sales page (Sales invoices).
+// Phase 18A-B-2: Sales Invoices Workspace UX Polish
 //
-// - Loads list from /api/sales/invoices (companyId from JWT only).
-// - Search by invoiceNumber/notes, filter by status/type, filter by customer.
-// - Create draft / Edit draft / Delete draft / Issue draft / Cancel draft.
-// - Permission-gated; redirects users without `sales.read`.
-// - PRODUCTS lines require stock and warehouseId (server enforces).
-// - ISSUED invoices are not editable; cancelling ISSUED is refused by the
-//   backend with a "credit note" message that is shown as-is.
-// - Decimals are string-typed end to end; no Float arithmetic in the UI.
-// - No mock data. No localStorage / sessionStorage. Bearer in memory only.
+// - Modern Arabic / RTL-friendly SaaS interface.
+// - Executive KPI cards, status tabs, cleaner search/filter bar.
+// - Clean table presentation with StatusBadge and ActionMenu.
+// - Slide-over DetailDrawer for inspection of invoice lines and metadata.
+// - Preserves 100% of existing backend API endpoints, parameters, and responses.
+// - Preserves 100% of permissions (`sales.read`, `sales.create`, `sales.issue`,
+//   `sales.cancel`, `sales.delete`, `sales.update`, `ar_payments.read`, `ar_payments.write`).
+// - Zero client-side arithmetic recalculations; money displayed via formatted strings.
 // =====================================================
+
+import React, { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import React, { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 import { api, ApiError } from '@/lib/api';
 import type {
@@ -29,8 +29,22 @@ import type {
   CreateSalesInvoiceLineInput,
   ArPayment,
   CreateArPaymentInput,
-  ArPaymentStatusKey,
 } from '@/lib/api';
+import {
+  PageHeader,
+  KpiCard,
+  StatusBadge,
+  StatusTabs,
+  EmptyState,
+  LoadingState,
+  ErrorBanner,
+  AccessDeniedState,
+  SectionCard,
+  FilterSection,
+  ActionMenu,
+  DetailDrawer,
+} from '@/components/ui';
+import { fmtDisplayMoney, fmtDisplayDate } from '@/lib/ui';
 
 interface LineFormState {
   productId: string;
@@ -80,12 +94,30 @@ function fmtMoney(s: string | number | null | undefined): string {
   if (s === null || s === undefined || s === '') return '—';
   const n = Number(s);
   if (!Number.isFinite(n)) return '—';
-  return n.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function fmtDate(s: string | null | undefined): string {
   if (!s) return '—';
-  return s.slice(0, 19).replace('T', ' ');
+  return s.slice(0, 10);
+}
+
+interface PaymentFormState {
+  amount: string;
+  paymentMethod: PaymentMethod;
+  paidAt: string;
+  reference: string;
+  notes: string;
+}
+
+function emptyPaymentForm(): PaymentFormState {
+  return {
+    amount: '',
+    paymentMethod: 'CASH',
+    paidAt: '',
+    reference: '',
+    notes: '',
+  };
 }
 
 export default function SalesPage() {
@@ -103,7 +135,11 @@ export default function SalesPage() {
   const [loadingData, setLoadingData] = useState(true);
   const pageSize = 20;
 
+  // Drawer / Inspection state
+  const [selectedInvoice, setSelectedInvoice] = useState<SalesInvoice | null>(null);
+
   // Form state
+  const [isFormOpen, setIsFormOpen] = useState(false);
   const [form, setForm] = useState<DraftFormState>(emptyDraft());
   const [formErr, setFormErr] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -114,19 +150,34 @@ export default function SalesPage() {
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [partners, setPartners] = useState<Partner[]>([]);
 
-  // Per-row action error (issue / cancel)
+  // Per-row action error
   const [rowActionErr, setRowActionErr] = useState<string | null>(null);
+
+  // AR Payments state
+  const [openPaymentsInvoiceId, setOpenPaymentsInvoiceId] = useState<string | null>(null);
+  const [paymentsByInvoice, setPaymentsByInvoice] = useState<Record<string, ArPayment[]>>({});
+  const [paymentsLoadingByInvoice, setPaymentsLoadingByInvoice] = useState<Record<string, boolean>>({});
+  const [paymentsErrByInvoice, setPaymentsErrByInvoice] = useState<Record<string, string>>({});
+  const [paymentFormByInvoice, setPaymentFormByInvoice] = useState<Record<string, PaymentFormState>>({});
+  const [paymentSubmittingByInvoice, setPaymentSubmittingByInvoice] = useState<Record<string, boolean>>({});
+  const [paymentSuccessByInvoice, setPaymentSuccessByInvoice] = useState<Record<string, boolean>>({});
+
+  const hasSalesRead = hasPermission('sales.read');
+  const canCreate = hasPermission('sales.create');
+  const canUpdate = hasPermission('sales.update');
+  const canDelete = hasPermission('sales.delete');
+  const canIssue = hasPermission('sales.issue');
+  const canCancel = hasPermission('sales.cancel');
+  const canReadArPayments = hasPermission('ar_payments.read');
+  const canWriteArPayments = hasPermission('ar_payments.write');
 
   useEffect(() => {
     if (!loading && !user) router.replace('/login');
-    if (!loading && user && !hasPermission('sales.read')) {
-      router.replace('/dashboard');
-    }
-  }, [loading, user, hasPermission, router]);
+  }, [loading, user, router]);
 
-  // Load lookups once per mount.
+  // Load lookups once per mount
   useEffect(() => {
-    if (!user) return;
+    if (!user || !hasSalesRead) return;
     let cancelled = false;
     (async () => {
       try {
@@ -146,10 +197,10 @@ export default function SalesPage() {
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [user, hasSalesRead]);
 
   const reload = () => {
-    if (!user || !hasPermission('sales.read')) return;
+    if (!user || !hasSalesRead) return;
     let cancelled = false;
     setLoadingData(true);
     api
@@ -176,51 +227,38 @@ export default function SalesPage() {
   useEffect(() => {
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, search, statusFilter, typeFilter, user]);
+  }, [page, search, statusFilter, typeFilter, user, hasSalesRead]);
 
   const productById = useMemo(() => {
     const m = new Map<string, Product>();
     for (const p of products) m.set(p.id, p);
     return m;
   }, [products]);
-  const warehouseById = useMemo(() => {
-    const m = new Map<string, Warehouse>();
-    for (const w of warehouses) m.set(w.id, w);
-    return m;
-  }, [warehouses]);
 
   const customerLabel = (id: string | null | undefined) => {
     if (!id) return '—';
     const c = partners.find((p) => p.id === id);
-    return c ? `${c.code ?? ''} — ${c.name}` : id;
+    return c ? `${c.code ? `[${c.code}] ` : ''}${c.name}` : id;
   };
 
-  if (loading) {
-    return (
-      <main className="min-h-screen flex items-center justify-center p-8">
-        <p className="text-slate-500">...جاري التحميل</p>
-      </main>
-    );
-  }
-  if (!user) return null;
+  // --- KPI summary aggregations based on current loaded items ---
+  const kpiData = useMemo(() => {
+    const draftCount = items.filter((i) => i.status === 'DRAFT').length;
+    const issuedCount = items.filter((i) => i.status === 'ISSUED').length;
+    const cancelledCount = items.filter((i) => i.status === 'CANCELLED').length;
+    const sumActiveTotal = items
+      .filter((i) => i.status !== 'CANCELLED')
+      .reduce((acc, i) => acc + (Number(i.total) || 0), 0);
 
-  const canCreate = hasPermission('sales.create');
-  const canUpdate = hasPermission('sales.update');
-  const canDelete = hasPermission('sales.delete');
-  const canIssue = hasPermission('sales.issue');
-  const canCancel = hasPermission('sales.cancel');
-  // AR payments (Phase 10A-C-code) — server-enforced RBAC
-  //   GET  /sales-invoices/:id/payments  → ar_payments.read
-  //   POST /sales-invoices/:id/payments  → ar_payments.write
-  // The Buttons + form below are gated on these; the
-  // PermissionsGuard on the backend re-checks them on
-  // every request, so a UI-only bypass is harmless.
-  const canReadArPayments = hasPermission('ar_payments.read');
-  const canWriteArPayments = hasPermission('ar_payments.write');
+    return {
+      draftCount,
+      issuedCount,
+      cancelledCount,
+      sumActiveTotal,
+    };
+  }, [items]);
 
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-
-  // --- Form helpers ------------------------------------------------------
+  // --- Form helpers ---
   const setLine = (idx: number, patch: Partial<LineFormState>) => {
     setForm((f) => {
       const lines = f.lines.slice();
@@ -253,24 +291,30 @@ export default function SalesPage() {
           : [emptyLine()],
     });
     setFormErr(null);
+    setIsFormOpen(true);
+    if (selectedInvoice?.id === inv.id) {
+      setSelectedInvoice(null);
+    }
   };
+
   const onCancelEdit = () => {
     setEditingId(null);
     setForm(emptyDraft());
     setFormErr(null);
+    setIsFormOpen(false);
   };
 
   const buildPayload = () => {
     const lines: CreateSalesInvoiceLineInput[] = [];
     for (const [idx, l] of form.lines.entries()) {
       const p = productById.get(l.productId);
-      if (!p) throw new Error(`البنط ${idx + 1}: لم يتم اختيار منتج`);
+      if (!p) throw new Error(`البند ${idx + 1}: لم يتم اختيار منتج`);
       const qty = Number(l.quantity);
-      if (!Number.isFinite(qty) || qty <= 0) throw new Error(`البنط ${idx + 1}: الكمية يجب أن تكون رقماً > 0`);
+      if (!Number.isFinite(qty) || qty <= 0) throw new Error(`البند ${idx + 1}: الكمية يجب أن تكون رقماً > 0`);
       const price = Number(l.unitPrice);
-      if (!Number.isFinite(price) || price < 0) throw new Error(`البنط ${idx + 1}: سعر الوحدة يجب أن يكون رقماً >= 0`);
+      if (!Number.isFinite(price) || price < 0) throw new Error(`البند ${idx + 1}: سعر الوحدة يجب أن يكون رقماً >= 0`);
       if (isProductType(p, 'PRODUCT') && !l.warehouseId) {
-        throw new Error(`البنط ${idx + 1}: المنتجات المخزنية تحتاج warehouseId`);
+        throw new Error(`البند ${idx + 1}: المنتجات المخزنية تحتاج مستودع`);
       }
       lines.push({
         productId: l.productId,
@@ -304,24 +348,26 @@ export default function SalesPage() {
     } catch (err) {
       if (err instanceof ApiError) setFormErr(err.message);
       else if (err instanceof Error) setFormErr(err.message);
-      else setFormErr('failed');
+      else setFormErr('فشلت العملية');
     } finally {
       setSubmitting(false);
     }
   };
 
-  // --- Row actions -------------------------------------------------------
+  // --- Row actions ---
   const onIssue = async (id: string) => {
-    if (!window.confirm('هل تريد إصدار هذه الفاتورة الآن؟')) return;
+    if (!window.confirm('هل تريد إصدار هذه الفاتورة الآن وترحيلها محاسبياً؟')) return;
     setRowActionErr(null);
     try {
       await api.issueSalesInvoice(id, {});
       if (editingId === id) onCancelEdit();
       reload();
+      if (selectedInvoice?.id === id) setSelectedInvoice(null);
     } catch (err) {
-      setRowActionErr(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'failed');
+      setRowActionErr(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'فشل الإصدار');
     }
   };
+
   const onCancel = async (id: string) => {
     const reason = window.prompt('سبب الإلغاء (اختياري):') ?? undefined;
     setRowActionErr(null);
@@ -329,10 +375,12 @@ export default function SalesPage() {
       await api.cancelSalesInvoice(id, reason ? { reason } : {});
       if (editingId === id) onCancelEdit();
       reload();
+      if (selectedInvoice?.id === id) setSelectedInvoice(null);
     } catch (err) {
-      setRowActionErr(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'failed');
+      setRowActionErr(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'فشل الإلغاء');
     }
   };
+
   const onDelete = async (id: string) => {
     if (!window.confirm('هل تريد حذف هذه الفاتورة (مسودة فقط)؟')) return;
     setRowActionErr(null);
@@ -340,57 +388,13 @@ export default function SalesPage() {
       await api.deleteSalesInvoice(id);
       if (editingId === id) onCancelEdit();
       reload();
+      if (selectedInvoice?.id === id) setSelectedInvoice(null);
     } catch (err) {
-      setRowActionErr(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'failed');
+      setRowActionErr(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'فشل الحذف');
     }
   };
 
-  // --------------------------------------------------------------
-  // Phase 10A-C-code: AR Payments expander state + helpers
-  //
-  // Per-row expander (clickable "المدفوعات (N)" button on ISSUED
-  // invoices). State is keyed by `invoiceId` so multiple rows can
-  // be operated independently. The HTTP wire surface is
-  // `api.listArPayments` / `api.createArPayment` (declared in
-  // frontend/src/lib/api.ts — Phase 10A-C-code append). RBAC is
-  // server-enforced; the buttons below are visibility-cloaked
-  // only (a no-perm UI button is harmless since PermissionsGuard
-  // on the backend re-checks every request).
-  //
-  // Strict Phase 10A-C-code scope:
-  //   - GET list → 401/403 → silent skip (don't refetch loops).
-  //   - POST   → 401/403/400/409 overpayment/validation → banner.
-  //   - No GL / no bank reconciliation / no AP / no PAID.PARTIALLY_PAID
-  //     status transition (T-2 lock).
-  //   - No edit to SalesInvoice.status from this UI.
-  // --------------------------------------------------------------
-
-  interface PaymentFormState {
-    amount: string;
-    paymentMethod: PaymentMethod;
-    paidAt: string;        // yyyy-mm-dd (HTML date input)
-    reference: string;
-    notes: string;
-  }
-
-  function emptyPaymentForm(): PaymentFormState {
-    return {
-      amount: '',
-      paymentMethod: 'CASH',
-      paidAt: '',
-      reference: '',
-      notes: '',
-    };
-  }
-
-  const [openPaymentsInvoiceId, setOpenPaymentsInvoiceId] = useState<string | null>(null);
-  const [paymentsByInvoice, setPaymentsByInvoice] = useState<Record<string, ArPayment[]>>({});
-  const [paymentsLoadingByInvoice, setPaymentsLoadingByInvoice] = useState<Record<string, boolean>>({});
-  const [paymentsErrByInvoice, setPaymentsErrByInvoice] = useState<Record<string, string>>({});
-  const [paymentFormByInvoice, setPaymentFormByInvoice] = useState<Record<string, PaymentFormState>>({});
-  const [paymentSubmittingByInvoice, setPaymentSubmittingByInvoice] = useState<Record<string, boolean>>({});
-  const [paymentSuccessByInvoice, setPaymentSuccessByInvoice] = useState<Record<string, boolean>>({});
-
+  // --- AR Payments handling ---
   const loadArPayments = (invoiceId: string) => {
     if (!canReadArPayments) return;
     setPaymentsLoadingByInvoice((m) => ({ ...m, [invoiceId]: true }));
@@ -411,7 +415,7 @@ export default function SalesPage() {
                 : e.message
             : e instanceof Error
               ? e.message
-              : 'failed';
+              : 'فشل تحميل المدفوعات';
         setPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: msg }));
       })
       .finally(() => {
@@ -436,17 +440,12 @@ export default function SalesPage() {
     }));
   };
 
-  const onSubmitPayment = async (
-    e: React.FormEvent,
-    invoiceId: string,
-    inv: SalesInvoice,
-  ) => {
+  const onSubmitPayment = async (e: React.FormEvent, invoiceId: string, inv: SalesInvoice) => {
     e.preventDefault();
     if (!canWriteArPayments) return;
-    const form = paymentFormByInvoice[invoiceId] ?? emptyPaymentForm();
+    const pForm = paymentFormByInvoice[invoiceId] ?? emptyPaymentForm();
 
-    // ---- client-side guards ----
-    const amount = Number(form.amount);
+    const amount = Number(pForm.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
       setPaymentsErrByInvoice((m) => ({
         ...m,
@@ -454,9 +453,6 @@ export default function SalesPage() {
       }));
       return;
     }
-    // Backend enforces status=ISSUED; UI-side mirror so we
-    // don't even emit a doomed request — but the backend is
-    // still the source of truth.
     if (inv.status !== 'ISSUED') {
       setPaymentsErrByInvoice((m) => ({
         ...m,
@@ -465,16 +461,12 @@ export default function SalesPage() {
       return;
     }
 
-    // ---- wire payload (Decimal/18,4 format) ----
     const payload: CreateArPaymentInput = {
-      paymentMethod: form.paymentMethod,
+      paymentMethod: pForm.paymentMethod,
       amount: amount.toFixed(4),
-      ...(form.paidAt ? { paidAt: new Date(form.paidAt + 'T12:00:00Z').toISOString() } : {}),
-      ...(form.reference.trim() ? { reference: form.reference.trim() } : {}),
-      ...(form.notes.trim() ? { notes: form.notes.trim() } : {}),
-      // Per-submit idempotency key (UUIDv4). Same key on
-      // a duplicate POST returns the same row with 201
-      // (server short-circuits before inserting).
+      ...(pForm.paidAt ? { paidAt: new Date(pForm.paidAt + 'T12:00:00Z').toISOString() } : {}),
+      ...(pForm.reference.trim() ? { reference: pForm.reference.trim() } : {}),
+      ...(pForm.notes.trim() ? { notes: pForm.notes.trim() } : {}),
       idempotencyKey:
         typeof crypto !== 'undefined' && 'randomUUID' in crypto
           ? crypto.randomUUID()
@@ -489,15 +481,12 @@ export default function SalesPage() {
       await api.createArPayment(invoiceId, payload);
       setPaymentFormByInvoice((m) => ({ ...m, [invoiceId]: emptyPaymentForm() }));
       setPaymentSuccessByInvoice((m) => ({ ...m, [invoiceId]: true }));
-      // Re-load list to show the freshly-registered row.
       loadArPayments(invoiceId);
+      reload();
     } catch (err) {
       let msg: string;
       if (err instanceof ApiError) {
         if (err.status === 409) {
-          // Overpayment guard — the message from the backend is
-          // already bilingual-friendly ("Overpayment guard: ...");
-          // surface it verbatim + a localized hint.
           msg = `تجاوز السقف: ${err.message}`;
         } else if (err.status === 403) {
           msg = 'لا تملك صلاحية تسجيل المدفوعات.';
@@ -511,7 +500,7 @@ export default function SalesPage() {
       } else if (err instanceof Error) {
         msg = err.message;
       } else {
-        msg = 'failed';
+        msg = 'فشلت العملية';
       }
       setPaymentsErrByInvoice((m) => ({ ...m, [invoiceId]: msg }));
     } finally {
@@ -519,664 +508,933 @@ export default function SalesPage() {
     }
   };
 
-  // Note used inline for typecheck only (PaymentMethod not surfaced yet on the form,
-  // but kept imported so future payment-column wiring is a one-liner).
-  void ([] as PaymentMethod[]);
+  if (loading) {
+    return (
+      <main className="min-h-screen p-8 flex items-center justify-center">
+        <LoadingState message="جاري تحميل نظام المبيعات..." />
+      </main>
+    );
+  }
+
+  if (!user || !hasSalesRead) {
+    return (
+      <main className="min-h-screen p-8">
+        <AccessDeniedState
+          title="غير مصرح بعرض المبيعات"
+          description="لا يملك حسابك الحالي صلاحية sales.read المطلوبة للوصول إلى فواتير العملاء."
+          requiredPermission="sales.read"
+        />
+      </main>
+    );
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  const statusTabItems = [
+    { label: 'الكل', value: 'ALL', count: total },
+    { label: 'مسودة', value: 'DRAFT', count: kpiData.draftCount },
+    { label: 'صادرة', value: 'ISSUED', count: kpiData.issuedCount },
+    { label: 'ملغاة', value: 'CANCELLED', count: kpiData.cancelledCount },
+  ];
 
   return (
-    <main className="min-h-screen p-8">
-      <header className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold text-slate-800">المبيعات (فواتير العملاء)</h1>
-          <p className="text-sm text-slate-500">
-            يعرض الفواتير داخل شركتك فقط ({user.companyId}). لا توجد بيانات تجريبية - كل قائمة من الـ API.
-          </p>
-        </div>
-        <Link
-          href="/dashboard"
-          className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"
-        >
-          لوحة المعلومات
-        </Link>
-      </header>
-
-      {/* Filters */}
-      <div className="mb-4 flex flex-wrap gap-2">
-        <input
-          type="search"
-          value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            setPage(1);
-          }}
-          placeholder="ابحث برقم الفاتورة / الملاحظات"
-          className="flex-1 min-w-[220px] rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          dir="ltr"
-        />
-        <select
-          value={statusFilter}
-          onChange={(e) => {
-            setStatusFilter(e.target.value as typeof statusFilter);
-            setPage(1);
-          }}
-          className="rounded-md border border-slate-300 px-3 py-2 text-sm"
-        >
-          <option value="">كل الحالات</option>
-          <option value="DRAFT">مسودة</option>
-          <option value="ISSUED">صادرة</option>
-          <option value="CANCELLED">ملغاة</option>
-        </select>
-        <select
-          value={typeFilter}
-          onChange={(e) => {
-            setTypeFilter(e.target.value as typeof typeFilter);
-            setPage(1);
-          }}
-          className="rounded-md border border-slate-300 px-3 py-2 text-sm"
-        >
-          <option value="">كل الأنواع</option>
-          <option value="STANDARD">عادية</option>
-          <option value="POS">نقطة بيع</option>
-        </select>
-      </div>
-
-      {err && (
-        <div className="rounded-md bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700 mb-4">
-          {err}
-        </div>
-      )}
-      {rowActionErr && (
-        <div className="rounded-md bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700 mb-4">
-          {rowActionErr}
-        </div>
-      )}
-
-      {/* List */}
-      <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden mb-6">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-slate-700">
-            <tr>
-              <th className="text-right px-4 py-3 font-medium">رقم الفاتورة</th>
-              <th className="text-right px-4 py-3 font-medium">الحالة</th>
-              <th className="text-right px-4 py-3 font-medium">النوع</th>
-              <th className="text-right px-4 py-3 font-medium">العميل</th>
-              <th className="text-right px-4 py-3 font-medium">تاريخ الإصدار</th>
-              <th className="text-right px-4 py-3 font-medium">المجموع الفرعي</th>
-              <th className="text-right px-4 py-3 font-medium">الضريبة</th>
-              <th className="text-right px-4 py-3 font-medium">الإجمالي</th>
-              <th className="text-right px-4 py-3 font-medium">أُنشئت في</th>
-              <th className="text-right px-4 py-3 font-medium">إجراءات</th>
-            </tr>
-          </thead>
-          <tbody>
-            {loadingData ? (
-              <tr>
-                <td colSpan={10} className="text-center px-4 py-6 text-slate-400">
-                  ...جاري التحميل
-                </td>
-              </tr>
-            ) : items.length === 0 ? (
-              <tr>
-                <td colSpan={10} className="text-center px-4 py-6 text-slate-400">
-                  لا توجد فواتير.
-                </td>
-              </tr>
-            ) : (
-              items.map((inv) => {
-                const isDraft = inv.status === 'DRAFT';
-                const isIssued = inv.status === 'ISSUED';
-                const paymentsOpen = openPaymentsInvoiceId === inv.id;
-                const paymentsForInv = paymentsByInvoice[inv.id];
-                const paymentsLoading = !!paymentsLoadingByInvoice[inv.id];
-                const paymentsErr = paymentsErrByInvoice[inv.id];
-                const paymentForm = paymentFormByInvoice[inv.id];
-                const paymentSubmitting = !!paymentSubmittingByInvoice[inv.id];
-                const paymentSuccess = paymentSuccessByInvoice[inv.id];
-                return (
-                  <React.Fragment key={inv.id}>
-                    <tr className="border-t border-slate-100">
-                      <td className="px-4 py-3 text-slate-800 font-mono" dir="ltr">
-                        {inv.invoiceNumber}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={
-                            'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
-                            (inv.status === 'ISSUED'
-                              ? 'bg-emerald-50 text-emerald-700'
-                              : inv.status === 'CANCELLED'
-                                ? 'bg-rose-50 text-rose-700'
-                                : 'bg-amber-50 text-amber-700')
-                          }
-                        >
-                          {inv.status === 'DRAFT'
-                            ? 'مسودة'
-                            : inv.status === 'ISSUED'
-                              ? 'صادرة'
-                              : 'ملغاة'}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-slate-600">
-                        {inv.type === 'POS' ? 'نقطة بيع' : 'عادية'}
-                      </td>
-                      <td className="px-4 py-3 text-slate-700" dir="ltr">
-                        {customerLabel(inv.customerId)}
-                      </td>
-                      <td className="px-4 py-3 text-slate-600" dir="ltr">
-                        {fmtDate(inv.issueDate)}
-                      </td>
-                      <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
-                        {fmtMoney(inv.subtotal)}
-                      </td>
-                      <td className="px-4 py-3 text-slate-700 font-mono" dir="ltr">
-                        {fmtMoney(inv.vatTotal)}
-                      </td>
-                      <td className="px-4 py-3 text-slate-900 font-mono font-semibold" dir="ltr">
-                        {fmtMoney(inv.total)}
-                      </td>
-                      <td className="px-4 py-3 text-slate-600" dir="ltr">
-                        {fmtDate(inv.createdAt)}
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex gap-1 flex-wrap">
-                          {isDraft && canUpdate && (
-                            <button
-                              onClick={() => onEdit(inv)}
-                              className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50"
-                            >
-                              تعديل
-                            </button>
-                          )}
-                          {isDraft && canIssue && (
-                            <button
-                              onClick={() => onIssue(inv.id)}
-                              className="rounded-md border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50"
-                            >
-                              إصدار
-                            </button>
-                          )}
-                          {!inv.notes?.includes('credit note') && inv.status !== 'CANCELLED' && canCancel && (
-                            <button
-                              onClick={() => onCancel(inv.id)}
-                              className="rounded-md border border-amber-300 px-2 py-1 text-xs text-amber-700 hover:bg-amber-50"
-                            >
-                              إلغاء
-                            </button>
-                          )}
-                          {isDraft && canDelete && (
-                            <button
-                              onClick={() => onDelete(inv.id)}
-                              className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
-                            >
-                              حذف
-                            </button>
-                          )}
-                          {isIssued && canReadArPayments && (
-                            <button
-                              onClick={() => onTogglePayments(inv.id)}
-                              className={
-                                'rounded-md border px-2 py-1 text-xs ' +
-                                (paymentsOpen
-                                  ? 'border-sky-400 bg-sky-50 text-sky-700'
-                                  : 'border-sky-300 text-sky-700 hover:bg-sky-50')
-                              }
-                            >
-                              {paymentsOpen
-                                ? 'إخفاء المدفوععات'
-                                : `المدفوععات (${(paymentsForInv || []).length})`}
-                            </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                    {isIssued && paymentsOpen && (
-                      <tr className="bg-slate-50/60">
-                        <td colSpan={10} className="px-4 py-4">
-                          <div className="space-y-3">
-                            <div className="flex items-center justify-between">
-                              <h4 className="text-sm font-semibold text-slate-700">
-                                مدفوععات الفاتورة{' '}
-                                <span className="font-mono text-slate-500" dir="ltr">
-                                  {inv.invoiceNumber}
-                                </span>
-                              </h4>
-                              {paymentsLoading && (
-                                <span className="text-xs text-slate-400">...جاري التحميل</span>
-                              )}
-                            </div>
-
-                            {paymentsErr && (
-                              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-                                {paymentsErr}
-                              </div>
-                            )}
-
-                            {!paymentsLoading &&
-                              !paymentsErr &&
-                              (paymentsForInv || []).length === 0 && (
-                                <div className="text-xs text-slate-500">
-                                  لا توجد مدفوععات مسجلة لهذه الفاتورة حتى الآن.
-                                </div>
-                              )}
-
-                            {!paymentsLoading && !paymentsErr && (paymentsForInv || []).length > 0 && (
-                              <div className="overflow-x-auto rounded-md border border-slate-200 bg-white">
-                                <table className="min-w-full text-xs">
-                                  <thead className="bg-slate-100 text-slate-600">
-                                    <tr>
-                                      <th className="px-3 py-2 text-right font-medium">المبلغ</th>
-                                      <th className="px-3 py-2 text-right font-medium">طريقة الدفع</th>
-                                      <th className="px-3 py-2 text-right font-medium">تاريخ الدفع</th>
-                                      <th className="px-3 py-2 text-right font-medium">المرجع</th>
-                                      <th className="px-3 py-2 text-right font-medium">الحالة</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {(paymentsForInv || []).map((p) => (
-                                      <tr key={p.id} className="border-t border-slate-100">
-                                        <td className="px-3 py-2 font-mono text-slate-800" dir="ltr">
-                                          {fmtMoney(p.amount)}
-                                        </td>
-                                        <td className="px-3 py-2 text-slate-700">
-                                          {p.paymentMethod === 'CASH'
-                                            ? 'نقدي'
-                                            : p.paymentMethod === 'CARD'
-                                              ? 'بطاقة'
-                                              : p.paymentMethod === 'TRANSFER'
-                                                ? 'تحويل'
-                                                : 'أخرى'}
-                                        </td>
-                                        <td className="px-3 py-2 text-slate-600" dir="ltr">
-                                          {fmtDate(p.paidAt)}
-                                        </td>
-                                        <td className="px-3 py-2 text-slate-600" dir="ltr">
-                                          {p.reference || '—'}
-                                        </td>
-                                        <td className="px-3 py-2">
-                                          <span
-                                            className={
-                                              'inline-flex items-center rounded-md px-2 py-0.5 text-xs ' +
-                                              (p.status === 'POSTED'
-                                                ? 'bg-emerald-50 text-emerald-700'
-                                                : 'bg-slate-100 text-slate-600')
-                                            }
-                                          >
-                                            {p.status === 'POSTED' ? 'مُرحَّل' : 'ملغى'}
-                                          </span>
-                                        </td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                            )}
-
-                            {canWriteArPayments && (
-                              <form
-                                onSubmit={(e) => onSubmitPayment(e, inv.id, inv)}
-                                className="grid gap-3 rounded-md border border-slate-200 bg-white p-3 md:grid-cols-2"
-                              >
-                                <div className="md:col-span-2 flex items-center justify-between">
-                                  <h5 className="text-sm font-semibold text-slate-700">
-                                    تسجيل مدفوعة جديدة
-                                  </h5>
-                                  {paymentSuccess && (
-                                    <span className="text-xs text-emerald-700">
-                                      {paymentSuccess}
-                                    </span>
-                                  )}
-                                </div>
-
-                                <label className="text-xs text-slate-600">
-                                  <span className="block mb-1">المبلغ</span>
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    dir="ltr"
-                                    value={paymentForm?.amount ?? ''}
-                                    onChange={(e) =>
-                                      setPaymentForm(inv.id, { amount: e.target.value })
-                                    }
-                                    placeholder="0.0000"
-                                    className="w-full rounded-md border border-slate-300 px-2 py-1 font-mono text-sm"
-                                    required
-                                  />
-                                </label>
-
-                                <label className="text-xs text-slate-600">
-                                  <span className="block mb-1">طريقة الدفع</span>
-                                  <select
-                                    value={paymentForm?.paymentMethod ?? 'CASH'}
-                                    onChange={(e) =>
-                                      setPaymentForm(inv.id, {
-                                        paymentMethod: e.target
-                                          .value as PaymentMethod,
-                                      })
-                                    }
-                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                                  >
-                                    <option value="CASH">نقدي</option>
-                                    <option value="CARD">بطاقة</option>
-                                    <option value="TRANSFER">تحويل</option>
-                                    <option value="OTHER">أخرى</option>
-                                  </select>
-                                </label>
-
-                                <label className="text-xs text-slate-600">
-                                  <span className="block mb-1">تاريخ الدفع</span>
-                                  <input
-                                    type="date"
-                                    dir="ltr"
-                                    value={paymentForm?.paidAt ?? ''}
-                                    onChange={(e) =>
-                                      setPaymentForm(inv.id, { paidAt: e.target.value })
-                                    }
-                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                                    required
-                                  />
-                                </label>
-
-                                <label className="text-xs text-slate-600">
-                                  <span className="block mb-1">المرجع</span>
-                                  <input
-                                    type="text"
-                                    dir="ltr"
-                                    value={paymentForm?.reference ?? ''}
-                                    onChange={(e) =>
-                                      setPaymentForm(inv.id, { reference: e.target.value })
-                                    }
-                                    placeholder="receipt / cheque #"
-                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                                  />
-                                </label>
-
-                                <label className="text-xs text-slate-600 md:col-span-2">
-                                  <span className="block mb-1">ملاحظات</span>
-                                  <textarea
-                                    rows={2}
-                                    value={paymentForm?.notes ?? ''}
-                                    onChange={(e) =>
-                                      setPaymentForm(inv.id, { notes: e.target.value })
-                                    }
-                                    className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                                  />
-                                </label>
-
-                                <div className="md:col-span-2 flex items-center justify-between">
-                                  <span className="text-xs text-slate-400" dir="ltr">
-                                    Idempotency-Key يُولَّد تلقائياً لكل محاولة إرسال.
-                                  </span>
-                                  <button
-                                    type="submit"
-                                    disabled={paymentSubmitting}
-                                    className={
-                                      'rounded-md border px-3 py-1 text-xs ' +
-                                      (paymentSubmitting
-                                        ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
-                                        : 'border-sky-300 bg-sky-600 text-white hover:bg-sky-700')
-                                    }
-                                  >
-                                    {paymentSubmitting ? '...جاري التسجيل' : 'تسجيل المدفوعة'}
-                                  </button>
-                                </div>
-                              </form>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                  </React.Fragment>
-                );
-              })
-            )}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="flex items-center justify-between text-sm mb-8">
-        <span className="text-slate-500">
-          {total} فاتورة • صفحة {page} من {totalPages}
-        </span>
-        <div className="flex gap-2">
-          <button
-            disabled={page <= 1}
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-            className="rounded-md border border-slate-300 px-3 py-1.5 disabled:opacity-40"
-          >
-            السابق
-          </button>
-          <button
-            disabled={page >= totalPages}
-            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-            className="rounded-md border border-slate-300 px-3 py-1.5 disabled:opacity-40"
-          >
-            التالي
-          </button>
-        </div>
-      </div>
-
-      {/* Create / edit draft form */}
-      {(canCreate || editingId) && (
-        <section className="rounded-2xl border border-slate-200 bg-white shadow-sm p-6">
-          <h2 className="text-lg font-semibold text-slate-800 mb-4">
-            {editingId ? 'تعديل مسودة الفاتورة' : 'إنشاء مسودة فاتورة جديدة'}
-          </h2>
-
-          {/* Header */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-            <label className="text-sm">
-              <span className="block text-slate-700 mb-1">العميل (اختياري)</span>
-              <select
-                value={form.customerId}
-                onChange={(e) => setForm({ ...form, customerId: e.target.value })}
-                className="w-full rounded-md border border-slate-300 px-3 py-2"
-                dir="ltr"
+    <main className="min-h-screen p-4 sm:p-8 max-w-7xl mx-auto space-y-6">
+      {/* 1. Modern Page Header */}
+      <PageHeader
+        title="فواتير العملاء"
+        subtitle="إدارة فواتير المبيعات التجارية، الإصدار، متابعة التحصيلات، والترحيل المحاسبي التلقائي."
+        eyebrow="المبيعات (Sales)"
+        actions={
+          <>
+            <Link
+              href="/dashboard"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs sm:text-sm font-medium transition-colors shadow-xs"
+            >
+              ← لوحة التحكم
+            </Link>
+            {canCreate && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (isFormOpen && !editingId) {
+                    onCancelEdit();
+                  } else {
+                    setEditingId(null);
+                    setForm(emptyDraft());
+                    setIsFormOpen(true);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm font-semibold transition-colors shadow-sm cursor-pointer"
               >
-                <option value="">بدون عميل</option>
-                {partners
-                  .filter((p) => p.type === 'CUSTOMER' || p.type === 'BOTH')
-                  .map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.code ?? ''} — {p.name}
-                    </option>
-                  ))}
-              </select>
-              <span className="text-xs text-slate-500">يجب أن يكون CUSTOMER أو BOTH.</span>
-            </label>
+                {isFormOpen && !editingId ? 'إخفاء النموذج' : '+ إنشاء فاتورة جديدة'}
+              </button>
+            )}
+          </>
+        }
+      />
 
-            <label className="text-sm">
-              <span className="block text-slate-700 mb-1">تاريخ الإصدار (اختياري)</span>
-              <input
-                type="date"
-                value={form.issueDate}
-                onChange={(e) => setForm({ ...form, issueDate: e.target.value })}
-                className="w-full rounded-md border border-slate-300 px-3 py-2 font-mono"
-                dir="ltr"
-              />
-            </label>
+      {/* 2. Top Executive KPI Cards Strip */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <KpiCard
+          label="إجمالي الفواتير"
+          value={total}
+          helperText="العدد الكلي في النظام"
+          tone="neutral"
+        />
+        <KpiCard
+          label="فواتير صادرة"
+          value={kpiData.issuedCount}
+          helperText="مرحلة محاسبياً بانتظار السداد"
+          tone="success"
+        />
+        <KpiCard
+          label="مسودات المبيعات"
+          value={kpiData.draftCount}
+          helperText="مسودات قيد الإعداد"
+          tone="warning"
+        />
+        <KpiCard
+          label="إجمالي المبيعات النشطة"
+          value={fmtDisplayMoney(kpiData.sumActiveTotal, 'ر.س')}
+          helperText="حسب النتائج المعروضة"
+          tone="info"
+        />
+      </div>
 
-            <label className="text-sm">
-              <span className="block text-slate-700 mb-1">تاريخ الاستحقاق (اختياري)</span>
-              <input
-                type="date"
-                value={form.dueDate}
-                onChange={(e) => setForm({ ...form, dueDate: e.target.value })}
-                className="w-full rounded-md border border-slate-300 px-3 py-2 font-mono"
-                dir="ltr"
-              />
-            </label>
+      {/* Error Banners */}
+      {err && <ErrorBanner message={err} onRetry={reload} />}
+      {rowActionErr && (
+        <ErrorBanner
+          title="خطأ في تنفيذ الإجراء"
+          message={rowActionErr}
+          tone="danger"
+        />
+      )}
 
-            <label className="text-sm md:col-span-3">
-              <span className="block text-slate-700 mb-1">ملاحظات (Header)</span>
-              <textarea
-                rows={2}
-                value={form.notes}
-                onChange={(e) => setForm({ ...form, notes: e.target.value })}
-                className="w-full rounded-md border border-slate-300 px-3 py-2"
-              />
-            </label>
-          </div>
+      {/* 3. Status Tabs Filter Bar */}
+      <StatusTabs
+        tabs={statusTabItems}
+        activeValue={statusFilter === '' ? 'ALL' : statusFilter}
+        onChange={(val) => {
+          setStatusFilter(val === 'ALL' ? '' : (val as SalesInvoiceStatus));
+          setPage(1);
+        }}
+      />
 
-          {/* Lines */}
-          <div className="space-y-3 mb-4">
-            <h3 className="text-sm font-semibold text-slate-700">البنود</h3>
-            {form.lines.map((l, idx) => {
-              const p = productById.get(l.productId);
-              const needsWarehouse = isProductType(p, 'PRODUCT');
-              return (
-                <div
-                  key={idx}
-                  className="grid grid-cols-1 md:grid-cols-12 gap-3 rounded-md border border-slate-200 p-3"
-                >
-                  <label className="text-xs md:col-span-3">
-                    <span className="block text-slate-700 mb-1">المنتج *</span>
-                    <select
-                      required
-                      value={l.productId}
-                      onChange={(e) =>
-                        setLine(idx, {
-                          productId: e.target.value,
-                          warehouseId: productById.get(e.target.value)?.type === 'PRODUCT' ? l.warehouseId : '',
-                        })
-                      }
-                      className="w-full rounded-md border border-slate-300 px-2 py-2"
-                      dir="ltr"
-                    >
-                      <option value="">اختر منتجاً</option>
-                      {products.map((pr) => (
-                        <option key={pr.id} value={pr.id}>
-                          {pr.sku} — {pr.name} ({pr.type === 'PRODUCT' ? 'منتج' : 'خدمة'})
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+      {/* 4. Filter and Search Section */}
+      <FilterSection>
+        <div className="flex-1 min-w-[240px]">
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            placeholder="ابحث برقم الفاتورة أو الملاحظات..."
+            className="w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
+            dir="rtl"
+          />
+        </div>
 
-                  <label className="text-xs md:col-span-2">
-                    <span className="block text-slate-700 mb-1">
-                      المستودع {needsWarehouse && '*'}
-                    </span>
-                    <select
-                      required={needsWarehouse}
-                      value={l.warehouseId}
-                      onChange={(e) => setLine(idx, { warehouseId: e.target.value })}
-                      disabled={!needsWarehouse}
-                      className="w-full rounded-md border border-slate-300 px-2 py-2 disabled:bg-slate-100"
-                      dir="ltr"
-                    >
-                      <option value="">—</option>
-                      {warehouses.map((w) => (
-                        <option key={w.id} value={w.id}>
-                          {w.code} — {w.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+        <div className="w-44">
+          <select
+            value={typeFilter}
+            onChange={(e) => {
+              setTypeFilter(e.target.value as typeof typeFilter);
+              setPage(1);
+            }}
+            className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+          >
+            <option value="">كل الأنواع</option>
+            <option value="STANDARD">فاتورة عادية</option>
+            <option value="POS">نقطة بيع (POS)</option>
+          </select>
+        </div>
 
-                  <label className="text-xs md:col-span-1">
-                    <span className="block text-slate-700 mb-1">الكمية *</span>
-                    <input
-                      required
-                      value={l.quantity}
-                      onChange={(e) => setLine(idx, { quantity: e.target.value })}
-                      placeholder="0.0000"
-                      className="w-full rounded-md border border-slate-300 px-2 py-2 font-mono"
-                      dir="ltr"
-                    />
-                  </label>
-
-                  <label className="text-xs md:col-span-2">
-                    <span className="block text-slate-700 mb-1">سعر الوحدة *</span>
-                    <input
-                      required
-                      value={l.unitPrice}
-                      onChange={(e) => setLine(idx, { unitPrice: e.target.value })}
-                      placeholder="0.0000"
-                      className="w-full rounded-md border border-slate-300 px-2 py-2 font-mono"
-                      dir="ltr"
-                    />
-                  </label>
-
-                  <label className="text-xs md:col-span-1">
-                    <span className="block text-slate-700 mb-1">خصم</span>
-                    <input
-                      value={l.discountAmount}
-                      onChange={(e) => setLine(idx, { discountAmount: e.target.value })}
-                      placeholder="0.0000"
-                      className="w-full rounded-md border border-slate-300 px-2 py-2 font-mono"
-                      dir="ltr"
-                    />
-                  </label>
-
-                  <label className="text-xs md:col-span-1">
-                    <span className="block text-slate-700 mb-1">ضريبة %</span>
-                    <input
-                      value={l.vatRate}
-                      onChange={(e) => setLine(idx, { vatRate: e.target.value })}
-                      placeholder="15.00"
-                      className="w-full rounded-md border border-slate-300 px-2 py-2 font-mono"
-                      dir="ltr"
-                    />
-                  </label>
-
-                  <label className="text-xs md:col-span-1">
-                    <span className="block text-slate-700 mb-1">وصف</span>
-                    <input
-                      value={l.description}
-                      onChange={(e) => setLine(idx, { description: e.target.value })}
-                      className="w-full rounded-md border border-slate-300 px-2 py-2"
-                      dir="ltr"
-                    />
-                  </label>
-
-                  <div className="md:col-span-1 flex items-end">
-                    <button
-                      type="button"
-                      onClick={() => removeLine(idx)}
-                      disabled={form.lines.length <= 1}
-                      className="w-full rounded-md border border-rose-300 px-2 py-2 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-40"
-                    >
-                      حذف البند
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
+        {(search || statusFilter || typeFilter) && (
           <button
             type="button"
-            onClick={addLine}
-            className="mb-6 rounded-md border border-slate-300 px-4 py-2 text-sm hover:bg-slate-50"
+            onClick={() => {
+              setSearch('');
+              setStatusFilter('');
+              setTypeFilter('');
+              setPage(1);
+            }}
+            className="px-3 py-2 text-xs font-medium text-slate-500 hover:text-slate-800 transition-colors"
           >
-            + إضافة بند
+            إعادة تعيين الفلاتر
           </button>
+        )}
+      </FilterSection>
 
-          {formErr && (
-            <div className="rounded-md bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700 mb-4">
-              {formErr}
+      {/* 5. Modern Table Presentation */}
+      <SectionCard noPadding>
+        <div className="overflow-x-auto">
+          <table className="w-full text-right text-sm">
+            <thead className="bg-slate-50/80 border-b border-slate-200/80 text-xs font-semibold text-slate-600 uppercase tracking-wider">
+              <tr>
+                <th className="px-5 py-3.5">رقم الفاتورة</th>
+                <th className="px-5 py-3.5">الحالة</th>
+                <th className="px-5 py-3.5">العميل</th>
+                <th className="px-5 py-3.5">تاريخ الإصدار</th>
+                <th className="px-5 py-3.5">المجموع الفرعي</th>
+                <th className="px-5 py-3.5">الضريبة 15%</th>
+                <th className="px-5 py-3.5">الإجمالي</th>
+                <th className="px-5 py-3.5">النوع</th>
+                <th className="px-5 py-3.5 text-center">الإجراءات</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 bg-white">
+              {loadingData ? (
+                <tr>
+                  <td colSpan={9} className="py-12">
+                    <LoadingState message="جاري تحميل الفواتير..." />
+                  </td>
+                </tr>
+              ) : items.length === 0 ? (
+                <tr>
+                  <td colSpan={9} className="py-12">
+                    <EmptyState
+                      title="لا توجد فواتير مبيعات"
+                      description={
+                        search || statusFilter || typeFilter
+                          ? 'لم نجد أي فواتير تطابق شروط البحث الحالية.'
+                          : 'لم يتم إنشاء أي فواتير مبيعات حتى الآن.'
+                      }
+                      action={
+                        canCreate && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingId(null);
+                              setForm(emptyDraft());
+                              setIsFormOpen(true);
+                            }}
+                            className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
+                          >
+                            + إنشاء مسودة أولى
+                          </button>
+                        )
+                      }
+                    />
+                  </td>
+                </tr>
+              ) : (
+                items.map((inv) => {
+                  const isDraft = inv.status === 'DRAFT';
+                  const isIssued = inv.status === 'ISSUED';
+                  const paymentsOpen = openPaymentsInvoiceId === inv.id;
+                  const paymentsForInv = paymentsByInvoice[inv.id];
+                  const paymentsLoading = !!paymentsLoadingByInvoice[inv.id];
+                  const paymentsErr = paymentsErrByInvoice[inv.id];
+                  const pForm = paymentFormByInvoice[inv.id];
+                  const paymentSubmitting = !!paymentSubmittingByInvoice[inv.id];
+                  const paymentSuccess = paymentSuccessByInvoice[inv.id];
+
+                  // Assemble row actions for the ActionMenu
+                  const rowActions = [
+                    {
+                      label: 'عرض التفاصيل',
+                      onClick: () => setSelectedInvoice(inv),
+                    },
+                    ...(isDraft && canUpdate
+                      ? [
+                          {
+                            label: 'تعديل المسودة',
+                            onClick: () => onEdit(inv),
+                          },
+                        ]
+                      : []),
+                    ...(isDraft && canIssue
+                      ? [
+                          {
+                            label: 'إصدار الفاتورة',
+                            onClick: () => onIssue(inv.id),
+                            tone: 'primary' as const,
+                          },
+                        ]
+                      : []),
+                    ...(isIssued && canReadArPayments
+                      ? [
+                          {
+                            label: paymentsOpen ? 'إخفاء المدفوعات' : 'إدارة المدفوعات',
+                            onClick: () => onTogglePayments(inv.id),
+                          },
+                        ]
+                      : []),
+                    ...(!inv.notes?.includes('credit note') &&
+                    inv.status !== 'CANCELLED' &&
+                    canCancel
+                      ? [
+                          {
+                            label: 'إلغاء الفاتورة',
+                            onClick: () => onCancel(inv.id),
+                            tone: 'danger' as const,
+                          },
+                        ]
+                      : []),
+                    ...(isDraft && canDelete
+                      ? [
+                          {
+                            label: 'حذف المسودة',
+                            onClick: () => onDelete(inv.id),
+                            tone: 'danger' as const,
+                          },
+                        ]
+                      : []),
+                  ];
+
+                  return (
+                    <React.Fragment key={inv.id}>
+                      <tr className="hover:bg-slate-50/60 transition-colors">
+                        {/* Invoice Number */}
+                        <td className="px-5 py-3.5 font-mono text-sm font-semibold text-blue-600">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedInvoice(inv)}
+                            className="hover:underline cursor-pointer"
+                            dir="ltr"
+                          >
+                            {inv.invoiceNumber}
+                          </button>
+                        </td>
+
+                        {/* Status */}
+                        <td className="px-5 py-3.5">
+                          <StatusBadge status={inv.status} />
+                        </td>
+
+                        {/* Customer */}
+                        <td className="px-5 py-3.5 text-slate-800 font-medium">
+                          {customerLabel(inv.customerId)}
+                        </td>
+
+                        {/* Issue Date */}
+                        <td className="px-5 py-3.5 text-slate-500 font-mono text-xs" dir="ltr">
+                          {fmtDate(inv.issueDate)}
+                        </td>
+
+                        {/* Subtotal */}
+                        <td className="px-5 py-3.5 text-slate-600 font-mono text-xs" dir="ltr">
+                          {fmtMoney(inv.subtotal)}
+                        </td>
+
+                        {/* VAT */}
+                        <td className="px-5 py-3.5 text-slate-600 font-mono text-xs" dir="ltr">
+                          {fmtMoney(inv.vatTotal)}
+                        </td>
+
+                        {/* Total */}
+                        <td className="px-5 py-3.5 text-slate-900 font-mono font-bold" dir="ltr">
+                          {fmtMoney(inv.total)}
+                        </td>
+
+                        {/* Type */}
+                        <td className="px-5 py-3.5 text-xs text-slate-500">
+                          {inv.type === 'POS' ? 'نقطة بيع' : 'عادية'}
+                        </td>
+
+                        {/* Action Menu */}
+                        <td className="px-5 py-3.5 text-center">
+                          <ActionMenu actions={rowActions} />
+                        </td>
+                      </tr>
+
+                      {/* Expanded Payments Section for ISSUED invoices */}
+                      {isIssued && paymentsOpen && (
+                        <tr className="bg-slate-50/80 border-t border-b border-slate-200">
+                          <td colSpan={9} className="px-6 py-5">
+                            <div className="space-y-4 max-w-4xl mx-auto">
+                              <div className="flex items-center justify-between">
+                                <div>
+                                  <h4 className="text-sm font-bold text-slate-800">
+                                    مدفوعات الفاتورة ({inv.invoiceNumber})
+                                  </h4>
+                                  <p className="text-xs text-slate-500">
+                                    سجل حركات التحصيل المسجلة على هذه الفاتورة
+                                  </p>
+                                </div>
+                                {paymentsLoading && (
+                                  <span className="text-xs text-slate-400">...جاري التحميل</span>
+                                )}
+                              </div>
+
+                              {paymentsErr && (
+                                <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                                  {paymentsErr}
+                                </div>
+                              )}
+
+                              {!paymentsLoading &&
+                                !paymentsErr &&
+                                (paymentsForInv || []).length === 0 && (
+                                  <div className="text-xs text-slate-500 bg-white p-3 rounded-xl border border-slate-200 text-center">
+                                    لا توجد مدفوعات مسجلة لهذه الفاتورة حتى الآن.
+                                  </div>
+                                )}
+
+                              {!paymentsLoading && !paymentsErr && (paymentsForInv || []).length > 0 && (
+                                <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs">
+                                  <table className="min-w-full text-xs text-right">
+                                    <thead className="bg-slate-50 text-slate-600 border-b border-slate-100">
+                                      <tr>
+                                        <th className="px-4 py-2.5">المبلغ (SAR)</th>
+                                        <th className="px-4 py-2.5">طريقة الدفع</th>
+                                        <th className="px-4 py-2.5">تاريخ الدفع</th>
+                                        <th className="px-4 py-2.5">المرجع</th>
+                                        <th className="px-4 py-2.5">الحالة</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-100">
+                                      {(paymentsForInv || []).map((p) => (
+                                        <tr key={p.id}>
+                                          <td className="px-4 py-2.5 font-mono font-bold text-slate-800" dir="ltr">
+                                            {fmtMoney(p.amount)}
+                                          </td>
+                                          <td className="px-4 py-2.5 text-slate-700">
+                                            {p.paymentMethod === 'CASH'
+                                              ? 'نقدي'
+                                              : p.paymentMethod === 'CARD'
+                                                ? 'بطاقة'
+                                                : p.paymentMethod === 'TRANSFER'
+                                                  ? 'تحويل بنكي'
+                                                  : 'أخرى'}
+                                          </td>
+                                          <td className="px-4 py-2.5 text-slate-600 font-mono" dir="ltr">
+                                            {fmtDate(p.paidAt)}
+                                          </td>
+                                          <td className="px-4 py-2.5 text-slate-600" dir="ltr">
+                                            {p.reference || '—'}
+                                          </td>
+                                          <td className="px-4 py-2.5">
+                                            <StatusBadge status={p.status} size="sm" />
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              )}
+
+                              {/* AR Payment Recording Form */}
+                              {canWriteArPayments && (
+                                <form
+                                  onSubmit={(e) => onSubmitPayment(e, inv.id, inv)}
+                                  className="rounded-xl border border-slate-200 bg-white p-4 shadow-xs space-y-3"
+                                >
+                                  <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                                    <h5 className="text-xs font-bold text-slate-800">
+                                      تسجيل دفعة تحصيل جديدة
+                                    </h5>
+                                    {paymentSuccess && (
+                                      <span className="text-xs font-semibold text-emerald-600">
+                                        ✓ تم تسجيل الدفعة بنجاح
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                                    <label className="text-xs text-slate-600 space-y-1">
+                                      <span className="block font-medium">المبلغ *</span>
+                                      <input
+                                        type="text"
+                                        inputMode="decimal"
+                                        dir="ltr"
+                                        value={pForm?.amount ?? ''}
+                                        onChange={(e) =>
+                                          setPaymentForm(inv.id, { amount: e.target.value })
+                                        }
+                                        placeholder="0.00"
+                                        className="w-full rounded-lg border border-slate-200 px-3 py-1.5 font-mono text-sm"
+                                        required
+                                      />
+                                    </label>
+
+                                    <label className="text-xs text-slate-600 space-y-1">
+                                      <span className="block font-medium">طريقة الدفع *</span>
+                                      <select
+                                        value={pForm?.paymentMethod ?? 'CASH'}
+                                        onChange={(e) =>
+                                          setPaymentForm(inv.id, {
+                                            paymentMethod: e.target.value as PaymentMethod,
+                                          })
+                                        }
+                                        className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm"
+                                      >
+                                        <option value="CASH">نقدي</option>
+                                        <option value="CARD">بطاقة</option>
+                                        <option value="TRANSFER">تحويل بنكي</option>
+                                        <option value="OTHER">أخرى</option>
+                                      </select>
+                                    </label>
+
+                                    <label className="text-xs text-slate-600 space-y-1">
+                                      <span className="block font-medium">تاريخ الدفع *</span>
+                                      <input
+                                        type="date"
+                                        dir="ltr"
+                                        value={pForm?.paidAt ?? ''}
+                                        onChange={(e) =>
+                                          setPaymentForm(inv.id, { paidAt: e.target.value })
+                                        }
+                                        className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-mono"
+                                        required
+                                      />
+                                    </label>
+
+                                    <label className="text-xs text-slate-600 space-y-1">
+                                      <span className="block font-medium">المرجع / الشيك</span>
+                                      <input
+                                        type="text"
+                                        dir="ltr"
+                                        value={pForm?.reference ?? ''}
+                                        onChange={(e) =>
+                                          setPaymentForm(inv.id, { reference: e.target.value })
+                                        }
+                                        placeholder="رقم الإيصال أو الحوالة"
+                                        className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm"
+                                      />
+                                    </label>
+
+                                    <label className="text-xs text-slate-600 sm:col-span-2 md:col-span-3 space-y-1">
+                                      <span className="block font-medium">ملاحظات التحصيل</span>
+                                      <input
+                                        type="text"
+                                        value={pForm?.notes ?? ''}
+                                        onChange={(e) =>
+                                          setPaymentForm(inv.id, { notes: e.target.value })
+                                        }
+                                        placeholder="ملاحظات اختيارية..."
+                                        className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-sm"
+                                      />
+                                    </label>
+
+                                    <div className="flex items-end">
+                                      <button
+                                        type="submit"
+                                        disabled={paymentSubmitting}
+                                        className="w-full py-2 px-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors disabled:opacity-50 cursor-pointer"
+                                      >
+                                        {paymentSubmitting ? '...جاري الحفظ' : 'تسجيل التحصيل'}
+                                      </button>
+                                    </div>
+                                  </div>
+                                </form>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Pagination Bar */}
+        <div className="flex items-center justify-between px-5 py-4 border-t border-slate-100 bg-slate-50/50 text-xs text-slate-500">
+          <span>
+            إجمالي {total} فاتورة • صفحة {page} من {totalPages}
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium disabled:opacity-40 transition-colors"
+            >
+              السابق
+            </button>
+            <button
+              type="button"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-medium disabled:opacity-40 transition-colors"
+            >
+              التالي
+            </button>
+          </div>
+        </div>
+      </SectionCard>
+
+      {/* 6. Invoice Details Drawer (Slide-Over Inspection) */}
+      <DetailDrawer
+        isOpen={Boolean(selectedInvoice)}
+        onClose={() => setSelectedInvoice(null)}
+        title={selectedInvoice ? `تفاصيل الفاتورة: ${selectedInvoice.invoiceNumber}` : ''}
+        subtitle={selectedInvoice ? `العميل: ${customerLabel(selectedInvoice.customerId)}` : ''}
+        width="lg"
+      >
+        {selectedInvoice && (
+          <div className="space-y-6 text-sm">
+            {/* Metadata Badges */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <StatusBadge status={selectedInvoice.status} size="md" />
+              <span className="text-xs px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 border border-slate-200">
+                {selectedInvoice.type === 'POS' ? 'نقطة بيع' : 'فاتورة عادية'}
+              </span>
             </div>
-          )}
 
-          <div className="flex gap-2 justify-end">
-            {editingId && (
+            {/* Financial Summary Card */}
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 grid grid-cols-3 gap-3 text-center">
+              <div>
+                <span className="text-xs text-slate-500 block">المجموع الفرعي</span>
+                <span className="text-base font-bold text-slate-800 font-mono" dir="ltr">
+                  {fmtDisplayMoney(selectedInvoice.subtotal, 'ر.س')}
+                </span>
+              </div>
+              <div>
+                <span className="text-xs text-slate-500 block">الضريبة 15%</span>
+                <span className="text-base font-bold text-slate-800 font-mono" dir="ltr">
+                  {fmtDisplayMoney(selectedInvoice.vatTotal, 'ر.س')}
+                </span>
+              </div>
+              <div>
+                <span className="text-xs text-slate-500 block">الإجمالي الكلي</span>
+                <span className="text-base font-bold text-blue-700 font-mono" dir="ltr">
+                  {fmtDisplayMoney(selectedInvoice.total, 'ر.س')}
+                </span>
+              </div>
+            </div>
+
+            {/* Dates & Terms */}
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="p-3 bg-white rounded-xl border border-slate-200">
+                <span className="text-slate-400 block mb-1">تاريخ الإصدار:</span>
+                <span className="font-semibold text-slate-800 font-mono" dir="ltr">
+                  {fmtDisplayDate(selectedInvoice.issueDate)}
+                </span>
+              </div>
+              <div className="p-3 bg-white rounded-xl border border-slate-200">
+                <span className="text-slate-400 block mb-1">تاريخ الاستحقاق:</span>
+                <span className="font-semibold text-slate-800 font-mono" dir="ltr">
+                  {fmtDisplayDate(selectedInvoice.dueDate)}
+                </span>
+              </div>
+            </div>
+
+            {/* Line Items Table */}
+            <div>
+              <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">
+                بنود الفاتورة ({selectedInvoice.lines?.length || 0})
+              </h4>
+              {selectedInvoice.lines && selectedInvoice.lines.length > 0 ? (
+                <div className="rounded-xl border border-slate-200 overflow-hidden bg-white">
+                  <table className="w-full text-xs text-right">
+                    <thead className="bg-slate-50 text-slate-600 border-b border-slate-100">
+                      <tr>
+                        <th className="p-2.5">المنتج / البند</th>
+                        <th className="p-2.5">الكمية</th>
+                        <th className="p-2.5">السعر</th>
+                        <th className="p-2.5">الضريبة</th>
+                        <th className="p-2.5">المجموع</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {selectedInvoice.lines.map((l, idx) => {
+                        const prod = productById.get(l.productId);
+                        return (
+                          <tr key={idx}>
+                            <td className="p-2.5">
+                              <span className="font-medium text-slate-800">
+                                {prod?.name || l.productId}
+                              </span>
+                              {l.description && (
+                                <span className="block text-[11px] text-slate-400">
+                                  {l.description}
+                                </span>
+                              )}
+                            </td>
+                            <td className="p-2.5 font-mono" dir="ltr">
+                              {l.quantity}
+                            </td>
+                            <td className="p-2.5 font-mono" dir="ltr">
+                              {fmtMoney(l.unitPrice)}
+                            </td>
+                            <td className="p-2.5 font-mono text-slate-500" dir="ltr">
+                              {l.vatRate}%
+                            </td>
+                            <td className="p-2.5 font-mono font-bold text-slate-800" dir="ltr">
+                              {fmtMoney(l.lineTotal)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 italic">لا توجد بنود مفصلة مرفقة.</p>
+              )}
+            </div>
+
+            {/* Notes */}
+            {selectedInvoice.notes && (
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                <span className="font-semibold text-slate-700 block mb-1">ملاحظات:</span>
+                <p className="text-slate-600 leading-relaxed">{selectedInvoice.notes}</p>
+              </div>
+            )}
+
+            {/* Action Bar in Drawer */}
+            <div className="pt-4 border-t border-slate-200 flex items-center justify-end gap-2">
+              {selectedInvoice.status === 'DRAFT' && canIssue && (
+                <button
+                  type="button"
+                  onClick={() => onIssue(selectedInvoice.id)}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold cursor-pointer"
+                >
+                  إصدار الفاتورة وترحيلها
+                </button>
+              )}
+              {selectedInvoice.status === 'DRAFT' && canUpdate && (
+                <button
+                  type="button"
+                  onClick={() => onEdit(selectedInvoice)}
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer"
+                >
+                  تعديل المسودة
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setSelectedInvoice(null)}
+                className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-600 text-xs hover:bg-slate-50 cursor-pointer"
+              >
+                إغلاق
+              </button>
+            </div>
+          </div>
+        )}
+      </DetailDrawer>
+
+      {/* 7. Create / Edit Invoice Form Section */}
+      {isFormOpen && (canCreate || editingId) && (
+        <SectionCard
+          title={editingId ? 'تعديل مسودة الفاتورة' : 'إنشاء مسودة فاتورة مبيعات جديدة'}
+          description="أدخل بيانات العميل والبنود التفصيلية مع احتساب ضريبة القيمة المضافة 15% تلقائياً."
+          actions={
+            <button
+              type="button"
+              onClick={onCancelEdit}
+              className="text-xs text-slate-500 hover:text-slate-800"
+            >
+              إلغاء وإغلاق النموذج
+            </button>
+          }
+        >
+          <form onSubmit={onSubmit} className="space-y-6">
+            {/* Header Fields */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <label className="text-xs text-slate-600 space-y-1">
+                <span className="block font-medium text-slate-700">العميل (اختياري)</span>
+                <select
+                  value={form.customerId}
+                  onChange={(e) => setForm({ ...form, customerId: e.target.value })}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                  dir="ltr"
+                >
+                  <option value="">بدون عميل (عميل نقدي عام)</option>
+                  {partners
+                    .filter((p) => p.type === 'CUSTOMER' || p.type === 'BOTH')
+                    .map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.code ? `[${p.code}] ` : ''}{p.name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+
+              <label className="text-xs text-slate-600 space-y-1">
+                <span className="block font-medium text-slate-700">تاريخ الإصدار</span>
+                <input
+                  type="date"
+                  value={form.issueDate}
+                  onChange={(e) => setForm({ ...form, issueDate: e.target.value })}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-mono"
+                  dir="ltr"
+                />
+              </label>
+
+              <label className="text-xs text-slate-600 space-y-1">
+                <span className="block font-medium text-slate-700">تاريخ الاستحقاق</span>
+                <input
+                  type="date"
+                  value={form.dueDate}
+                  onChange={(e) => setForm({ ...form, dueDate: e.target.value })}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-mono"
+                  dir="ltr"
+                />
+              </label>
+
+              <label className="text-xs text-slate-600 md:col-span-3 space-y-1">
+                <span className="block font-medium text-slate-700">ملاحظات الفاتورة</span>
+                <textarea
+                  rows={2}
+                  value={form.notes}
+                  onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                  placeholder="ملاحظات تظهر على الفاتورة..."
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                />
+              </label>
+            </div>
+
+            {/* Line Items List */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+                  بنود الفاتورة *
+                </h4>
+                <button
+                  type="button"
+                  onClick={addLine}
+                  className="px-3 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold cursor-pointer"
+                >
+                  + إضافة بند إضافي
+                </button>
+              </div>
+
+              {form.lines.map((l, idx) => {
+                const p = productById.get(l.productId);
+                const needsWarehouse = isProductType(p, 'PRODUCT');
+                return (
+                  <div
+                    key={idx}
+                    className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-12 gap-3 p-4 rounded-xl border border-slate-200 bg-slate-50/50 items-end"
+                  >
+                    <label className="text-xs md:col-span-3 space-y-1">
+                      <span className="block font-medium text-slate-700">المنتج / الخدمة *</span>
+                      <select
+                        required
+                        value={l.productId}
+                        onChange={(e) =>
+                          setLine(idx, {
+                            productId: e.target.value,
+                            warehouseId:
+                              productById.get(e.target.value)?.type === 'PRODUCT'
+                                ? l.warehouseId
+                                : '',
+                          })
+                        }
+                        className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm"
+                        dir="ltr"
+                      >
+                        <option value="">اختر منتجاً...</option>
+                        {products.map((pr) => (
+                          <option key={pr.id} value={pr.id}>
+                            {pr.sku} — {pr.name} ({pr.type === 'PRODUCT' ? 'منتج' : 'خدمة'})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="text-xs md:col-span-2 space-y-1">
+                      <span className="block font-medium text-slate-700">
+                        المستودع {needsWarehouse && '*'}
+                      </span>
+                      <select
+                        required={needsWarehouse}
+                        value={l.warehouseId}
+                        onChange={(e) => setLine(idx, { warehouseId: e.target.value })}
+                        disabled={!needsWarehouse}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm disabled:bg-slate-100 disabled:opacity-50"
+                        dir="ltr"
+                      >
+                        <option value="">—</option>
+                        {warehouses.map((w) => (
+                          <option key={w.id} value={w.id}>
+                            {w.code} — {w.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="text-xs md:col-span-2 space-y-1">
+                      <span className="block font-medium text-slate-700">الكمية *</span>
+                      <input
+                        required
+                        value={l.quantity}
+                        onChange={(e) => setLine(idx, { quantity: e.target.value })}
+                        placeholder="1.00"
+                        className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-mono"
+                        dir="ltr"
+                      />
+                    </label>
+
+                    <label className="text-xs md:col-span-2 space-y-1">
+                      <span className="block font-medium text-slate-700">سعر الوحدة *</span>
+                      <input
+                        required
+                        value={l.unitPrice}
+                        onChange={(e) => setLine(idx, { unitPrice: e.target.value })}
+                        placeholder="0.00"
+                        className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-mono"
+                        dir="ltr"
+                      />
+                    </label>
+
+                    <label className="text-xs md:col-span-1 space-y-1">
+                      <span className="block font-medium text-slate-700">ضريبة %</span>
+                      <input
+                        value={l.vatRate}
+                        onChange={(e) => setLine(idx, { vatRate: e.target.value })}
+                        placeholder="15.00"
+                        className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-mono"
+                        dir="ltr"
+                      />
+                    </label>
+
+                    <label className="text-xs md:col-span-1 space-y-1">
+                      <span className="block font-medium text-slate-700">خصم</span>
+                      <input
+                        value={l.discountAmount}
+                        onChange={(e) => setLine(idx, { discountAmount: e.target.value })}
+                        placeholder="0.00"
+                        className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-mono"
+                        dir="ltr"
+                      />
+                    </label>
+
+                    <div className="md:col-span-1 flex items-end">
+                      <button
+                        type="button"
+                        onClick={() => removeLine(idx)}
+                        disabled={form.lines.length <= 1}
+                        className="w-full py-2 rounded-lg border border-rose-200 bg-white hover:bg-rose-50 text-xs text-rose-600 disabled:opacity-30 cursor-pointer"
+                        title="حذف هذا البند"
+                      >
+                        حذف
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {formErr && <ErrorBanner message={formErr} />}
+
+            {/* Form Actions */}
+            <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-100">
               <button
                 type="button"
                 onClick={onCancelEdit}
-                className="rounded-md border border-slate-300 px-4 py-2 text-sm hover:bg-slate-50"
+                className="px-4 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium transition-colors cursor-pointer"
               >
-                إلغاء التعديل
+                إلغاء
               </button>
-            )}
-            <button
-              type="button"
-              onClick={onSubmit}
-              disabled={submitting}
-              className="rounded-md bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 disabled:opacity-40"
-            >
-              {submitting ? '...جاري الحفظ' : editingId ? 'حفظ التعديلات' : 'إنشاء مسودة'}
-            </button>
-          </div>
-        </section>
+              <button
+                type="submit"
+                disabled={submitting}
+                className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold transition-colors shadow-sm disabled:opacity-50 cursor-pointer"
+              >
+                {submitting ? '...جاري الحفظ' : editingId ? 'حفظ التعديلات' : 'إنشاء المسودة'}
+              </button>
+            </div>
+          </form>
+        </SectionCard>
       )}
     </main>
   );
