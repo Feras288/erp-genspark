@@ -582,6 +582,28 @@ export default function AccountingPage() {
   }
   if (!user) return null;
 
+  if (!canRead) {
+    return (
+      <main className="min-h-screen p-8 bg-slate-50 flex items-center justify-center">
+        <div className="rounded-2xl border border-rose-200 bg-white p-8 max-w-md text-center shadow-md">
+          <div className="w-12 h-12 rounded-full bg-rose-100 text-rose-600 mx-auto flex items-center justify-center mb-4 text-2xl font-bold">
+            🚫
+          </div>
+          <h1 className="text-xl font-bold text-slate-800 mb-2">غير مصرح — Access Denied</h1>
+          <p className="text-slate-600 text-sm mb-6 leading-relaxed">
+            تتطلب هذه الصفحة توفر صلاحية <code className="bg-slate-100 px-1.5 py-0.5 rounded text-rose-600 text-xs">accounting.read</code>. يرجى مراجعة مسؤول النظام.
+          </p>
+          <Link
+            href="/dashboard"
+            className="inline-block rounded-xl bg-slate-800 hover:bg-slate-900 text-white text-sm font-medium px-5 py-2.5 transition-colors shadow-sm"
+          >
+            العودة إلى لوحة المعلومات
+          </Link>
+        </div>
+      </main>
+    );
+  }
+
   const totalAccountsPages = Math.max(1, Math.ceil(accountsTotal / pageSize));
   const totalJournalPages = Math.max(1, Math.ceil(journalTotal / 20));
 

@@ -134,6 +134,14 @@ export default function DashboardPage() {
               التقارير
             </Link>
           )}
+          {user.permissions.includes('audit_log.read') && (
+            <Link
+              href="/admin/audit-logs"
+              className="rounded-md bg-slate-800 hover:bg-slate-900 text-white text-sm px-4 py-2"
+            >
+              سجل التدقيق
+            </Link>
+          )}
           <button
             onClick={onLogout}
             className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"
