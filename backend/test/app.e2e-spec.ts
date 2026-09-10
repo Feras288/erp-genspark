@@ -25,6 +25,7 @@ import {
   postPurchaseInvoiceReceived,
   postSalesInvoiceIssued,
 } from '../src/accounting/posting-events';
+import { AuditLogsService } from '../src/audit-logs/audit-logs.service';
 
 // Helper: extract the value of `name=...;...` from the first Set-Cookie header.
 function readCookie(setCookieHeader: string | string[] | undefined, name: string): string | undefined {
@@ -6159,6 +6160,395 @@ describe('Phase 12A-B-5: Financial Statements consolidation (e2e)', () => {
         .set('Authorization', `Bearer ${cashierToken}`);
       expect(forbiddenSummary.status).toBe(403);
     });
+  });
+});
+
+// =====================================================
+// Phase 15A-B-5: Centralized Audit Trail & Activity Log
+// E2E test suite for AuditLog read endpoints, filters,
+// pagination, export-preview, redaction, and RBAC guards.
+// =====================================================
+describe('Phase 15A-B-5: Audit Log filtering and coverage (e2e)', () => {
+  let app: INestApplication;
+  let http: ReturnType<INestApplication['getHttpServer']>;
+  let prisma: PrismaService;
+  let auditLogsService: AuditLogsService;
+  let adminToken: string;
+  let cashierToken: string;
+  let adminCompanyId: string;
+  let adminUserId: string;
+  let otherCompanyId: string;
+  let targetEntityId: string;
+  let targetLogId: string;
+  let otherCompanyLogId: string;
+  let redactedLogId: string;
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleRef.createNestApplication();
+    app.use(helmet());
+    app.use(cookieParser());
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        transform: true,
+      }),
+    );
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = app.getHttpServer();
+    prisma = app.get(PrismaService);
+    auditLogsService = app.get(AuditLogsService);
+
+    // Ensure admin user role has audit_log permissions
+    const auditPerms = await prisma.permission.findMany({
+      where: {
+        key: { in: ['audit_log.read', 'audit_log.export', 'audit_log.admin'] },
+      },
+    });
+    const adminUser = await prisma.user.findFirst({
+      where: { email: 'admin@example.sa' },
+      include: { userRoles: true },
+    });
+    if (adminUser && adminUser.userRoles.length > 0) {
+      for (const p of auditPerms) {
+        await prisma.rolePermission.upsert({
+          where: {
+            roleId_permissionId: {
+              roleId: adminUser.userRoles[0].roleId,
+              permissionId: p.id,
+            },
+          },
+          update: {},
+          create: {
+            roleId: adminUser.userRoles[0].roleId,
+            permissionId: p.id,
+          },
+        });
+      }
+    }
+
+    const loginRes = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'admin@example.sa', password: 'Admin@12345' });
+    adminToken = loginRes.body.accessToken;
+    adminCompanyId = loginRes.body.user.companyId;
+    adminUserId = loginRes.body.user.id;
+
+    const cashierLogin = await request(http)
+      .post(`${API_PREFIX}/auth/login`)
+      .send({ email: 'cashier-e2e@example.sa', password: 'Cashier@123' });
+    if (cashierLogin.status === 200) {
+      cashierToken = cashierLogin.body.accessToken;
+    }
+
+    // Seed isolated test audit log entries
+    const unique = Date.now().toString().slice(-6);
+    targetEntityId = `je-test-${unique}`;
+
+    // 1. Specific accounting audit log row
+    const targetLog = await prisma.auditLog.create({
+      data: {
+        companyId: adminCompanyId,
+        actorUserId: adminUserId,
+        actorType: 'USER',
+        category: 'ACCOUNTING',
+        event: 'JOURNAL_POSTED',
+        entityType: 'JournalEntry',
+        entityId: targetEntityId,
+        action: 'POST',
+        severity: 'INFO',
+        status: 'SUCCESS',
+        metadata: {
+          entryNumber: `JE-${unique}`,
+          totalDebit: '1000.0000',
+          totalCredit: '1000.0000',
+        },
+      },
+    });
+    targetLogId = targetLog.id;
+
+    // 2. Another audit log row for same company with different category
+    await prisma.auditLog.create({
+      data: {
+        companyId: adminCompanyId,
+        actorUserId: adminUserId,
+        actorType: 'USER',
+        category: 'SALES',
+        event: 'SALES_INVOICE_CREATED',
+        entityType: 'SalesInvoice',
+        entityId: `inv-${unique}`,
+        action: 'CREATE',
+        severity: 'INFO',
+        status: 'SUCCESS',
+        metadata: {
+          invoiceNumber: `SI-${unique}`,
+        },
+      },
+    });
+
+    // 3. Second company for tenant isolation
+    const otherCompany = await prisma.company.create({
+      data: { name: `Audit Isolation Corp ${unique}` },
+    });
+    otherCompanyId = otherCompany.id;
+
+    const otherLog = await prisma.auditLog.create({
+      data: {
+        companyId: otherCompanyId,
+        actorType: 'SYSTEM',
+        category: 'SYSTEM',
+        event: 'SYSTEM_EVENT',
+        entityType: 'SystemEntity',
+        entityId: `sys-${unique}`,
+        action: 'INIT',
+        severity: 'INFO',
+        status: 'SUCCESS',
+        metadata: { isolation: true },
+      },
+    });
+    otherCompanyLogId = otherLog.id;
+
+    // 4. Log with sensitive data created via auditLogsService (to test redaction)
+    const redactedLog = await auditLogsService.createAuditLog({
+      companyId: adminCompanyId,
+      actorUserId: adminUserId,
+      category: 'AUTH',
+      event: 'LOGIN_ATTEMPT',
+      action: 'LOGIN',
+      severity: 'INFO',
+      status: 'SUCCESS',
+      metadata: {
+        password: 'SuperSecretPassword123!',
+        token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sensitive',
+        authorization: 'Bearer secret_token_xyz',
+        cookie: 'sessionId=abc123secret',
+        apiKey: 'sk_live_1234567890abcdef',
+        safeField: 'normalValue',
+      },
+    });
+    redactedLogId = redactedLog.id;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('15A-B-5.1) Authorized user can list audit logs', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/audit-logs`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(Array.isArray(res.body.data.items)).toBe(true);
+    expect(res.body.companyId).toBe(adminCompanyId);
+    expect(res.body.data.items.length).toBeGreaterThanOrEqual(1);
+    for (const item of res.body.data.items) {
+      expect(item.companyId).toBe(adminCompanyId);
+    }
+  });
+
+  it('15A-B-5.2) Filters by category/event/status/severity', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/audit-logs`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .query({
+        category: 'ACCOUNTING',
+        event: 'JOURNAL_POSTED',
+        status: 'SUCCESS',
+        severity: 'INFO',
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.data.items.length).toBeGreaterThanOrEqual(1);
+    for (const item of res.body.data.items) {
+      expect(item.category).toBe('ACCOUNTING');
+      expect(item.event).toContain('JOURNAL_POSTED');
+      expect(item.status).toBe('SUCCESS');
+      expect(item.severity).toBe('INFO');
+      expect(item.companyId).toBe(adminCompanyId);
+    }
+  });
+
+  it('15A-B-5.3) Entity timeline returns matching entity logs for tenant descending', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/audit-logs/entity/JournalEntry/${targetEntityId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.companyId).toBe(adminCompanyId);
+    expect(Array.isArray(res.body.data.items)).toBe(true);
+    expect(res.body.data.items.length).toBeGreaterThanOrEqual(1);
+    for (const item of res.body.data.items) {
+      expect(item.entityType).toBe('JournalEntry');
+      expect(item.entityId).toBe(targetEntityId);
+      expect(item.companyId).toBe(adminCompanyId);
+    }
+  });
+
+  it('15A-B-5.4) Single item endpoint returns 200 for tenant row and 404 for nonexistent or other tenant', async () => {
+    // 200 for tenant-owned row
+    const res = await request(http)
+      .get(`${API_PREFIX}/audit-logs/${targetLogId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.data.item.id).toBe(targetLogId);
+    expect(res.body.data.item.companyId).toBe(adminCompanyId);
+
+    // 404 for nonexistent id
+    const resNotFound = await request(http)
+      .get(`${API_PREFIX}/audit-logs/nonexistent-id-9999`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(resNotFound.status).toBe(404);
+
+    // 404 for other tenant's audit log id
+    const resOtherTenant = await request(http)
+      .get(`${API_PREFIX}/audit-logs/${otherCompanyLogId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(resOtherTenant.status).toBe(404);
+  });
+
+  it('15A-B-5.5) Export preview endpoint returns count and out-of-scope message', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/audit-logs/export-preview`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.companyId).toBe(adminCompanyId);
+    expect(res.body.data.exportImplemented).toBe(false);
+    expect(typeof res.body.data.count).toBe('number');
+    expect(res.body.data.count).toBeGreaterThanOrEqual(1);
+    expect(res.body.data.message).toMatch(/out of scope/i);
+  });
+
+  it('15A-B-5.6) RBAC / auth enforcement for audit log endpoints', async () => {
+    // 1. Without token => 401
+    const unauthList = await request(http).get(`${API_PREFIX}/audit-logs`);
+    expect(unauthList.status).toBe(401);
+
+    const unauthExport = await request(http).get(`${API_PREFIX}/audit-logs/export-preview`);
+    expect(unauthExport.status).toBe(401);
+
+    const unauthSingle = await request(http).get(`${API_PREFIX}/audit-logs/${targetLogId}`);
+    expect(unauthSingle.status).toBe(401);
+
+    const unauthTimeline = await request(http).get(`${API_PREFIX}/audit-logs/entity/JournalEntry/${targetEntityId}`);
+    expect(unauthTimeline.status).toBe(401);
+
+    // 2. Token lacking audit_log.read => 403
+    if (cashierToken) {
+      const forbiddenList = await request(http)
+        .get(`${API_PREFIX}/audit-logs`)
+        .set('Authorization', `Bearer ${cashierToken}`);
+      expect(forbiddenList.status).toBe(403);
+
+      const forbiddenSingle = await request(http)
+        .get(`${API_PREFIX}/audit-logs/${targetLogId}`)
+        .set('Authorization', `Bearer ${cashierToken}`);
+      expect(forbiddenSingle.status).toBe(403);
+
+      const forbiddenTimeline = await request(http)
+        .get(`${API_PREFIX}/audit-logs/entity/JournalEntry/${targetEntityId}`)
+        .set('Authorization', `Bearer ${cashierToken}`);
+      expect(forbiddenTimeline.status).toBe(403);
+
+      // 3. Token lacking audit_log.export => 403
+      const forbiddenExport = await request(http)
+        .get(`${API_PREFIX}/audit-logs/export-preview`)
+        .set('Authorization', `Bearer ${cashierToken}`);
+      expect(forbiddenExport.status).toBe(403);
+    }
+  });
+
+  it('15A-B-5.7) Sensitive metadata fields are redacted to [REDACTED]', async () => {
+    const res = await request(http)
+      .get(`${API_PREFIX}/audit-logs/${redactedLogId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.item.id).toBe(redactedLogId);
+
+    const meta = res.body.data.item.metadata;
+    expect(meta).toBeDefined();
+    expect(meta.password).toBe('[REDACTED]');
+    expect(meta.token).toBe('[REDACTED]');
+    expect(meta.authorization).toBe('[REDACTED]');
+    expect(meta.cookie).toBe('[REDACTED]');
+    expect(meta.apiKey).toBe('[REDACTED]');
+    expect(meta.safeField).toBe('normalValue');
+
+    // Confirm raw sensitive values are nowhere in response body string
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toContain('SuperSecretPassword123!');
+    expect(bodyStr).not.toContain('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sensitive');
+    expect(bodyStr).not.toContain('secret_token_xyz');
+    expect(bodyStr).not.toContain('abc123secret');
+    expect(bodyStr).not.toContain('sk_live_1234567890abcdef');
+  });
+
+  it('15A-B-5.8) Tenant isolation: company A cannot see company B audit logs', async () => {
+    // 1. List logs as admin of adminCompanyId
+    const res = await request(http)
+      .get(`${API_PREFIX}/audit-logs`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    const itemIds = res.body.data.items.map((i: any) => i.id);
+    expect(itemIds).not.toContain(otherCompanyLogId);
+
+    // 2. Direct lookup of other company's log returns 404
+    const resGetOther = await request(http)
+      .get(`${API_PREFIX}/audit-logs/${otherCompanyLogId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(resGetOther.status).toBe(404);
+
+    // 3. Entity timeline for other company's entity returns empty items
+    const resTimelineOther = await request(http)
+      .get(`${API_PREFIX}/audit-logs/entity/SystemEntity/sys-${otherCompanyLogId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(resTimelineOther.status).toBe(200);
+    expect(resTimelineOther.body.data.items).toHaveLength(0);
+  });
+
+  it('15A-B-5.9) Pagination limit and invalid query parameter validation', async () => {
+    // 1. Limit parameter bounds returned items
+    const resLimit = await request(http)
+      .get(`${API_PREFIX}/audit-logs`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .query({ limit: 1 });
+
+    expect(resLimit.status).toBe(200);
+    expect(resLimit.body.data.items.length).toBe(1);
+    expect(resLimit.body.data.nextCursor).toBeDefined();
+
+    // 2. Cursor pagination fetches next page
+    if (resLimit.body.data.nextCursor) {
+      const resCursor = await request(http)
+        .get(`${API_PREFIX}/audit-logs`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .query({ cursor: resLimit.body.data.nextCursor, limit: 1 });
+
+      expect(resCursor.status).toBe(200);
+      expect(resCursor.body.data.items[0]?.id).not.toBe(resLimit.body.data.items[0]?.id);
+    }
+
+    // 3. Invalid enum category rejected with 400
+    const resBadCategory = await request(http)
+      .get(`${API_PREFIX}/audit-logs`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .query({ category: 'NON_EXISTENT_CATEGORY' });
+
+    expect(resBadCategory.status).toBe(400);
   });
 });
 
