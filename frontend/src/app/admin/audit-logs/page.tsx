@@ -1,42 +1,24 @@
 'use client';
 
 // =====================================================
-// Phase 15A-C: Audit Log Frontend Viewer Workspace
+// Phase 18A-B-5: Audit Log Frontend Viewer Workspace UX Polish
 // Route: /admin/audit-logs
 //
-// Features:
-// 1. Permission Gating:
-//    - Requires auth and `audit_log.read` to view
-//    - `audit_log.export` gates the Export Preview action
-//    - `audit_log.admin` displayed as administrative privilege indicator
-// 2. Filter Bar:
-//    - fromDate, toDate, category (11 enums), event, severity (4 enums),
-//      status (3 enums), actorUserId, entityType, entityId, requestId, limit
-//    - Apply and Reset actions
-// 3. Audit Log Table:
-//    - Color badges:
-//        INFO/SUCCESS: emerald/green
-//        WARNING/BLOCKED: amber/yellow
-//        ERROR/SECURITY: rose/red
-//    - Display createdAt, actor, category, event, entity, status, severity, message
-// 4. Details Drawer/Modal:
-//    - Fetches by ID via GET /api/audit-logs/:id
-//    - Read-only pretty-printed JSON for before, after, metadata
-//    - Context: actor, request, route, IP, userAgent
-// 5. Entity Timeline Drawer/Modal:
-//    - Fetches by entity via GET /api/audit-logs/entity/:entityType/:entityId
-//    - Chronological event timeline for the entity
-// 6. Export Preview Modal:
-//    - Gated by `audit_log.export`
-//    - Fetches count & status via GET /api/audit-logs/export-preview
-//    - Shows clear note that direct file download is out of scope / append-only
-// 7. Security:
-//    - Zero client-side unredaction; zero localStorage; zero file downloads.
+// - Modern Arabic / RTL-friendly SaaS interface.
+// - Standardized PageHeader ("سجل النشاطات والتدقيق").
+// - Top KPI summary cards for Total Displayed, High Severity, Success,
+//   and Warning/Failure events.
+// - Modern SectionCard containers for Filter Bar and Audit Records Table.
+// - Enhanced details drawer/modal, entity timeline, and export preview modal.
+// - Read-only safety preserved: zero client-side unredaction, zero local storage,
+//   zero download implementation (export preview only).
+// - Preserves 100% of permissions (`audit_log.read`, `audit_log.export`,
+//   `audit_log.admin`).
 // =====================================================
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 import {
   api,
@@ -48,6 +30,17 @@ import {
   AuditSeverityKey,
   AuditStatusKey,
 } from '@/lib/api';
+import {
+  PageHeader,
+  KpiCard,
+  SectionCard,
+  FilterSection,
+  StatusBadge,
+  EmptyState,
+  LoadingState,
+  ErrorBanner,
+  AccessDeniedState,
+} from '@/components/ui';
 
 // ---------- Constants --------------------------------------------
 
@@ -93,7 +86,7 @@ function formatDateTime(val: string | null | undefined): string {
 
 // ---------- Badges -----------------------------------------------
 
-function StatusBadge({ status }: { status: AuditStatusKey }) {
+function AuditStatusBadge({ status }: { status: AuditStatusKey }) {
   switch (status) {
     case 'SUCCESS':
       return (
@@ -124,31 +117,31 @@ function SeverityBadge({ severity }: { severity: AuditSeverityKey }) {
   switch (severity) {
     case 'INFO':
       return (
-        <span className="inline-flex items-center rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700 border border-slate-200">
+        <span className="inline-flex items-center rounded-lg bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-700 border border-slate-200">
           INFO
         </span>
       );
     case 'WARNING':
       return (
-        <span className="inline-flex items-center rounded-md bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 border border-amber-200">
+        <span className="inline-flex items-center rounded-lg bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800 border border-amber-200">
           WARNING
         </span>
       );
     case 'ERROR':
       return (
-        <span className="inline-flex items-center rounded-md bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-800 border border-rose-200">
+        <span className="inline-flex items-center rounded-lg bg-rose-100 px-2.5 py-0.5 text-xs font-medium text-rose-800 border border-rose-200">
           ERROR
         </span>
       );
     case 'SECURITY':
       return (
-        <span className="inline-flex items-center rounded-md bg-purple-100 px-2 py-0.5 text-xs font-semibold text-purple-900 border border-purple-300">
+        <span className="inline-flex items-center rounded-lg bg-purple-100 px-2.5 py-0.5 text-xs font-semibold text-purple-900 border border-purple-300">
           🔒 SECURITY
         </span>
       );
     default:
       return (
-        <span className="inline-flex items-center rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
+        <span className="inline-flex items-center rounded-lg bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-700">
           {severity}
         </span>
       );
@@ -157,7 +150,7 @@ function SeverityBadge({ severity }: { severity: AuditSeverityKey }) {
 
 function CategoryBadge({ category }: { category: AuditCategoryKey }) {
   return (
-    <span className="inline-flex items-center rounded-md bg-slate-50 px-2 py-0.5 text-xs font-mono font-medium text-slate-700 border border-slate-200">
+    <span className="inline-flex items-center rounded-lg bg-slate-50 px-2 py-0.5 text-xs font-mono font-medium text-slate-700 border border-slate-200">
       {category}
     </span>
   );
@@ -334,7 +327,6 @@ export default function AdminAuditLogsPage() {
       const res = await api.getAuditLogById(logItem.id);
       setSelectedLog(res.data.item);
     } catch (err) {
-      // If fetching single item fails, retain the row data we already have
       const msg =
         err instanceof ApiError
           ? err.message
@@ -426,14 +418,21 @@ export default function AdminAuditLogsPage() {
     setExportError(null);
   };
 
+  // ---- Derived KPIs ---------------------------------------------
+  const totalEventsCount = logs.length;
+  const highSeverityCount = logs.filter(
+    (l) => l.severity === 'ERROR' || l.severity === 'SECURITY',
+  ).length;
+  const successEventsCount = logs.filter((l) => l.status === 'SUCCESS').length;
+  const warningOrFailureCount = logs.filter(
+    (l) => l.status === 'FAILURE' || l.status === 'BLOCKED' || l.severity === 'WARNING',
+  ).length;
+
   // ---- Render Guards --------------------------------------------
   if (authLoading) {
     return (
-      <main className="min-h-screen flex items-center justify-center p-8 bg-slate-50">
-        <div className="text-center">
-          <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-solid border-slate-700 border-r-transparent mb-3" />
-          <p className="text-slate-500">جاري التحقق من الهوية...</p>
-        </div>
+      <main className="min-h-screen flex items-center justify-center p-8 bg-slate-50" dir="rtl">
+        <LoadingState message="جاري التحقق من الهوية والصلاحيات..." />
       </main>
     );
   }
@@ -442,326 +441,329 @@ export default function AdminAuditLogsPage() {
 
   if (!canRead) {
     return (
-      <main className="min-h-screen flex items-center justify-center p-8 bg-slate-50">
-        <div className="max-w-md rounded-2xl border border-rose-200 bg-white p-6 text-center shadow-sm">
-          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-rose-100 text-rose-600 text-xl font-bold">
-            🚫
-          </div>
-          <h2 className="text-lg font-bold text-slate-900 mb-2">غير مصرح — Access Denied</h2>
-          <p className="text-sm text-slate-600 mb-4">
-            يتطلب استعراض سجل التدقيق توفر صلاحية <code>audit_log.read</code>. يرجى مراجعة مسؤول النظام لمنحك الصلاحية.
-          </p>
-          <Link
-            href="/dashboard"
-            className="inline-block rounded-lg bg-slate-800 px-4 py-2 text-sm text-white hover:bg-slate-700"
-          >
-            العودة إلى لوحة المعلومات
-          </Link>
-        </div>
+      <main className="min-h-screen flex items-center justify-center p-8 bg-slate-50" dir="rtl">
+        <AccessDeniedState
+          title="غير مصرح — Access Denied"
+          description="يتطلب استعراض سجل التدقيق توفر صلاحية audit_log.read. يرجى مراجعة مسؤول النظام لمنحك الصلاحية."
+          returnHref="/dashboard"
+          returnLabel="العودة إلى لوحة التحكم"
+          requiredPermission="audit_log.read"
+        />
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-slate-50 p-6 md:p-8">
-      {/* Header */}
-      <header className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-900 text-white font-bold text-lg shadow-sm">
-              🛡️
-            </span>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-2xl md:text-3xl font-bold text-slate-900">
-                  سجل التدقيق والعمليات (Audit Logs)
-                </h1>
-                {isAdmin && (
-                  <span className="rounded-full bg-purple-100 px-2.5 py-0.5 text-xs font-semibold text-purple-800 border border-purple-200">
-                    مدير النظام (Admin)
-                  </span>
-                )}
-              </div>
-              <p className="text-sm text-slate-500 mt-0.5">
-                سجل رقابي مركزي غير قابل للتعديل أو الحذف (Append-only) لكافة العمليات المالية والأمنية والإدارية
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {canExport && (
-            <button
-              onClick={handleOpenExportPreview}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-100 transition-colors"
+    <main className="min-h-screen bg-slate-50 p-6 md:p-8 text-slate-800" dir="rtl">
+      {/* Standardized Header */}
+      <PageHeader
+        eyebrow="التدقيق والامتثال"
+        title="سجل النشاطات والتدقيق"
+        subtitle="عرض أحداث النظام المصرّح بها بشكل read-only مع إخفاء البيانات الحساسة."
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            {isAdmin && (
+              <span className="rounded-full bg-purple-100 px-3 py-1 text-xs font-semibold text-purple-800 border border-purple-200">
+                مدير النظام (Admin)
+              </span>
+            )}
+            {canExport && (
+              <button
+                onClick={handleOpenExportPreview}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-xs hover:bg-slate-100 transition"
+              >
+                <span>📥</span>
+                <span>معاينة التصدير (Export Preview)</span>
+              </button>
+            )}
+            <Link
+              href="/accounting"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-xs hover:bg-slate-100 transition"
             >
-              📥 معاينة التصدير (Export Preview)
-            </button>
-          )}
-          <Link
-            href="/accounting"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 transition-colors"
-          >
-            📖 المحاسبة
-          </Link>
-          <Link
-            href="/dashboard"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 transition-colors"
-          >
-            لوحة المعلومات
-          </Link>
-        </div>
-      </header>
+              <span>📖</span>
+              <span>المحاسبة</span>
+            </Link>
+            <Link
+              href="/dashboard"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-800 transition shadow-xs"
+            >
+              لوحة التحكم
+            </Link>
+          </div>
+        }
+      />
+
+      {/* KPI Cards Row */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <KpiCard
+          label="إجمالي الأحداث المعروضة"
+          value={loading ? '...' : totalEventsCount}
+          helperText={nextCursor ? 'توجد صفحات إضافية قابلة للتحميل' : 'كافة السجلات المحملة حالياً'}
+          icon={<span className="text-slate-700">📜</span>}
+        />
+        <KpiCard
+          label="أحداث عالية الأهمية"
+          value={loading ? '...' : highSeverityCount}
+          helperText="عمليات أمنية وأخطاء حرجة (Security / Error)"
+          tone={highSeverityCount > 0 ? 'danger' : 'neutral'}
+          icon={<span className="text-rose-600">🛡️</span>}
+        />
+        <KpiCard
+          label="عمليات ناجحة (SUCCESS)"
+          value={loading ? '...' : successEventsCount}
+          helperText="عمليات تم تنفيذها وترحيلها بنجاح"
+          tone="success"
+          icon={<span className="text-emerald-600">✓</span>}
+        />
+        <KpiCard
+          label="تحذيرات وحالات فشل"
+          value={loading ? '...' : warningOrFailureCount}
+          helperText="أحداث تحذيرية أو محظورة أو فاشلة"
+          tone={warningOrFailureCount > 0 ? 'warning' : 'neutral'}
+          icon={<span className="text-amber-600">⚠️</span>}
+        />
+      </div>
 
       {/* Compliance / Security Info Banner */}
-      <div className="mb-6 rounded-xl border border-indigo-100 bg-indigo-50/60 p-4 text-xs text-indigo-900 flex items-start gap-3">
-        <span className="text-base">ℹ️</span>
-        <div className="leading-relaxed">
-          <p className="font-semibold mb-0.5">معايير أمان سجلات التدقيق (Audit Trail Security):</p>
-          <p className="text-indigo-800/90">
-            جميع السجلات مشفرة ومحفوظة بصيغة تسلسلية غير قابلة للإلغاء أو التعديل. يتم تسجيل المستخدم المنفذ، الكيان المستهدف،
-            معرف الطلب (Request ID)، التغييرات قبل وبعد العملية، مع حجب البيانات الحساسة تلقائياً في الواجهة الخلفية.
-          </p>
+      <div className="mb-6 rounded-2xl border border-indigo-100 bg-indigo-50/70 p-4 text-xs text-indigo-950 shadow-xs">
+        <div className="flex items-start gap-3">
+          <span className="text-lg">ℹ️</span>
+          <div className="leading-relaxed space-y-1">
+            <p className="font-bold text-indigo-950 text-sm">معايير أمان سجلات التدقيق (Audit Trail Security):</p>
+            <p className="text-indigo-900/90">
+              كافة سجلات النظام محفوظة بصيغة تسلسلية غير قابلة للإلغاء أو التعديل (Append-only). يتم تسجيل المستخدم المنفذ،
+              الكيان المستهدف، معرف الربط (Request ID)، والتغييرات السابقة واللاحقة مع حجب البيانات السرية والشخصية تلقائياً في الخادم.
+            </p>
+          </div>
         </div>
       </div>
 
-      {/* Filter Bar */}
-      <section className="mb-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-        <form onSubmit={handleApplyFilters}>
-          <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
-            <h2 className="text-sm font-bold text-slate-800 flex items-center gap-2">
-              <span>🔍</span> تصفية سجل التدقيق (Filters)
-            </h2>
+      {/* Filter Section */}
+      <div className="mb-6">
+        <SectionCard
+          title="تصفية سجل التدقيق والعمليات"
+          description="ابحث في سجلات التدقيق حسب التاريخ، التصنيف، الحدث، الكيان، أو المستخدم المنفذ"
+          actions={
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={handleResetFilters}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 transition-colors"
+                className="rounded-xl border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 transition"
               >
                 إعادة ضبط
               </button>
               <button
-                type="submit"
-                className="rounded-lg bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-slate-800 transition-colors"
+                type="button"
+                onClick={() => handleApplyFilters()}
+                className="rounded-xl bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-slate-800 transition"
               >
                 تطبيق التصفية
               </button>
             </div>
-          </div>
+          }
+        >
+          <form onSubmit={handleApplyFilters} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 text-xs">
+              {/* fromDate */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">من تاريخ (fromDate)</label>
+                <input
+                  type="datetime-local"
+                  value={filters.fromDate}
+                  onChange={(e) => setFilters({ ...filters, fromDate: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                />
+              </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 text-xs">
-            {/* fromDate */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">من تاريخ (fromDate)</label>
-              <input
-                type="datetime-local"
-                value={filters.fromDate}
-                onChange={(e) => setFilters({ ...filters, fromDate: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none"
-              />
-            </div>
+              {/* toDate */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">إلى تاريخ (toDate)</label>
+                <input
+                  type="datetime-local"
+                  value={filters.toDate}
+                  onChange={(e) => setFilters({ ...filters, toDate: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                />
+              </div>
 
-            {/* toDate */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">إلى تاريخ (toDate)</label>
-              <input
-                type="datetime-local"
-                value={filters.toDate}
-                onChange={(e) => setFilters({ ...filters, toDate: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none"
-              />
-            </div>
+              {/* Category */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">التصنيف (Category)</label>
+                <select
+                  value={filters.category}
+                  onChange={(e) => setFilters({ ...filters, category: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                >
+                  <option value="">جميع التصنيفات (All)</option>
+                  {AUDIT_CATEGORIES.map((c) => (
+                    <option key={c.key} value={c.key}>
+                      {c.labelAr}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            {/* Category */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">التصنيف (Category)</label>
-              <select
-                value={filters.category}
-                onChange={(e) => setFilters({ ...filters, category: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
-              >
-                <option value="">جميع التصنيفات (All)</option>
-                {AUDIT_CATEGORIES.map((c) => (
-                  <option key={c.key} value={c.key}>
-                    {c.labelAr}
-                  </option>
-                ))}
-              </select>
-            </div>
+              {/* Event */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">الحدث (Event)</label>
+                <input
+                  type="text"
+                  placeholder="مثال: JOURNAL_POSTED, AUTH_LOGIN"
+                  value={filters.event}
+                  onChange={(e) => setFilters({ ...filters, event: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                />
+              </div>
 
-            {/* Event */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">الحدث (Event)</label>
-              <input
-                type="text"
-                placeholder="مثال: JOURNAL_POSTED, AUTH_LOGIN"
-                value={filters.event}
-                onChange={(e) => setFilters({ ...filters, event: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none"
-              />
-            </div>
+              {/* Severity */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">مستوى الأهمية (Severity)</label>
+                <select
+                  value={filters.severity}
+                  onChange={(e) => setFilters({ ...filters, severity: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                >
+                  <option value="">جميع المستويات (All)</option>
+                  {AUDIT_SEVERITIES.map((s) => (
+                    <option key={s.key} value={s.key}>
+                      {s.labelAr}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            {/* Severity */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">مستوى الأهمية (Severity)</label>
-              <select
-                value={filters.severity}
-                onChange={(e) => setFilters({ ...filters, severity: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
-              >
-                <option value="">جميع المستويات (All)</option>
-                {AUDIT_SEVERITIES.map((s) => (
-                  <option key={s.key} value={s.key}>
-                    {s.labelAr}
-                  </option>
-                ))}
-              </select>
-            </div>
+              {/* Status */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">الحالة (Status)</label>
+                <select
+                  value={filters.status}
+                  onChange={(e) => setFilters({ ...filters, status: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                >
+                  <option value="">جميع الحالات (All)</option>
+                  {AUDIT_STATUSES.map((st) => (
+                    <option key={st.key} value={st.key}>
+                      {st.labelAr}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            {/* Status */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">الحالة (Status)</label>
-              <select
-                value={filters.status}
-                onChange={(e) => setFilters({ ...filters, status: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
-              >
-                <option value="">جميع الحالات (All)</option>
-                {AUDIT_STATUSES.map((st) => (
-                  <option key={st.key} value={st.key}>
-                    {st.labelAr}
-                  </option>
-                ))}
-              </select>
-            </div>
+              {/* Entity Type */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">نوع الكيان (Entity Type)</label>
+                <input
+                  type="text"
+                  placeholder="مثال: JournalEntry, Payment"
+                  value={filters.entityType}
+                  onChange={(e) => setFilters({ ...filters, entityType: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                />
+              </div>
 
-            {/* Entity Type */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">نوع الكيان (Entity Type)</label>
-              <input
-                type="text"
-                placeholder="مثال: JournalEntry, Payment, PeriodClose"
-                value={filters.entityType}
-                onChange={(e) => setFilters({ ...filters, entityType: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none"
-              />
-            </div>
+              {/* Entity ID */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">معرّف الكيان (Entity ID)</label>
+                <input
+                  type="text"
+                  placeholder="معرّف السجل المستهدف (UUID أو كود)"
+                  value={filters.entityId}
+                  onChange={(e) => setFilters({ ...filters, entityId: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none font-mono bg-white"
+                />
+              </div>
 
-            {/* Entity ID */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">معرّف الكيان (Entity ID)</label>
-              <input
-                type="text"
-                placeholder="معرّف السجل المستهدف (UUID أو كود)"
-                value={filters.entityId}
-                onChange={(e) => setFilters({ ...filters, entityId: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none font-mono"
-              />
-            </div>
+              {/* Actor User ID */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">المستخدم المنفذ (Actor ID)</label>
+                <input
+                  type="text"
+                  placeholder="معرّف المستخدم المنفذ"
+                  value={filters.actorUserId}
+                  onChange={(e) => setFilters({ ...filters, actorUserId: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none font-mono bg-white"
+                />
+              </div>
 
-            {/* Actor User ID */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">المستخدم المنفذ (Actor User ID)</label>
-              <input
-                type="text"
-                placeholder="معرّف المستخدم المنفذ"
-                value={filters.actorUserId}
-                onChange={(e) => setFilters({ ...filters, actorUserId: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none font-mono"
-              />
-            </div>
+              {/* Request ID */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">معرّف الطلب (Request ID)</label>
+                <input
+                  type="text"
+                  placeholder="معرّف الربط (Correlation ID)"
+                  value={filters.requestId}
+                  onChange={(e) => setFilters({ ...filters, requestId: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none font-mono bg-white"
+                />
+              </div>
 
-            {/* Request ID */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">معرّف الطلب (Request ID)</label>
-              <input
-                type="text"
-                placeholder="معرّف الربط (Correlation Request ID)"
-                value={filters.requestId}
-                onChange={(e) => setFilters({ ...filters, requestId: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none font-mono"
-              />
+              {/* Limit */}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1.5">عدد النتائج (Limit)</label>
+                <select
+                  value={filters.limit}
+                  onChange={(e) => setFilters({ ...filters, limit: Number(e.target.value) })}
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
+                >
+                  <option value={10}>10 سجلات</option>
+                  <option value={25}>25 سجل</option>
+                  <option value={50}>50 سجل</option>
+                  <option value={100}>100 سجل</option>
+                  <option value={200}>200 سجل</option>
+                </select>
+              </div>
             </div>
-
-            {/* Limit */}
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">عدد النتائج (Limit)</label>
-              <select
-                value={filters.limit}
-                onChange={(e) => setFilters({ ...filters, limit: Number(e.target.value) })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs focus:border-slate-500 focus:outline-none bg-white"
-              >
-                <option value={10}>10 سجلات</option>
-                <option value={25}>25 سجل</option>
-                <option value={50}>50 سجل</option>
-                <option value={100}>100 سجل</option>
-                <option value={200}>200 سجل</option>
-              </select>
-            </div>
-          </div>
-        </form>
-      </section>
+          </form>
+        </SectionCard>
+      </div>
 
       {/* Error Alert */}
       {error && (
-        <div className="mb-6 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800 flex items-start justify-between">
-          <div className="flex items-center gap-2">
-            <span>⚠️</span>
-            <span>{error}</span>
-          </div>
-          <button
-            onClick={() => fetchLogs(activeFilters)}
-            className="text-xs font-semibold underline hover:text-rose-900"
-          >
-            إعادة المحاولة
-          </button>
+        <div className="mb-6">
+          <ErrorBanner
+            title="خطأ في استرجاع السجلات"
+            message={error}
+            onRetry={() => fetchLogs(activeFilters)}
+          />
         </div>
       )}
 
-      {/* Table Card */}
-      <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-        <div className="flex items-center justify-between p-4 border-b border-slate-200 bg-slate-50/50">
-          <div className="flex items-center gap-2 text-xs text-slate-600">
-            <span className="font-semibold text-slate-900">{logs.length}</span>
-            <span>سجل معروض</span>
-            {nextCursor && <span className="text-amber-600 font-medium">(توجد صفحات تالية)</span>}
+      {/* Records Table Section */}
+      <SectionCard
+        title="سجلات العمليات والتدقيق"
+        description={`عرض السجلات المرتبطة بالشركة: ${user.companyId}`}
+        actions={
+          <div className="flex items-center gap-2 text-xs text-slate-600 font-medium">
+            <span className="font-bold text-slate-900 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200">
+              {logs.length} سجل معروض
+            </span>
+            {nextCursor && <span className="text-amber-700">(توجد صفحات تالية)</span>}
           </div>
-          <div className="text-xs text-slate-500">
-            الشركة: <span className="font-mono">{user.companyId}</span>
-          </div>
-        </div>
-
-        {/* Loading Spinner */}
+        }
+      >
         {loading ? (
-          <div className="p-12 text-center">
-            <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-solid border-slate-700 border-r-transparent mb-3" />
-            <p className="text-xs text-slate-500">جاري تحميل سجلات التدقيق...</p>
+          <div className="py-12">
+            <LoadingState message="جاري استرجاع سجلات التدقيق..." />
           </div>
         ) : logs.length === 0 ? (
-          /* Empty State */
-          <div className="p-12 text-center">
-            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-400 text-xl">
-              📂
-            </div>
-            <h3 className="text-sm font-semibold text-slate-800 mb-1">
-              لا توجد سجلات تدقيق مطابقة للشروط
-            </h3>
-            <p className="text-xs text-slate-500 mb-4 max-w-sm mx-auto">
-              لم يتم العثور على أي عمليات مسجلة بالمعايير الحالية. يمكنك تعديل أو إعادة ضبط فلاتر البحث.
-            </p>
-            <button
-              onClick={handleResetFilters}
-              className="rounded-lg border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
-            >
-              إعادة ضبط الفلاتر
-            </button>
-          </div>
+          <EmptyState
+            title="لا توجد سجلات تدقيق مطابقة للشروط"
+            description="لم يتم العثور على أي عمليات مسجلة بالمعايير الحالية. يمكنك تعديل أو إعادة ضبط فلاتر البحث."
+            action={
+              <button
+                type="button"
+                onClick={handleResetFilters}
+                className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition shadow-xs"
+              >
+                إعادة ضبط الفلاتر
+              </button>
+            }
+          />
         ) : (
-          /* Table */
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs">
             <table className="w-full text-right border-collapse text-xs">
               <thead>
-                <tr className="border-b border-slate-200 bg-slate-100/70 text-slate-700 font-semibold">
+                <tr className="border-b border-slate-200 bg-slate-100/80 text-slate-700 font-semibold">
                   <th className="py-3 px-4">التاريخ والوقت</th>
                   <th className="py-3 px-4">المنفذ (Actor)</th>
                   <th className="py-3 px-4">التصنيف</th>
@@ -791,13 +793,13 @@ export default function AdminAuditLogsPage() {
                       <td className="py-3 px-4">
                         {item.actorUser ? (
                           <div>
-                            <p className="font-semibold text-slate-900">{item.actorUser.fullName}</p>
+                            <p className="font-bold text-slate-900">{item.actorUser.fullName}</p>
                             <p className="text-[11px] text-slate-400 font-mono">{item.actorUser.email}</p>
                           </div>
                         ) : item.actorUserId ? (
                           <span className="font-mono text-slate-600 text-[11px]">{item.actorUserId}</span>
                         ) : (
-                          <span className="inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-mono text-slate-600">
+                          <span className="inline-flex rounded bg-slate-100 px-2 py-0.5 text-[10px] font-mono text-slate-600">
                             {item.actorType}
                           </span>
                         )}
@@ -809,7 +811,7 @@ export default function AdminAuditLogsPage() {
                       </td>
 
                       {/* event */}
-                      <td className="py-3 px-4 font-mono font-medium text-slate-800 whitespace-nowrap">
+                      <td className="py-3 px-4 font-mono font-semibold text-slate-800 whitespace-nowrap">
                         {item.event}
                       </td>
 
@@ -817,8 +819,8 @@ export default function AdminAuditLogsPage() {
                       <td className="py-3 px-4 font-mono text-[11px]">
                         {hasEntity ? (
                           <div>
-                            <span className="font-semibold text-slate-700">{item.entityType}</span>
-                            <span className="text-slate-400 mr-1">/</span>
+                            <span className="font-bold text-slate-700">{item.entityType}</span>
+                            <span className="text-slate-400 mx-1">#</span>
                             <span className="text-slate-600 truncate max-w-[120px] inline-block align-bottom" title={item.entityId ?? ''}>
                               {item.entityId}
                             </span>
@@ -830,7 +832,7 @@ export default function AdminAuditLogsPage() {
 
                       {/* status */}
                       <td className="py-3 px-4 whitespace-nowrap">
-                        <StatusBadge status={item.status} />
+                        <AuditStatusBadge status={item.status} />
                       </td>
 
                       {/* severity */}
@@ -852,7 +854,7 @@ export default function AdminAuditLogsPage() {
                           <button
                             type="button"
                             onClick={() => handleOpenDetails(item)}
-                            className="rounded px-2 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-50 transition-colors"
+                            className="rounded-lg px-2.5 py-1 text-xs font-semibold text-indigo-700 hover:bg-indigo-50 transition"
                           >
                             التفاصيل
                           </button>
@@ -862,7 +864,7 @@ export default function AdminAuditLogsPage() {
                               onClick={() =>
                                 handleOpenEntityTimeline(item.entityType!, item.entityId!)
                               }
-                              className="rounded px-2 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50 transition-colors"
+                              className="rounded-lg px-2.5 py-1 text-xs font-semibold text-teal-700 hover:bg-teal-50 transition"
                               title="استعراض المخطط الزمني لهذا الكيان"
                             >
                               المخطط
@@ -880,11 +882,11 @@ export default function AdminAuditLogsPage() {
 
         {/* Next page pagination footer */}
         {nextCursor && !loading && (
-          <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-center">
+          <div className="p-4 border-t border-slate-200 bg-slate-50/70 flex items-center justify-center">
             <button
               onClick={handleLoadNextPage}
               disabled={loadingMore}
-              className="inline-flex items-center gap-2 rounded-lg bg-white border border-slate-300 px-5 py-2 text-xs font-semibold text-slate-800 shadow-sm hover:bg-slate-100 disabled:opacity-50 transition-colors"
+              className="inline-flex items-center gap-2 rounded-xl bg-white border border-slate-300 px-5 py-2.5 text-xs font-semibold text-slate-800 shadow-xs hover:bg-slate-100 disabled:opacity-50 transition"
             >
               {loadingMore ? (
                 <>
@@ -900,7 +902,7 @@ export default function AdminAuditLogsPage() {
             </button>
           </div>
         )}
-      </div>
+      </SectionCard>
 
       {/* ============================================================= */}
       {/* 1. Details Drawer / Modal */}
@@ -911,7 +913,7 @@ export default function AdminAuditLogsPage() {
             {/* Modal Header */}
             <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4 bg-slate-50">
               <div className="flex items-center gap-3">
-                <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-white font-bold text-sm">
+                <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-900 text-white font-bold text-sm">
                   📄
                 </span>
                 <div>
@@ -926,7 +928,7 @@ export default function AdminAuditLogsPage() {
               </div>
               <button
                 onClick={handleCloseDetails}
-                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-200 hover:text-slate-700 transition-colors"
+                className="rounded-xl p-1.5 text-slate-400 hover:bg-slate-200 hover:text-slate-700 transition"
               >
                 ✕
               </button>
@@ -935,18 +937,18 @@ export default function AdminAuditLogsPage() {
             {/* Modal Body */}
             <div className="flex-1 overflow-y-auto p-6 space-y-6 text-xs">
               {detailsError && (
-                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
                   {detailsError} (يتم عرض البيانات المتاحة محلياً).
                 </div>
               )}
 
               {/* Badges & Timestamp */}
-              <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-xl bg-slate-50 border border-slate-200">
+              <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl bg-slate-50 border border-slate-200">
                 <div className="flex flex-wrap items-center gap-2">
                   <CategoryBadge category={selectedLog.category} />
-                  <StatusBadge status={selectedLog.status} />
+                  <AuditStatusBadge status={selectedLog.status} />
                   <SeverityBadge severity={selectedLog.severity} />
-                  <span className="rounded bg-slate-200 px-2 py-0.5 font-mono text-[11px] text-slate-700">
+                  <span className="rounded-lg bg-slate-200 px-2 py-0.5 font-mono text-[11px] text-slate-700">
                     {selectedLog.actorType}
                   </span>
                 </div>
@@ -959,7 +961,7 @@ export default function AdminAuditLogsPage() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 rounded-xl border border-slate-200 p-4">
                 <div>
                   <p className="text-slate-400 mb-1">المنفذ (Actor):</p>
-                  <p className="font-semibold text-slate-800">
+                  <p className="font-bold text-slate-800">
                     {selectedLog.actorUser
                       ? `${selectedLog.actorUser.fullName} (${selectedLog.actorUser.email})`
                       : selectedLog.actorUserId || selectedLog.actorType}
@@ -975,11 +977,11 @@ export default function AdminAuditLogsPage() {
                   <p className="text-slate-400 mb-1">الكيان المستهدف (Target Entity):</p>
                   {selectedLog.entityType ? (
                     <div>
-                      <span className="font-semibold text-slate-800">{selectedLog.entityType}</span>
+                      <span className="font-bold text-slate-800">{selectedLog.entityType}</span>
                       <span className="text-slate-400 mx-1">#</span>
                       <span className="font-mono text-slate-700">{selectedLog.entityId || '—'}</span>
                       {selectedLog.action && (
-                        <span className="mr-2 inline-block rounded bg-indigo-50 px-1.5 py-0.5 text-[11px] text-indigo-700 font-mono">
+                        <span className="mr-2 inline-block rounded bg-indigo-50 px-2 py-0.5 text-[11px] text-indigo-700 font-mono">
                           action: {selectedLog.action}
                         </span>
                       )}
@@ -1043,7 +1045,7 @@ export default function AdminAuditLogsPage() {
                     <button
                       type="button"
                       onClick={() => setActiveJsonTab('metadata')}
-                      className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                      className={`rounded-lg px-3 py-1 text-xs font-semibold transition ${
                         activeJsonTab === 'metadata'
                           ? 'bg-slate-900 text-white'
                           : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -1054,7 +1056,7 @@ export default function AdminAuditLogsPage() {
                     <button
                       type="button"
                       onClick={() => setActiveJsonTab('before')}
-                      className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                      className={`rounded-lg px-3 py-1 text-xs font-semibold transition ${
                         activeJsonTab === 'before'
                           ? 'bg-slate-900 text-white'
                           : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -1065,7 +1067,7 @@ export default function AdminAuditLogsPage() {
                     <button
                       type="button"
                       onClick={() => setActiveJsonTab('after')}
-                      className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                      className={`rounded-lg px-3 py-1 text-xs font-semibold transition ${
                         activeJsonTab === 'after'
                           ? 'bg-slate-900 text-white'
                           : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -1116,7 +1118,7 @@ export default function AdminAuditLogsPage() {
                       handleCloseDetails();
                       void handleOpenEntityTimeline(et, eid);
                     }}
-                    className="inline-flex items-center gap-1 rounded-lg border border-teal-300 bg-teal-50 px-3.5 py-1.5 text-xs font-semibold text-teal-800 hover:bg-teal-100 transition-colors"
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-teal-300 bg-teal-50 px-3.5 py-2 text-xs font-semibold text-teal-800 hover:bg-teal-100 transition shadow-xs"
                   >
                     <span>⏱️</span>
                     <span>استعراض المخطط الزمني لهذا الكيان ({selectedLog.entityType})</span>
@@ -1126,7 +1128,7 @@ export default function AdminAuditLogsPage() {
               <button
                 type="button"
                 onClick={handleCloseDetails}
-                className="rounded-lg bg-slate-800 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-700 transition-colors"
+                className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition shadow-xs"
               >
                 إغلاق
               </button>
@@ -1144,7 +1146,7 @@ export default function AdminAuditLogsPage() {
             {/* Header */}
             <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4 bg-slate-50">
               <div className="flex items-center gap-3">
-                <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-teal-700 text-white font-bold text-sm">
+                <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-teal-700 text-white font-bold text-sm">
                   ⏱️
                 </span>
                 <div>
@@ -1161,7 +1163,7 @@ export default function AdminAuditLogsPage() {
               </div>
               <button
                 onClick={handleCloseEntityTimeline}
-                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-200 hover:text-slate-700 transition-colors"
+                className="rounded-xl p-1.5 text-slate-400 hover:bg-slate-200 hover:text-slate-700 transition"
               >
                 ✕
               </button>
@@ -1170,65 +1172,65 @@ export default function AdminAuditLogsPage() {
             {/* Body */}
             <div className="flex-1 overflow-y-auto p-6">
               {loadingTimeline ? (
-                <div className="p-12 text-center">
-                  <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-solid border-teal-700 border-r-transparent mb-3" />
-                  <p className="text-xs text-slate-500">جاري تحميل سجلات الكيان...</p>
+                <div className="py-12">
+                  <LoadingState message="جاري استرجاع سجلات الكيان..." />
                 </div>
               ) : timelineError ? (
-                <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-xs text-rose-800">
-                  {timelineError}
+                <div className="mb-4">
+                  <ErrorBanner title="خطأ في استرجاع المخطط" message={timelineError} />
                 </div>
               ) : timelineLogs.length === 0 ? (
-                <div className="p-8 text-center text-slate-500 text-xs">
-                  لا توجد سجلات تدقيق إضافية لهذا الكيان.
-                </div>
+                <EmptyState
+                  title="لا توجد سجلات تدقيق لهذا الكيان"
+                  description="لم يتم العثور على أحداث مسجلة لهذا الكيان بالتحديد."
+                />
               ) : (
-                <div className="overflow-x-auto">
+                <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs">
                   <table className="w-full text-right border-collapse text-xs">
                     <thead>
-                      <tr className="border-b border-slate-200 bg-slate-100/70 text-slate-700 font-semibold">
-                        <th className="py-2.5 px-3">التاريخ والوقت</th>
-                        <th className="py-2.5 px-3">الحدث (Event)</th>
-                        <th className="py-2.5 px-3">الإجراء (Action)</th>
-                        <th className="py-2.5 px-3">التصنيف</th>
-                        <th className="py-2.5 px-3">الحالة</th>
-                        <th className="py-2.5 px-3">الأهمية</th>
-                        <th className="py-2.5 px-3">الرسالة</th>
-                        <th className="py-2.5 px-3 text-center">التفاصيل</th>
+                      <tr className="border-b border-slate-200 bg-slate-100/80 text-slate-700 font-semibold">
+                        <th className="py-3 px-3.5">التاريخ والوقت</th>
+                        <th className="py-3 px-3.5">الحدث (Event)</th>
+                        <th className="py-3 px-3.5">الإجراء (Action)</th>
+                        <th className="py-3 px-3.5">التصنيف</th>
+                        <th className="py-3 px-3.5">الحالة</th>
+                        <th className="py-3 px-3.5">الأهمية</th>
+                        <th className="py-3 px-3.5">الرسالة</th>
+                        <th className="py-3 px-3.5 text-center">التفاصيل</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {timelineLogs.map((tl) => (
                         <tr key={tl.id} className="hover:bg-slate-50">
-                          <td className="py-2.5 px-3 font-mono text-slate-600 whitespace-nowrap">
+                          <td className="py-3 px-3.5 font-mono text-slate-600 whitespace-nowrap">
                             {formatDateTime(tl.createdAt)}
                           </td>
-                          <td className="py-2.5 px-3 font-mono font-medium text-slate-800">
+                          <td className="py-3 px-3.5 font-mono font-bold text-slate-800">
                             {tl.event}
                           </td>
-                          <td className="py-2.5 px-3 font-mono text-slate-600">
+                          <td className="py-3 px-3.5 font-mono text-slate-600">
                             {tl.action || '—'}
                           </td>
-                          <td className="py-2.5 px-3">
+                          <td className="py-3 px-3.5">
                             <CategoryBadge category={tl.category} />
                           </td>
-                          <td className="py-2.5 px-3">
-                            <StatusBadge status={tl.status} />
+                          <td className="py-3 px-3.5">
+                            <AuditStatusBadge status={tl.status} />
                           </td>
-                          <td className="py-2.5 px-3">
+                          <td className="py-3 px-3.5">
                             <SeverityBadge severity={tl.severity} />
                           </td>
-                          <td className="py-2.5 px-3 text-slate-700 max-w-xs truncate" title={tl.message ?? ''}>
+                          <td className="py-3 px-3.5 text-slate-700 max-w-xs truncate" title={tl.message ?? ''}>
                             {tl.message || '—'}
                           </td>
-                          <td className="py-2.5 px-3 text-center">
+                          <td className="py-3 px-3.5 text-center">
                             <button
                               type="button"
                               onClick={() => {
                                 handleCloseEntityTimeline();
                                 void handleOpenDetails(tl);
                               }}
-                              className="rounded px-2 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-50"
+                              className="rounded-lg px-2.5 py-1 text-xs font-semibold text-indigo-700 hover:bg-indigo-50 transition"
                             >
                               عرض
                             </button>
@@ -1246,7 +1248,7 @@ export default function AdminAuditLogsPage() {
               <button
                 type="button"
                 onClick={handleCloseEntityTimeline}
-                className="rounded-lg bg-slate-800 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-700 transition-colors"
+                className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition shadow-xs"
               >
                 إغلاق
               </button>
@@ -1263,8 +1265,8 @@ export default function AdminAuditLogsPage() {
           <div className="relative w-full max-w-lg rounded-2xl bg-white shadow-2xl overflow-hidden p-6 space-y-4">
             {/* Header */}
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div className="flex items-center gap-2">
-                <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900 text-white text-sm">
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-slate-900 text-white text-sm">
                   📥
                 </span>
                 <h3 className="text-sm font-bold text-slate-900">
@@ -1273,7 +1275,7 @@ export default function AdminAuditLogsPage() {
               </div>
               <button
                 onClick={handleCloseExportPreview}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                className="rounded-xl p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition"
               >
                 ✕
               </button>
@@ -1281,18 +1283,17 @@ export default function AdminAuditLogsPage() {
 
             {/* Content */}
             {loadingExport ? (
-              <div className="p-8 text-center">
-                <div className="inline-block h-7 w-7 animate-spin rounded-full border-4 border-solid border-slate-700 border-r-transparent mb-2" />
-                <p className="text-xs text-slate-500">جاري احتساب عدد السجلات المطابقة...</p>
+              <div className="py-8">
+                <LoadingState message="جاري احتساب عدد السجلات المطابقة..." />
               </div>
             ) : exportError ? (
-              <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-800">
-                {exportError}
+              <div className="mb-2">
+                <ErrorBanner title="خطأ في معاينة التصدير" message={exportError} />
               </div>
             ) : exportData ? (
               <div className="space-y-4 text-xs">
                 {/* Count KPI Card */}
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-center">
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 text-center">
                   <p className="text-slate-500 mb-1">إجمالي السجلات المطابقة لشروط التصفية:</p>
                   <p className="text-3xl font-extrabold text-slate-900 font-mono">
                     {exportData.count}
@@ -1302,7 +1303,7 @@ export default function AdminAuditLogsPage() {
 
                 {/* Server Response Message */}
                 <div className="rounded-xl border border-slate-200 bg-white p-3.5">
-                  <p className="font-semibold text-slate-700 mb-1">إشعار النظام (System Message):</p>
+                  <p className="font-bold text-slate-700 mb-1">إشعار النظام (System Message):</p>
                   <p className="text-slate-600 font-mono text-[11px] leading-relaxed">
                     {exportData.message}
                   </p>
@@ -1310,12 +1311,12 @@ export default function AdminAuditLogsPage() {
 
                 {/* Security Disclaimer */}
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-amber-900">
-                  <p className="font-bold flex items-center gap-1 mb-1">
+                  <p className="font-bold flex items-center gap-1.5 mb-1">
                     <span>⚠️</span>
                     <span>تنبيه أمني ورقابي:</span>
                   </p>
                   <p className="text-[11px] leading-relaxed text-amber-800">
-                    خاصية التحميل المباشر للملفات (CSV / Excel Export) غير مفعلة برمجياً في هذه المرحلة للحفاظ على سرية
+                    خاصية التصدير المباشر للملفات (CSV / Excel Download) غير مفعلة برمجياً في هذه المرحلة للحفاظ على سرية
                     السجلات المحاسبية والامتثال لمعايير عدم تسريب مسارات التدقيق الحساسة (Export Implemented: false).
                   </p>
                 </div>
@@ -1327,7 +1328,7 @@ export default function AdminAuditLogsPage() {
               <button
                 type="button"
                 onClick={handleCloseExportPreview}
-                className="rounded-lg bg-slate-800 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-700 transition-colors"
+                className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition shadow-xs"
               >
                 إغلاق
               </button>

@@ -1,35 +1,29 @@
 'use client';
 
 // =====================================================
-// Phase 14A-C: Period Close & Fiscal Year Close Workspace
+// Phase 18A-B-5: Period Close & Fiscal Year Close Workspace UX Polish
 // Route: /accounting/period-close
 //
-// Features:
-// 1. Permission Gating:
-//    - Requires auth and `period_close.read`
-//    - `period_close.close` gates period & fiscal year close
-//    - `period_close.reopen` gates period & fiscal year reopen
-// 2. Status Inspector Panel (checks date status for period & fiscal year)
-// 3. Period Close Validation & Workflow Panel
-// 4. Period Closes History Table (with reopen modal)
-// 5. Fiscal Year Close Validation & Workflow Panel (with retained earnings notice)
-// 6. Fiscal Year Closes History Table (with reopen modal)
-// 7. Period Close Audit Log Section
-// 8. Financial Statements & Navigation links
-//
-// Monetary values are treated strictly as strings to prevent floating-point inaccuracies.
-// Zero frontend Number() arithmetic.
+// - Modern Arabic / RTL-friendly SaaS interface.
+// - Standardized PageHeader ("إقفال الفترات والسنة المالية").
+// - Top KPI summary cards for Open Periods, Closed Periods, Posting Readiness,
+//   and Fiscal Year Status.
+// - Modern SectionCard containers for Status Inspector, Period Validation & Close,
+//   Fiscal Year Close, and Period Close Audit Trail.
+// - Preserves 100% of period close validation rules, blocking checks, reopen
+//   guards, and fiscal year logic.
+// - Preserves 100% of permissions (`period_close.read`, `period_close.close`,
+//   `period_close.reopen`).
+// - Monetary values treated strictly as strings (no floating-point arithmetic).
 // =====================================================
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 import {
   api,
   ApiError,
-  CloseFiscalYearResponse,
-  ClosePeriodResponse,
   FiscalYearCloseRecord,
   FiscalYearValidationResponse,
   PeriodCloseAuditLogRecord,
@@ -39,6 +33,16 @@ import {
   PeriodCloseStatusData,
   PeriodCloseValidationResponse,
 } from '@/lib/api';
+import {
+  PageHeader,
+  KpiCard,
+  SectionCard,
+  StatusBadge,
+  EmptyState,
+  LoadingState,
+  ErrorBanner,
+  AccessDeniedState,
+} from '@/components/ui';
 
 // ---------- Formatters -------------------------------------------
 
@@ -67,27 +71,27 @@ function todayDateString(): string {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-// ---------- Badges -----------------------------------------------
+// ---------- Specialized Badges -----------------------------------
 
-function StatusBadge({ status }: { status: PeriodCloseStatus }) {
+function PeriodStatusBadge({ status }: { status: PeriodCloseStatus }) {
   switch (status) {
     case 'CLOSED':
       return (
-        <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2.5 py-0.5 text-xs font-semibold text-rose-800 border border-rose-200">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-50 px-2.5 py-0.5 text-xs font-semibold text-rose-700 border border-rose-200">
           <span className="h-1.5 w-1.5 rounded-full bg-rose-600" />
           مقفل (CLOSED)
         </span>
       );
     case 'CLOSING':
       return (
-        <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-800 border border-amber-200">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-semibold text-amber-700 border border-amber-200">
           <span className="h-1.5 w-1.5 rounded-full bg-amber-600" />
           جاري الإقفال (CLOSING)
         </span>
       );
     case 'REOPENED':
       return (
-        <span className="inline-flex items-center gap-1 rounded-full bg-sky-100 px-2.5 py-0.5 text-xs font-semibold text-sky-800 border border-sky-200">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-50 px-2.5 py-0.5 text-xs font-semibold text-sky-700 border border-sky-200">
           <span className="h-1.5 w-1.5 rounded-full bg-sky-600" />
           مُعاد فتحه (REOPENED)
         </span>
@@ -95,7 +99,7 @@ function StatusBadge({ status }: { status: PeriodCloseStatus }) {
     case 'OPEN':
     default:
       return (
-        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-semibold text-emerald-800 border border-emerald-200">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700 border border-emerald-200">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-600" />
           مفتوح (OPEN)
         </span>
@@ -107,35 +111,29 @@ function CheckStatusBadge({ status }: { status: PeriodCloseCheckStatus }) {
   switch (status) {
     case 'PASS':
       return (
-        <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 border border-emerald-200">
-          <svg className="h-3.5 w-3.5 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
-          </svg>
+        <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 border border-emerald-200">
+          <span className="font-bold">✓</span>
           ناجح (PASS)
         </span>
       );
     case 'FAIL':
       return (
-        <span className="inline-flex items-center gap-1 rounded-md bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-700 border border-rose-200">
-          <svg className="h-3.5 w-3.5 text-rose-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
-          </svg>
+        <span className="inline-flex items-center gap-1 rounded-lg bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-700 border border-rose-200">
+          <span className="font-bold">✕</span>
           فشل (FAIL)
         </span>
       );
     case 'WARNING':
       return (
-        <span className="inline-flex items-center gap-1 rounded-md bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
-          <svg className="h-3.5 w-3.5 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
+        <span className="inline-flex items-center gap-1 rounded-lg bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
+          <span>⚠️</span>
           تنبيه (WARNING)
         </span>
       );
     case 'SKIPPED':
     default:
       return (
-        <span className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 border border-slate-200">
+        <span className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 border border-slate-200">
           تخطي (SKIPPED)
         </span>
       );
@@ -533,14 +531,16 @@ export default function PeriodClosePage() {
     }
   };
 
-  // ---- Rendering Guards -----------------------------------------
+  // ---- Derived KPI Metrics --------------------------------------
+  const openPeriodsCount = periods.filter((p) => p.status === 'OPEN' || p.status === 'REOPENED').length;
+  const closedPeriodsCount = periods.filter((p) => p.status === 'CLOSED').length;
+  const activeFiscalYear = statusData?.fiscalYear.fiscalYear ?? currentYearNum;
+  const fyIsClosed = statusData?.fiscalYear.isClosed ?? (fiscalYears[0]?.status === 'CLOSED');
+
   if (authLoading) {
     return (
-      <main className="min-h-screen flex items-center justify-center p-8 bg-slate-50">
-        <div className="flex flex-col items-center gap-2">
-          <div className="h-8 w-8 animate-spin rounded-full border-4 border-purple-600 border-t-transparent" />
-          <p className="text-sm text-slate-600">جاري التحقق من الصلاحيات والتحميل...</p>
-        </div>
+      <main className="min-h-screen flex items-center justify-center p-8 bg-slate-50" dir="rtl">
+        <LoadingState message="جاري التحقق من الصلاحيات والبيانات..." />
       </main>
     );
   }
@@ -549,81 +549,70 @@ export default function PeriodClosePage() {
 
   if (!canRead) {
     return (
-      <main className="min-h-screen p-8 bg-slate-50 flex items-center justify-center">
-        <div className="max-w-md w-full rounded-2xl bg-white p-8 shadow-sm border border-slate-200 text-center space-y-4">
-          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-rose-100 text-rose-600">
-            <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-            </svg>
-          </div>
-          <h2 className="text-xl font-bold text-slate-800">غير مصرح بالوصول</h2>
-          <p className="text-sm text-slate-600">
-            يتطلب استعراض شاشة إقفال الفترات المحاسبية توفر صلاحية <code>period_close.read</code>. يرجى مراجعة مسؤول النظام.
-          </p>
-          <Link
-            href="/dashboard"
-            className="inline-block rounded-lg bg-slate-800 px-4 py-2 text-sm text-white hover:bg-slate-700"
-          >
-            العودة إلى لوحة المعلومات
-          </Link>
-        </div>
+      <main className="min-h-screen p-8 bg-slate-50 flex items-center justify-center" dir="rtl">
+        <AccessDeniedState
+          title="غير مصرح بالوصول"
+          description="تتطلب شاشة إقفال الفترات المحاسبية توفر صلاحية period_close.read. يرجى مراجعة مسؤول النظام."
+          returnHref="/dashboard"
+          returnLabel="العودة إلى لوحة التحكم"
+          requiredPermission="period_close.read"
+        />
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-slate-50 p-6 md:p-8">
-      {/* Header */}
-      <header className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-purple-100 text-purple-700 font-bold">
-              🔒
-            </span>
-            <div>
-              <h1 className="text-2xl md:text-3xl font-bold text-slate-900">إقفال الفترات والسنوات المالية</h1>
-              <p className="text-sm text-slate-500 mt-0.5">
-                التحكم في إقفال وإعادة فتح الفترات الشهرية والسنوات المالية ومنع الترحيل المحاسبي غير المصرح به
-              </p>
-            </div>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {hasPermission('gl_journal.read') && (
-            <Link
-              href="/accounting/reports"
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+    <main className="min-h-screen bg-slate-50 p-6 md:p-8 text-slate-800" dir="rtl">
+      {/* Standardized Header */}
+      <PageHeader
+        eyebrow="الإقفال المالي"
+        title="إقفال الفترات والسنة المالية"
+        subtitle="مراجعة حالة الفترات، القيود غير المرحّلة، والحواجز المحاسبية قبل الإقفال."
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={refreshAll}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 transition shadow-xs"
             >
-              📊 القوائم المالية
+              <span>🔄</span>
+              <span>تحديث البيانات</span>
+            </button>
+            {hasPermission('gl_journal.read') && (
+              <Link
+                href="/accounting/reports"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 transition shadow-xs"
+              >
+                <span>📊</span>
+                <span>القوائم المالية</span>
+              </Link>
+            )}
+            <Link
+              href="/accounting"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 transition shadow-xs"
+            >
+              <span>📖</span>
+              <span>دليل الحسابات</span>
             </Link>
-          )}
-          <Link
-            href="/accounting"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
-          >
-            📖 دليل الحسابات والقيود
-          </Link>
-          <Link
-            href="/dashboard"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
-          >
-            لوحة المعلومات
-          </Link>
-        </div>
-      </header>
+            <Link
+              href="/dashboard"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-800 transition shadow-xs"
+            >
+              لوحة التحكم
+            </Link>
+          </div>
+        }
+      />
 
       {/* Notifications */}
       {actionSuccess && (
-        <div className="mb-6 flex items-start justify-between rounded-xl bg-emerald-50 p-4 border border-emerald-200 text-emerald-800">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <svg className="h-5 w-5 text-emerald-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
+        <div className="mb-6 rounded-2xl bg-emerald-50 border border-emerald-200 p-4 text-sm text-emerald-800 flex items-center justify-between shadow-xs">
+          <div className="flex items-center gap-2 font-medium">
+            <span className="text-emerald-600 font-bold">✓</span>
             <span>{actionSuccess}</span>
           </div>
           <button
             onClick={() => setActionSuccess(null)}
-            className="text-emerald-600 hover:text-emerald-900 text-sm font-bold ml-2"
+            className="text-emerald-600 hover:text-emerald-900 text-base font-bold px-1"
           >
             ✕
           </button>
@@ -631,139 +620,174 @@ export default function PeriodClosePage() {
       )}
 
       {actionError && (
-        <div className="mb-6 flex items-start justify-between rounded-xl bg-rose-50 p-4 border border-rose-200 text-rose-800">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <svg className="h-5 w-5 text-rose-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            <span>{actionError}</span>
-          </div>
-          <button
-            onClick={() => setActionError(null)}
-            className="text-rose-600 hover:text-rose-900 text-sm font-bold ml-2"
-          >
-            ✕
-          </button>
+        <div className="mb-6">
+          <ErrorBanner
+            title="تنبيه بالإجراء"
+            message={actionError}
+            onRetry={() => setActionError(null)}
+          />
         </div>
       )}
 
+      {/* Top KPI Cards Row */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <KpiCard
+          label="الفترات المفتوحة"
+          value={loadingPeriods ? '...' : openPeriodsCount}
+          helperText="فترات تتيح ترحيل الحركات والقيود"
+          tone={openPeriodsCount > 0 ? 'info' : 'neutral'}
+          icon={<span className="text-emerald-600">🔓</span>}
+        />
+        <KpiCard
+          label="الفترات المغلقة"
+          value={loadingPeriods ? '...' : closedPeriodsCount}
+          helperText="فترات مقفلة تمنع الترحيل بحالة 409"
+          tone="neutral"
+          icon={<span className="text-rose-600">🔒</span>}
+        />
+        <KpiCard
+          label="حالة التاريخ المفحوص"
+          value={
+            statusData
+              ? statusData.period.isClosed || statusData.fiscalYear.isClosed
+                ? 'ممنوع الترحيل'
+                : 'الترحيل متاح'
+              : '—'
+          }
+          helperText={`التاريخ: ${statusDate}`}
+          tone={
+            statusData
+              ? statusData.period.isClosed || statusData.fiscalYear.isClosed
+                ? 'danger'
+                : 'success'
+              : 'neutral'
+          }
+          icon={
+            statusData?.period.isClosed || statusData?.fiscalYear.isClosed ? (
+              <span className="text-rose-600">🚫</span>
+            ) : (
+              <span className="text-emerald-600">✅</span>
+            )
+          }
+        />
+        <KpiCard
+          label="حالة السنة المالية"
+          value={fyIsClosed ? `سنة ${activeFiscalYear} (مقفلة)` : `سنة ${activeFiscalYear} (مفتوحة)`}
+          helperText={fyIsClosed ? 'السنة المالية مقفلة بالكامل' : 'السنة المالية قيد النشاط والتسجيل'}
+          tone={fyIsClosed ? 'danger' : 'success'}
+          icon={<span className={fyIsClosed ? 'text-rose-600' : 'text-indigo-600'}>🏛️</span>}
+        />
+      </div>
+
       {/* Global Safety Notices Banner */}
-      <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50/70 p-4 text-sm text-amber-900">
+      <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50/80 p-4 text-xs text-amber-900 shadow-xs">
         <div className="flex items-start gap-3">
-          <span className="text-xl">⚠️</span>
+          <span className="text-lg">⚠️</span>
           <div className="space-y-1">
-            <p className="font-semibold text-amber-950">قواعد الأمان والإقفال المحاسبي:</p>
-            <ul className="list-disc list-inside text-xs md:text-sm text-amber-900/90 space-y-0.5">
+            <p className="font-bold text-amber-950 text-sm">ضوابط الأمان المحاسبي وحواجز الإقفال:</p>
+            <ul className="list-disc list-inside text-amber-900/90 space-y-1 leading-relaxed">
               <li>
-                <strong>إقفال الفترة المحاسبية أو السنة المالية:</strong> يقوم تلقائياً بقفل عمليات الترحيل
-                (القيود اليدوية، فواتير المبيعات، فواتير المشتريات، وسندات القبض والصرف) داخل التواريخ المقفلة ورفضها بحالة 409 Conflict.
+                <strong>منع الترحيل التلقائي:</strong> إقفال أي فترة محاسبية أو سنة مالية يمنع تلقائياً إنشاء أو تعديل أو ترحيل أي قيود يومية، فواتير مبيعات، فواتير مشتريات، أو سندات دفع وقبض واقعة ضمن التواريخ المقفلة ويرفضها النظام بحالة 409 Conflict.
               </li>
               <li>
-                <strong>إقفال السنة المالية (Phase 14A):</strong> يتطلب إقفال جميع الفترات المحاسبية داخل السنة،
-                ولا يتم إنشاء قيد ترحيل الأرباح المبقاة (Retained Earnings) آلياً في هذه المرحلة.
+                <strong>قيد الأرباح المبقاة (Retained Earnings):</strong> إقفال السنة المالية يوثق حاجز الإقفال السنوي دون إنشاء قيد ترحيل الأرباح المبقاة تلقائياً، حفاظاً على دقة التسويات الختامية المعتمدة.
               </li>
             </ul>
           </div>
         </div>
       </div>
 
-      {/* Section B: Current Status Panel */}
-      <section className="mb-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between border-b border-slate-100 pb-4 mb-4">
-          <div>
-            <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
-              <span>📅</span> فحص حالة الإقفال لتاريخ محدد
-            </h2>
-            <p className="text-xs text-slate-500">
-              تحقق فورياً مما إذا كان تاريخ معين مقفلاً ويمنع الترحيل المحاسبي
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="text-xs font-semibold text-slate-700">التاريخ المستهدف:</label>
-            <input
-              type="date"
-              value={statusDate}
-              onChange={(e) => setStatusDate(e.target.value)}
-              className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
-            />
-            <button
-              onClick={() => loadStatus(statusDate)}
-              disabled={loadingStatus}
-              className="rounded-lg bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:bg-slate-300"
-            >
-              {loadingStatus ? 'جاري الفحص...' : 'فحص'}
-            </button>
-          </div>
-        </div>
+      {/* Status Inspector Section */}
+      <div className="mb-6">
+        <SectionCard
+          title="فحص حالة الإقفال لتاريخ محدد (Status Inspector)"
+          description="تحقق فورياً مما إذا كان تاريخ عملية معين خاضعاً لحاجز إقفال يمنع الترحيل المحاسبي"
+          actions={
+            <div className="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200">
+              <label className="text-xs font-semibold text-slate-700">التاريخ المستهدف:</label>
+              <input
+                type="date"
+                value={statusDate}
+                onChange={(e) => setStatusDate(e.target.value)}
+                className="rounded-lg border border-slate-300 px-2.5 py-1 text-xs text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-purple-500"
+              />
+              <button
+                onClick={() => loadStatus(statusDate)}
+                disabled={loadingStatus}
+                className="rounded-lg bg-slate-900 px-3 py-1 text-xs text-white hover:bg-slate-800 disabled:bg-slate-300 font-medium transition"
+              >
+                {loadingStatus ? 'جاري الفحص...' : 'فحص'}
+              </button>
+            </div>
+          }
+        >
+          {statusError && (
+            <div className="mb-4">
+              <ErrorBanner title="خطأ في فحص التاريخ" message={statusError} />
+            </div>
+          )}
 
-        {statusError && (
-          <p className="text-xs text-rose-600 mb-4">{statusError}</p>
-        )}
-
-        {statusData && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Period Status Card */}
-            <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  الفترة المحاسبية (Accounting Period)
-                </span>
-                <StatusBadge status={statusData.period.status} />
-              </div>
-              <div className="space-y-1.5 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-slate-600">نطاق الفترة:</span>
-                  <span className="font-mono font-medium text-slate-800">
-                    {statusData.period.periodStart ? `${formatDate(statusData.period.periodStart)} إلى ${formatDate(statusData.period.periodEnd)}` : 'لا توجد فترة محددة'}
-                  </span>
+          {statusData && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Period Status Card */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                <div className="flex items-center justify-between mb-3 border-b border-slate-200 pb-2">
+                  <span className="text-xs font-bold text-slate-600">الفترة المحاسبية (Accounting Period)</span>
+                  <PeriodStatusBadge status={statusData.period.status} />
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-600">حالة الترحيل:</span>
-                  <span className={`font-semibold ${statusData.period.isClosed ? 'text-rose-600' : 'text-emerald-600'}`}>
-                    {statusData.period.isClosed ? '🚫 الترحيل مغلق وممنوع' : '✅ الترحيل متاح ومسموح'}
-                  </span>
+                <div className="space-y-2 text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">نطاق الفترة:</span>
+                    <span className="font-mono font-bold text-slate-800">
+                      {statusData.period.periodStart ? `${formatDate(statusData.period.periodStart)} إلى ${formatDate(statusData.period.periodEnd)}` : 'لا توجد فترة محددة'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">حالة الترحيل:</span>
+                    <span className={`font-bold px-2 py-0.5 rounded ${statusData.period.isClosed ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
+                      {statusData.period.isClosed ? '🚫 الترحيل مغلق وممنوع' : '✅ الترحيل متاح ومسموح'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Fiscal Year Status Card */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                <div className="flex items-center justify-between mb-3 border-b border-slate-200 pb-2">
+                  <span className="text-xs font-bold text-slate-600">السنة المالية (Fiscal Year)</span>
+                  <PeriodStatusBadge status={statusData.fiscalYear.status} />
+                </div>
+                <div className="space-y-2 text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">السنة المالية:</span>
+                    <span className="font-mono font-bold text-slate-800">
+                      {statusData.fiscalYear.fiscalYear ?? 'غير محددة'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">نطاق السنة:</span>
+                    <span className="font-mono font-medium text-slate-800">
+                      {statusData.fiscalYear.fiscalYearStart ? `${formatDate(statusData.fiscalYear.fiscalYearStart)} إلى ${formatDate(statusData.fiscalYear.fiscalYearEnd)}` : 'لا توجد سنة مالية مسجلة'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">حالة الترحيل:</span>
+                    <span className={`font-bold px-2 py-0.5 rounded ${statusData.fiscalYear.isClosed ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
+                      {statusData.fiscalYear.isClosed ? '🚫 السنة مقفلة ويمنع الترحيل' : '✅ السنة مفتوحة ومسموحة'}
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>
-
-            {/* Fiscal Year Status Card */}
-            <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  السنة المالية (Fiscal Year)
-                </span>
-                <StatusBadge status={statusData.fiscalYear.status} />
-              </div>
-              <div className="space-y-1.5 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-slate-600">السنة المالية:</span>
-                  <span className="font-mono font-bold text-slate-800">
-                    {statusData.fiscalYear.fiscalYear ?? 'غير محددة'}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-600">نطاق السنة:</span>
-                  <span className="font-mono font-medium text-slate-800">
-                    {statusData.fiscalYear.fiscalYearStart ? `${formatDate(statusData.fiscalYear.fiscalYearStart)} إلى ${formatDate(statusData.fiscalYear.fiscalYearEnd)}` : 'لا توجد سنة مالية مسجلة'}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-600">حالة الترحيل:</span>
-                  <span className={`font-semibold ${statusData.fiscalYear.isClosed ? 'text-rose-600' : 'text-emerald-600'}`}>
-                    {statusData.fiscalYear.isClosed ? '🚫 السنة مقفلة ويمنع الترحيل' : '✅ السنة مفتوحة ومسموحة'}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-      </section>
+          )}
+        </SectionCard>
+      </div>
 
       {/* Tabs Navigation */}
-      <div className="mb-6 flex border-b border-slate-200 gap-4">
+      <div className="mb-6 flex border-b border-slate-200 gap-3">
         <button
           onClick={() => setActiveTab('periods')}
-          className={`pb-3 text-sm font-semibold border-b-2 transition-colors ${
+          className={`pb-3 px-4 text-sm font-bold border-b-2 transition-colors ${
             activeTab === 'periods'
               ? 'border-purple-600 text-purple-700'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -773,7 +797,7 @@ export default function PeriodClosePage() {
         </button>
         <button
           onClick={() => setActiveTab('fiscal_years')}
-          className={`pb-3 text-sm font-semibold border-b-2 transition-colors ${
+          className={`pb-3 px-4 text-sm font-bold border-b-2 transition-colors ${
             activeTab === 'fiscal_years'
               ? 'border-purple-600 text-purple-700'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -783,7 +807,7 @@ export default function PeriodClosePage() {
         </button>
         <button
           onClick={() => setActiveTab('audit_log')}
-          className={`pb-3 text-sm font-semibold border-b-2 transition-colors ${
+          className={`pb-3 px-4 text-sm font-bold border-b-2 transition-colors ${
             activeTab === 'audit_log'
               ? 'border-purple-600 text-purple-700'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -797,18 +821,16 @@ export default function PeriodClosePage() {
           TAB 1: ACCOUNTING PERIODS
          ===================================================== */}
       {activeTab === 'periods' && (
-        <div className="space-y-8">
+        <div className="space-y-6">
           {/* Section C: Period Close Form & Validation */}
-          <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-bold text-slate-800 mb-1">إقفال فترة محاسبية جديدة</h2>
-            <p className="text-xs text-slate-500 mb-4">
-              قم بتحديد نطاق الفترة المحاسبية أولاً، ثم اضغط على &quot;التحقق من الفترة&quot; لفحص القيود وتوازن الحسابات قبل الإقفال
-            </p>
-
+          <SectionCard
+            title="إقفال فترة محاسبية جديدة"
+            description="حدد نطاق الفترة ثم اضغط على التحقق لفحص القيود وتوازن الحسابات قبل تنفيذ الإقفال"
+          >
             <form onSubmit={handleValidatePeriod} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     تاريخ بداية الفترة <span className="text-rose-500">*</span>
                   </label>
                   <input
@@ -819,11 +841,11 @@ export default function PeriodClosePage() {
                       setPeriodForm({ ...periodForm, periodStart: e.target.value });
                       setPeriodValidationResult(null);
                     }}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     تاريخ نهاية الفترة <span className="text-rose-500">*</span>
                   </label>
                   <input
@@ -834,11 +856,11 @@ export default function PeriodClosePage() {
                       setPeriodForm({ ...periodForm, periodEnd: e.target.value });
                       setPeriodValidationResult(null);
                     }}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     السنة المالية (اختياري)
                   </label>
                   <input
@@ -846,11 +868,11 @@ export default function PeriodClosePage() {
                     placeholder="مثال: 2026"
                     value={periodForm.fiscalYear}
                     onChange={(e) => setPeriodForm({ ...periodForm, fiscalYear: e.target.value })}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     رقم الفترة (اختياري 1-12)
                   </label>
                   <input
@@ -858,33 +880,35 @@ export default function PeriodClosePage() {
                     placeholder="مثال: 1"
                     value={periodForm.periodNumber}
                     onChange={(e) => setPeriodForm({ ...periodForm, periodNumber: e.target.value })}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                   ملاحظات الإقفال (اختياري)
                 </label>
                 <input
                   type="text"
-                  placeholder="مثال: إقفال حسابات شهر يناير 2026"
+                  placeholder="مثال: إقفال حسابات شهر يناير 2026 بعد مراجعة التسويات"
                   value={periodForm.notes}
                   onChange={(e) => setPeriodForm({ ...periodForm, notes: e.target.value })}
-                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                 />
               </div>
 
               {periodFormError && (
-                <p className="text-xs text-rose-600 font-medium">{periodFormError}</p>
+                <div className="mt-2">
+                  <ErrorBanner title="تنبيه بالتحقق" message={periodFormError} />
+                </div>
               )}
 
-              <div className="flex items-center gap-3 pt-2">
+              <div className="flex flex-wrap items-center gap-3 pt-2">
                 <button
                   type="submit"
                   disabled={validatingPeriod || closingPeriod}
-                  className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700 disabled:bg-slate-300"
+                  className="rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:bg-slate-300 transition shadow-xs"
                 >
                   {validatingPeriod ? 'جاري التحقق...' : 'التحقق من الفترة (Validate)'}
                 </button>
@@ -900,7 +924,7 @@ export default function PeriodClosePage() {
                     !periodValidationResult.canClose
                   }
                   title={!canClose ? 'يتطلب صلاحية period_close.close' : ''}
-                  className={`rounded-lg px-4 py-2 text-sm font-semibold text-white transition-colors ${
+                  className={`rounded-xl px-4 py-2.5 text-xs font-semibold text-white transition shadow-xs ${
                     periodValidationResult?.canClose && canClose
                       ? 'bg-rose-600 hover:bg-rose-700'
                       : 'bg-slate-300 cursor-not-allowed text-slate-500'
@@ -911,7 +935,7 @@ export default function PeriodClosePage() {
 
                 {!canClose && (
                   <span className="text-xs text-amber-700">
-                    * زر الإقفال يتطلب صلاحية <code>period_close.close</code>
+                    * زر الإقفال يتطلب توفر صلاحية <code>period_close.close</code>
                   </span>
                 )}
               </div>
@@ -919,7 +943,7 @@ export default function PeriodClosePage() {
 
             {/* Validation Results Panel */}
             {periodValidationResult && (
-              <div className="mt-6 rounded-xl border border-slate-200 bg-slate-50/70 p-4 space-y-4">
+              <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50/80 p-4 space-y-4 shadow-xs">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-slate-200 pb-3">
                   <div className="flex items-center gap-3">
                     <span
@@ -932,24 +956,24 @@ export default function PeriodClosePage() {
                       {periodValidationResult.canClose ? 'جاهز للإقفال (Ready to Close)' : 'فشل التحقق - لا يمكن الإقفال'}
                     </span>
                     <span className="text-xs text-slate-500">
-                      عدد الموانع: <strong>{periodValidationResult.blockingFailures}</strong>
+                      عدد الموانع الرقابية: <strong className="text-slate-800">{periodValidationResult.blockingFailures}</strong>
                     </span>
                   </div>
 
-                  {/* Totals display strictly without Number math */}
+                  {/* Totals strictly as strings */}
                   <div className="flex items-center gap-4 text-xs font-mono">
                     <span className="text-slate-600">
-                      إجمالي المدين: <strong className="text-slate-800">{formatAmount(periodValidationResult.totals.postedDebitTotal)}</strong>
+                      إجمالي المدين: <strong className="text-slate-900">{formatAmount(periodValidationResult.totals.postedDebitTotal)}</strong>
                     </span>
                     <span className="text-slate-600">
-                      إجمالي الدائن: <strong className="text-slate-800">{formatAmount(periodValidationResult.totals.postedCreditTotal)}</strong>
+                      إجمالي الدائن: <strong className="text-slate-900">{formatAmount(periodValidationResult.totals.postedCreditTotal)}</strong>
                     </span>
                   </div>
                 </div>
 
                 {periodValidationResult.warnings.length > 0 && (
-                  <div className="rounded-lg bg-amber-50 p-3 border border-amber-200 text-xs text-amber-900 space-y-1">
-                    <p className="font-bold">تنبيهات:</p>
+                  <div className="rounded-xl bg-amber-50 p-3 border border-amber-200 text-xs text-amber-900 space-y-1">
+                    <p className="font-bold">تنبيهات التحقق:</p>
                     <ul className="list-disc list-inside">
                       {periodValidationResult.warnings.map((w, i) => (
                         <li key={i}>{w}</li>
@@ -959,29 +983,29 @@ export default function PeriodClosePage() {
                 )}
 
                 {/* Detailed Checks Table */}
-                <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+                <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
                   <table className="w-full text-right text-xs">
-                    <thead className="bg-slate-100 text-slate-700">
+                    <thead className="bg-slate-100/80 text-slate-700">
                       <tr>
-                        <th className="p-2.5">رمز الفحص (Check Code)</th>
-                        <th className="p-2.5">الحالة</th>
-                        <th className="p-2.5">مانع للإقفال</th>
-                        <th className="p-2.5">التفاصيل والرسالة</th>
+                        <th className="p-3">رمز الفحص (Check Code)</th>
+                        <th className="p-3">الحالة</th>
+                        <th className="p-3">مانع للإقفال</th>
+                        <th className="p-3">التفاصيل والرسالة</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-200">
+                    <tbody className="divide-y divide-slate-100">
                       {periodValidationResult.checks.map((check, idx) => (
                         <tr key={idx} className="hover:bg-slate-50">
-                          <td className="p-2.5 font-mono font-medium text-slate-800">{check.code}</td>
-                          <td className="p-2.5"><CheckStatusBadge status={check.status} /></td>
-                          <td className="p-2.5 font-semibold">
+                          <td className="p-3 font-mono font-bold text-slate-800">{check.code}</td>
+                          <td className="p-3"><CheckStatusBadge status={check.status} /></td>
+                          <td className="p-3 font-semibold">
                             {check.blocking ? (
-                              <span className="text-rose-600">نعم</span>
+                              <span className="text-rose-600">نعم (مانع)</span>
                             ) : (
                               <span className="text-slate-400">لا</span>
                             )}
                           </td>
-                          <td className="p-2.5 text-slate-600">{check.message}</td>
+                          <td className="p-3 text-slate-600">{check.message}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -989,22 +1013,18 @@ export default function PeriodClosePage() {
                 </div>
               </div>
             )}
-          </section>
+          </SectionCard>
 
           {/* Section D: Period List */}
-          <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
-              <div>
-                <h2 className="text-lg font-bold text-slate-800">سجل الفترات المحاسبية</h2>
-                <p className="text-xs text-slate-500">استعراض الفترات المسجلة وحالاتها، مع إمكانية إعادة الفتح</p>
-              </div>
-
-              {/* Filters */}
+          <SectionCard
+            title="سجل الفترات المحاسبية"
+            description="استعراض الفترات المسجلة وحالاتها، مع إمكانية إعادة الفتح بموجب مبرر رقابي"
+            actions={
               <div className="flex flex-wrap items-center gap-2">
                 <select
                   value={periodStatusFilter}
                   onChange={(e) => setPeriodStatusFilter(e.target.value)}
-                  className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="rounded-xl border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                 >
                   <option value="">كل الحالات</option>
                   <option value="OPEN">مفتوح (OPEN)</option>
@@ -1018,31 +1038,34 @@ export default function PeriodClosePage() {
                   placeholder="تصفية بالسنة"
                   value={periodYearFilter}
                   onChange={(e) => setPeriodYearFilter(e.target.value)}
-                  className="w-28 rounded-lg border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="w-28 rounded-xl border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                 />
 
                 <button
                   onClick={loadPeriods}
                   disabled={loadingPeriods}
-                  className="rounded-lg bg-slate-100 hover:bg-slate-200 px-3 py-1.5 text-xs text-slate-700 font-medium"
+                  className="rounded-xl bg-slate-100 hover:bg-slate-200 px-3 py-1.5 text-xs text-slate-700 font-medium transition"
                 >
                   {loadingPeriods ? 'تحديث...' : 'تحديث'}
                 </button>
               </div>
-            </div>
-
+            }
+          >
             {periodsError && (
-              <p className="text-xs text-rose-600 mb-3">{periodsError}</p>
+              <div className="mb-4">
+                <ErrorBanner title="خطأ في تحميل الفترات" message={periodsError} />
+              </div>
             )}
 
             {periods.length === 0 ? (
-              <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-xl">
-                <p className="text-sm text-slate-500">لا توجد فترات محاسبية مطابقة للشروط الحالية.</p>
-              </div>
+              <EmptyState
+                title="لا توجد فترات محاسبية مطابقة"
+                description="لم يتم العثور على فترات محاسبية مسجلة أو مطابقة لشروط التصفية الحالية."
+              />
             ) : (
-              <div className="overflow-x-auto rounded-lg border border-slate-200">
+              <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs">
                 <table className="w-full text-right text-xs">
-                  <thead className="bg-slate-100 text-slate-700 font-semibold">
+                  <thead className="bg-slate-100/80 text-slate-700 font-semibold border-b border-slate-200">
                     <tr>
                       <th className="p-3">نطاق الفترة</th>
                       <th className="p-3">السنة / الرقم</th>
@@ -1053,22 +1076,22 @@ export default function PeriodClosePage() {
                       <th className="p-3 text-center">الإجراءات</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-200">
+                  <tbody className="divide-y divide-slate-100">
                     {periods.map((p) => (
-                      <tr key={p.id} className="hover:bg-slate-50">
-                        <td className="p-3 font-mono font-medium text-slate-800">
+                      <tr key={p.id} className="hover:bg-slate-50/80 transition-colors">
+                        <td className="p-3 font-mono font-bold text-slate-900">
                           {formatDate(p.periodStart)} إلى {formatDate(p.periodEnd)}
                         </td>
                         <td className="p-3 font-mono text-slate-700">
                           {p.fiscalYear} {p.periodNumber ? `(P${p.periodNumber})` : ''}
                         </td>
                         <td className="p-3">
-                          <StatusBadge status={p.status} />
+                          <PeriodStatusBadge status={p.status} />
                         </td>
                         <td className="p-3 text-slate-600">
                           {p.closedAt ? (
                             <div>
-                              <div>{formatDateTime(p.closedAt)}</div>
+                              <div className="font-mono text-[11px]">{formatDateTime(p.closedAt)}</div>
                               <span className="text-[10px] text-slate-400">
                                 {p.closedBy?.fullName ?? p.closedById ?? '—'}
                               </span>
@@ -1080,8 +1103,8 @@ export default function PeriodClosePage() {
                         <td className="p-3 text-slate-600">
                           {p.reopenedAt ? (
                             <div>
-                              <div>{formatDateTime(p.reopenedAt)}</div>
-                              <div className="text-[10px] text-amber-700">السبب: {p.reopenReason}</div>
+                              <div className="font-mono text-[11px]">{formatDateTime(p.reopenedAt)}</div>
+                              <div className="text-[10px] text-amber-700 font-medium">السبب: {p.reopenReason}</div>
                             </div>
                           ) : (
                             '—'
@@ -1099,7 +1122,7 @@ export default function PeriodClosePage() {
                               }}
                               disabled={!canReopen}
                               title={!canReopen ? 'يتطلب صلاحية period_close.reopen' : 'إعادة فتح الفترة للتعديل'}
-                              className="rounded-md bg-amber-50 border border-amber-300 text-amber-700 hover:bg-amber-100 disabled:bg-slate-100 disabled:text-slate-400 px-2.5 py-1 text-xs font-semibold"
+                              className="rounded-xl bg-amber-50 border border-amber-300 text-amber-800 hover:bg-amber-100 disabled:bg-slate-100 disabled:text-slate-400 px-3 py-1 text-xs font-semibold transition"
                             >
                               إعادة فتح
                             </button>
@@ -1113,7 +1136,7 @@ export default function PeriodClosePage() {
                 </table>
               </div>
             )}
-          </section>
+          </SectionCard>
         </div>
       )}
 
@@ -1121,18 +1144,16 @@ export default function PeriodClosePage() {
           TAB 2: FISCAL YEARS
          ===================================================== */}
       {activeTab === 'fiscal_years' && (
-        <div className="space-y-8">
+        <div className="space-y-6">
           {/* Section E: Fiscal Year Close Form & Validation */}
-          <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-bold text-slate-800 mb-1">إقفال سنة مالية</h2>
-            <p className="text-xs text-slate-500 mb-4">
-              يشترط لإقفال السنة المالية أن تكون جميع الفترات المحاسبية داخلها مقفلة بالكامل ومتوازنة
-            </p>
-
+          <SectionCard
+            title="إقفال سنة مالية"
+            description="يشترط لإقفال السنة المالية أن تكون جميع الفترات المحاسبية داخلها مقفلة بالكامل ومتوازنة"
+          >
             <form onSubmit={handleValidateFy} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     السنة المالية <span className="text-rose-500">*</span>
                   </label>
                   <input
@@ -1143,11 +1164,11 @@ export default function PeriodClosePage() {
                       setFyForm({ ...fyForm, fiscalYear: e.target.value });
                       setFyValidationResult(null);
                     }}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     تاريخ بداية السنة المالية <span className="text-rose-500">*</span>
                   </label>
                   <input
@@ -1158,11 +1179,11 @@ export default function PeriodClosePage() {
                       setFyForm({ ...fyForm, fiscalYearStart: e.target.value });
                       setFyValidationResult(null);
                     }}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     تاريخ نهاية السنة المالية <span className="text-rose-500">*</span>
                   </label>
                   <input
@@ -1173,13 +1194,13 @@ export default function PeriodClosePage() {
                       setFyForm({ ...fyForm, fiscalYearEnd: e.target.value });
                       setFyValidationResult(null);
                     }}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                   ملاحظات الإقفال السنوي (اختياري)
                 </label>
                 <input
@@ -1187,24 +1208,26 @@ export default function PeriodClosePage() {
                   placeholder="مثال: إقفال السنة المالية 2026 واعتماد الحسابات الختامية"
                   value={fyForm.notes}
                   onChange={(e) => setFyForm({ ...fyForm, notes: e.target.value })}
-                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                 />
               </div>
 
               {/* Retained earnings scope notice */}
-              <div className="rounded-lg bg-blue-50 border border-blue-200 p-3 text-xs text-blue-900">
-                ℹ️ <strong>ملاحظة الأرباح المبقاة:</strong> إقفال السنة المالية في هذا الإصدار لا يُنشئ قيد ترحيل الأرباح المبقاة (Retained Earnings Journal Entry).
+              <div className="rounded-xl bg-blue-50 border border-blue-200 p-3 text-xs text-blue-900">
+                ℹ️ <strong>ملاحظة الأرباح المبقاة:</strong> إقفال السنة المالية في هذا الإصدار لا يُنشئ قيد ترحيل الأرباح المبقاة (Retained Earnings) آلياً.
               </div>
 
               {fyFormError && (
-                <p className="text-xs text-rose-600 font-medium">{fyFormError}</p>
+                <div className="mt-2">
+                  <ErrorBanner title="تنبيه بالتحقق" message={fyFormError} />
+                </div>
               )}
 
-              <div className="flex items-center gap-3 pt-2">
+              <div className="flex flex-wrap items-center gap-3 pt-2">
                 <button
                   type="submit"
                   disabled={validatingFy || closingFy}
-                  className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700 disabled:bg-slate-300"
+                  className="rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:bg-slate-300 transition shadow-xs"
                 >
                   {validatingFy ? 'جاري التحقق...' : 'التحقق من السنة المالية (Validate)'}
                 </button>
@@ -1220,7 +1243,7 @@ export default function PeriodClosePage() {
                     !fyValidationResult.canClose
                   }
                   title={!canClose ? 'يتطلب صلاحية period_close.close' : ''}
-                  className={`rounded-lg px-4 py-2 text-sm font-semibold text-white transition-colors ${
+                  className={`rounded-xl px-4 py-2.5 text-xs font-semibold text-white transition shadow-xs ${
                     fyValidationResult?.canClose && canClose
                       ? 'bg-rose-600 hover:bg-rose-700'
                       : 'bg-slate-300 cursor-not-allowed text-slate-500'
@@ -1239,7 +1262,7 @@ export default function PeriodClosePage() {
 
             {/* FY Validation Results Panel */}
             {fyValidationResult && (
-              <div className="mt-6 rounded-xl border border-slate-200 bg-slate-50/70 p-4 space-y-4">
+              <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50/80 p-4 space-y-4 shadow-xs">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-slate-200 pb-3">
                   <div className="flex items-center gap-3">
                     <span
@@ -1252,29 +1275,29 @@ export default function PeriodClosePage() {
                       {fyValidationResult.canClose ? 'جاهز للإقفال السنوي' : 'فشل التحقق - لا يمكن إقفال السنة المالية'}
                     </span>
                     <span className="text-xs text-slate-500">
-                      عدد الموانع: <strong>{fyValidationResult.blockingFailures}</strong>
+                      عدد الموانع الرقابية: <strong className="text-slate-800">{fyValidationResult.blockingFailures}</strong>
                     </span>
                   </div>
 
                   {/* Totals strictly as strings */}
                   <div className="flex items-center gap-4 text-xs font-mono">
                     <span className="text-slate-600">
-                      إجمالي مدين السنة: <strong className="text-slate-800">{formatAmount(fyValidationResult.totals.postedDebitTotal)}</strong>
+                      إجمالي مدين السنة: <strong className="text-slate-900">{formatAmount(fyValidationResult.totals.postedDebitTotal)}</strong>
                     </span>
                     <span className="text-slate-600">
-                      إجمالي دائن السنة: <strong className="text-slate-800">{formatAmount(fyValidationResult.totals.postedCreditTotal)}</strong>
+                      إجمالي دائن السنة: <strong className="text-slate-900">{formatAmount(fyValidationResult.totals.postedCreditTotal)}</strong>
                     </span>
                   </div>
                 </div>
 
                 {/* Retained Earnings notice in validation */}
-                <div className="rounded-lg bg-slate-100 p-2.5 text-xs text-slate-700 flex items-center justify-between">
+                <div className="rounded-xl bg-white p-3 border border-slate-200 text-xs text-slate-700 flex items-center justify-between">
                   <span>حالة قيد الأرباح المبقاة: <strong>{fyValidationResult.retainedEarnings.postingCreated ? 'تم الإنشاء' : 'لم يتم الإنشاء (مستثنى)'}</strong></span>
                   <span className="text-[11px] text-slate-500">{fyValidationResult.retainedEarnings.reason}</span>
                 </div>
 
                 {fyValidationResult.warnings.length > 0 && (
-                  <div className="rounded-lg bg-amber-50 p-3 border border-amber-200 text-xs text-amber-900 space-y-1">
+                  <div className="rounded-xl bg-amber-50 p-3 border border-amber-200 text-xs text-amber-900 space-y-1">
                     <p className="font-bold">تنبيهات:</p>
                     <ul className="list-disc list-inside">
                       {fyValidationResult.warnings.map((w, i) => (
@@ -1285,29 +1308,29 @@ export default function PeriodClosePage() {
                 )}
 
                 {/* Detailed Checks Table */}
-                <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+                <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
                   <table className="w-full text-right text-xs">
-                    <thead className="bg-slate-100 text-slate-700">
+                    <thead className="bg-slate-100/80 text-slate-700">
                       <tr>
-                        <th className="p-2.5">رمز الفحص (Check Code)</th>
-                        <th className="p-2.5">الحالة</th>
-                        <th className="p-2.5">مانع للإقفال</th>
-                        <th className="p-2.5">التفاصيل والرسالة</th>
+                        <th className="p-3">رمز الفحص (Check Code)</th>
+                        <th className="p-3">الحالة</th>
+                        <th className="p-3">مانع للإقفال</th>
+                        <th className="p-3">التفاصيل والرسالة</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-200">
+                    <tbody className="divide-y divide-slate-100">
                       {fyValidationResult.checks.map((check, idx) => (
                         <tr key={idx} className="hover:bg-slate-50">
-                          <td className="p-2.5 font-mono font-medium text-slate-800">{check.code}</td>
-                          <td className="p-2.5"><CheckStatusBadge status={check.status} /></td>
-                          <td className="p-2.5 font-semibold">
+                          <td className="p-3 font-mono font-bold text-slate-800">{check.code}</td>
+                          <td className="p-3"><CheckStatusBadge status={check.status} /></td>
+                          <td className="p-3 font-semibold">
                             {check.blocking ? (
-                              <span className="text-rose-600">نعم</span>
+                              <span className="text-rose-600">نعم (مانع)</span>
                             ) : (
                               <span className="text-slate-400">لا</span>
                             )}
                           </td>
-                          <td className="p-2.5 text-slate-600">{check.message}</td>
+                          <td className="p-3 text-slate-600">{check.message}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1315,22 +1338,18 @@ export default function PeriodClosePage() {
                 </div>
               </div>
             )}
-          </section>
+          </SectionCard>
 
           {/* Section F: Fiscal Year List */}
-          <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
-              <div>
-                <h2 className="text-lg font-bold text-slate-800">سجل السنوات المالية</h2>
-                <p className="text-xs text-slate-500">استعراض السنوات المالية المقفلة والمفتوحة مع إمكانية إعادة الفتح</p>
-              </div>
-
-              {/* Filters */}
+          <SectionCard
+            title="سجل السنوات المالية"
+            description="استعراض السنوات المالية المقفلة والمفتوحة مع إمكانية إعادة الفتح"
+            actions={
               <div className="flex items-center gap-2">
                 <select
                   value={fyStatusFilter}
                   onChange={(e) => setFyStatusFilter(e.target.value)}
-                  className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="rounded-xl border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
                 >
                   <option value="">كل الحالات</option>
                   <option value="OPEN">مفتوح (OPEN)</option>
@@ -1342,25 +1361,28 @@ export default function PeriodClosePage() {
                 <button
                   onClick={loadFiscalYears}
                   disabled={loadingFiscalYears}
-                  className="rounded-lg bg-slate-100 hover:bg-slate-200 px-3 py-1.5 text-xs text-slate-700 font-medium"
+                  className="rounded-xl bg-slate-100 hover:bg-slate-200 px-3 py-1.5 text-xs text-slate-700 font-medium transition"
                 >
                   {loadingFiscalYears ? 'تحديث...' : 'تحديث'}
                 </button>
               </div>
-            </div>
-
+            }
+          >
             {fiscalYearsError && (
-              <p className="text-xs text-rose-600 mb-3">{fiscalYearsError}</p>
+              <div className="mb-4">
+                <ErrorBanner title="خطأ في تحميل السنوات المالية" message={fiscalYearsError} />
+              </div>
             )}
 
             {fiscalYears.length === 0 ? (
-              <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-xl">
-                <p className="text-sm text-slate-500">لا توجد سجلات سنوات مالية مسجلة حتى الآن.</p>
-              </div>
+              <EmptyState
+                title="لا توجد سجلات سنوات مالية مسجلة"
+                description="لم يتم العثور على سجلات سنوات مالية سابقة في النظام."
+              />
             ) : (
-              <div className="overflow-x-auto rounded-lg border border-slate-200">
+              <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs">
                 <table className="w-full text-right text-xs">
-                  <thead className="bg-slate-100 text-slate-700 font-semibold">
+                  <thead className="bg-slate-100/80 text-slate-700 font-semibold border-b border-slate-200">
                     <tr>
                       <th className="p-3">السنة المالية</th>
                       <th className="p-3">نطاق التواريخ</th>
@@ -1372,20 +1394,20 @@ export default function PeriodClosePage() {
                       <th className="p-3 text-center">الإجراءات</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-200">
+                  <tbody className="divide-y divide-slate-100">
                     {fiscalYears.map((fy) => (
-                      <tr key={fy.id} className="hover:bg-slate-50">
+                      <tr key={fy.id} className="hover:bg-slate-50/80 transition-colors">
                         <td className="p-3 font-mono font-bold text-slate-900">{fy.fiscalYear}</td>
                         <td className="p-3 font-mono text-slate-700">
                           {formatDate(fy.fiscalYearStart)} إلى {formatDate(fy.fiscalYearEnd)}
                         </td>
                         <td className="p-3">
-                          <StatusBadge status={fy.status} />
+                          <PeriodStatusBadge status={fy.status} />
                         </td>
                         <td className="p-3 text-slate-600">
                           {fy.closedAt ? (
                             <div>
-                              <div>{formatDateTime(fy.closedAt)}</div>
+                              <div className="font-mono text-[11px]">{formatDateTime(fy.closedAt)}</div>
                               <span className="text-[10px] text-slate-400">
                                 {fy.closedBy?.fullName ?? fy.closedById ?? '—'}
                               </span>
@@ -1397,8 +1419,8 @@ export default function PeriodClosePage() {
                         <td className="p-3 text-slate-600">
                           {fy.reopenedAt ? (
                             <div>
-                              <div>{formatDateTime(fy.reopenedAt)}</div>
-                              <div className="text-[10px] text-amber-700">السبب: {fy.reopenReason}</div>
+                              <div className="font-mono text-[11px]">{formatDateTime(fy.reopenedAt)}</div>
+                              <div className="text-[10px] text-amber-700 font-medium">السبب: {fy.reopenReason}</div>
                             </div>
                           ) : (
                             '—'
@@ -1419,7 +1441,7 @@ export default function PeriodClosePage() {
                               }}
                               disabled={!canReopen}
                               title={!canReopen ? 'يتطلب صلاحية period_close.reopen' : 'إعادة فتح السنة المالية'}
-                              className="rounded-md bg-amber-50 border border-amber-300 text-amber-700 hover:bg-amber-100 disabled:bg-slate-100 disabled:text-slate-400 px-2.5 py-1 text-xs font-semibold"
+                              className="rounded-xl bg-amber-50 border border-amber-300 text-amber-800 hover:bg-amber-100 disabled:bg-slate-100 disabled:text-slate-400 px-3 py-1 text-xs font-semibold transition"
                             >
                               إعادة فتح
                             </button>
@@ -1433,7 +1455,7 @@ export default function PeriodClosePage() {
                 </table>
               </div>
             )}
-          </section>
+          </SectionCard>
         </div>
       )}
 
@@ -1441,20 +1463,15 @@ export default function PeriodClosePage() {
           TAB 3: AUDIT TRAIL
          ===================================================== */}
       {activeTab === 'audit_log' && (
-        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
-            <div>
-              <h2 className="text-lg font-bold text-slate-800">سجل التدقيق والعمليات (Audit Trail)</h2>
-              <p className="text-xs text-slate-500">
-                تسجيل رقابي غير قابل للتعديل لجميع عمليات الإقفال وإعادة الفتح
-              </p>
-            </div>
-
+        <SectionCard
+          title="سجل التدقيق والعمليات (Period Close Audit Trail)"
+          description="تسجيل رقابي غير قابل للتعديل لكافة عمليات الإقفال وإعادة الفتح مع المبررات والمستخدمين"
+          actions={
             <div className="flex items-center gap-2">
               <select
                 value={auditActionFilter}
                 onChange={(e) => setAuditActionFilter(e.target.value)}
-                className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500"
+                className="rounded-xl border border-slate-300 px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
               >
                 <option value="">كل العمليات</option>
                 <option value="CLOSED">إقفال (CLOSED)</option>
@@ -1466,25 +1483,28 @@ export default function PeriodClosePage() {
               <button
                 onClick={loadAuditLogs}
                 disabled={loadingAuditLogs}
-                className="rounded-lg bg-slate-100 hover:bg-slate-200 px-3 py-1.5 text-xs text-slate-700 font-medium"
+                className="rounded-xl bg-slate-100 hover:bg-slate-200 px-3 py-1.5 text-xs text-slate-700 font-medium transition"
               >
                 {loadingAuditLogs ? 'تحديث...' : 'تحديث'}
               </button>
             </div>
-          </div>
-
+          }
+        >
           {auditLogsError && (
-            <p className="text-xs text-rose-600 mb-3">{auditLogsError}</p>
+            <div className="mb-4">
+              <ErrorBanner title="خطأ في تحميل سجل التدقيق" message={auditLogsError} />
+            </div>
           )}
 
           {auditLogs.length === 0 ? (
-            <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-xl">
-              <p className="text-sm text-slate-500">لا توجد سجلات تدقيق مسجلة حتى الآن.</p>
-            </div>
+            <EmptyState
+              title="لا توجد سجلات تدقيق مسجلة"
+              description="لم يتم تسجيل عمليات إقفال أو إعادة فتح للفترات بعد."
+            />
           ) : (
-            <div className="overflow-x-auto rounded-lg border border-slate-200">
+            <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs">
               <table className="w-full text-right text-xs">
-                <thead className="bg-slate-100 text-slate-700 font-semibold">
+                <thead className="bg-slate-100/80 text-slate-700 font-semibold border-b border-slate-200">
                   <tr>
                     <th className="p-3">التاريخ والوقت</th>
                     <th className="p-3">الإجراء (Action)</th>
@@ -1494,16 +1514,16 @@ export default function PeriodClosePage() {
                     <th className="p-3">بيانات إضافية (Metadata)</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-200">
+                <tbody className="divide-y divide-slate-100">
                   {auditLogs.map((log) => (
-                    <tr key={log.id} className="hover:bg-slate-50">
+                    <tr key={log.id} className="hover:bg-slate-50/80 transition-colors">
                       <td className="p-3 font-mono text-slate-800">{formatDateTime(log.createdAt)}</td>
                       <td className="p-3 font-semibold text-slate-900">
-                        <span className="rounded bg-slate-100 px-2 py-0.5 font-mono text-[11px] border border-slate-200">
+                        <span className="rounded-full bg-slate-100 px-2.5 py-0.5 font-mono text-[11px] border border-slate-200">
                           {log.action}
                         </span>
                       </td>
-                      <td className="p-3 text-slate-700">
+                      <td className="p-3 text-slate-700 font-medium">
                         {log.actorUser?.fullName ?? log.actorUser?.email ?? log.actorUserId}
                       </td>
                       <td className="p-3 text-slate-600 font-mono text-[11px]">
@@ -1523,7 +1543,7 @@ export default function PeriodClosePage() {
               </table>
             </div>
           )}
-        </section>
+        </SectionCard>
       )}
 
       {/* =====================================================
@@ -1532,18 +1552,18 @@ export default function PeriodClosePage() {
       {reopeningPeriod && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl space-y-4">
-            <h3 className="text-lg font-bold text-slate-900">
+            <h3 className="text-base font-bold text-slate-900">
               إعادة فتح الفترة المحاسبية
             </h3>
             <p className="text-xs text-slate-600">
               الفترة: <strong>{formatDate(reopeningPeriod.periodStart)}</strong> إلى <strong>{formatDate(reopeningPeriod.periodEnd)}</strong>
             </p>
-            <p className="text-xs text-amber-700 bg-amber-50 p-2.5 rounded-lg border border-amber-200">
-              ⚠️ تنبيه: إعادة فتح الفترة سيعيد السماح بترحيل وتعديل القيود والفواتير داخل هذا النطاق الزمني.
+            <p className="text-xs text-amber-800 bg-amber-50 p-3 rounded-xl border border-amber-200 leading-relaxed">
+              ⚠️ <strong>تنبيه رقابي:</strong> إعادة فتح الفترة سيعيد السماح بترحيل وتعديل القيود والفواتير وسندات الدفع داخل هذا النطاق الزمني.
             </p>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                 سبب إعادة الفتح (إلزامي) <span className="text-rose-500">*</span>
               </label>
               <textarea
@@ -1552,7 +1572,7 @@ export default function PeriodClosePage() {
                 placeholder="اذكر المبرر الرقابي لإعادة فتح الفترة..."
                 value={periodReopenReason}
                 onChange={(e) => setPeriodReopenReason(e.target.value)}
-                className="w-full rounded-lg border border-slate-300 p-2.5 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                className="w-full rounded-xl border border-slate-300 p-3 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
               />
             </div>
 
@@ -1561,7 +1581,7 @@ export default function PeriodClosePage() {
                 type="button"
                 onClick={() => setReopeningPeriod(null)}
                 disabled={submittingPeriodReopen}
-                className="rounded-lg bg-slate-100 hover:bg-slate-200 px-4 py-2 text-sm font-medium text-slate-700"
+                className="rounded-xl bg-slate-100 hover:bg-slate-200 px-4 py-2 text-xs font-medium text-slate-700 transition"
               >
                 إلغاء
               </button>
@@ -1569,7 +1589,7 @@ export default function PeriodClosePage() {
                 type="button"
                 onClick={handleConfirmPeriodReopen}
                 disabled={submittingPeriodReopen || !periodReopenReason.trim() || periodReopenReason.trim().length < 3}
-                className="rounded-lg bg-amber-600 hover:bg-amber-700 disabled:bg-slate-300 px-4 py-2 text-sm font-semibold text-white"
+                className="rounded-xl bg-amber-600 hover:bg-amber-700 disabled:bg-slate-300 px-4 py-2 text-xs font-semibold text-white transition shadow-xs"
               >
                 {submittingPeriodReopen ? 'جاري إعادة الفتح...' : 'تأكيد إعادة الفتح'}
               </button>
@@ -1584,18 +1604,18 @@ export default function PeriodClosePage() {
       {reopeningFy && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl space-y-4">
-            <h3 className="text-lg font-bold text-slate-900">
+            <h3 className="text-base font-bold text-slate-900">
               إعادة فتح السنة المالية {reopeningFy.fiscalYear}
             </h3>
             <p className="text-xs text-slate-600">
               النطاق: <strong>{formatDate(reopeningFy.fiscalYearStart)}</strong> إلى <strong>{formatDate(reopeningFy.fiscalYearEnd)}</strong>
             </p>
-            <p className="text-xs text-amber-700 bg-amber-50 p-2.5 rounded-lg border border-amber-200">
-              ⚠️ تنبيه: إعادة فتح السنة المالية سيعيد السماح بإجراء القيود المحاسبية التعديلية داخل هذه السنة.
+            <p className="text-xs text-amber-800 bg-amber-50 p-3 rounded-xl border border-amber-200 leading-relaxed">
+              ⚠️ <strong>تنبيه رقابي:</strong> إعادة فتح السنة المالية سيعيد السماح بإجراء القيود المحاسبية التعديلية داخل هذه السنة.
             </p>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                 سبب إعادة الفتح (إلزامي) <span className="text-rose-500">*</span>
               </label>
               <textarea
@@ -1604,7 +1624,7 @@ export default function PeriodClosePage() {
                 placeholder="اذكر المبرر الرقابي لإعادة فتح السنة المالية..."
                 value={fyReopenReason}
                 onChange={(e) => setFyReopenReason(e.target.value)}
-                className="w-full rounded-lg border border-slate-300 p-2.5 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                className="w-full rounded-xl border border-slate-300 p-3 text-xs focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
               />
             </div>
 
@@ -1613,7 +1633,7 @@ export default function PeriodClosePage() {
                 type="button"
                 onClick={() => setReopeningFy(null)}
                 disabled={submittingFyReopen}
-                className="rounded-lg bg-slate-100 hover:bg-slate-200 px-4 py-2 text-sm font-medium text-slate-700"
+                className="rounded-xl bg-slate-100 hover:bg-slate-200 px-4 py-2 text-xs font-medium text-slate-700 transition"
               >
                 إلغاء
               </button>
@@ -1621,7 +1641,7 @@ export default function PeriodClosePage() {
                 type="button"
                 onClick={handleConfirmFyReopen}
                 disabled={submittingFyReopen || !fyReopenReason.trim() || fyReopenReason.trim().length < 3}
-                className="rounded-lg bg-amber-600 hover:bg-amber-700 disabled:bg-slate-300 px-4 py-2 text-sm font-semibold text-white"
+                className="rounded-xl bg-amber-600 hover:bg-amber-700 disabled:bg-slate-300 px-4 py-2 text-xs font-semibold text-white transition shadow-xs"
               >
                 {submittingFyReopen ? 'جاري إعادة الفتح...' : 'تأكيد إعادة الفتح'}
               </button>
