@@ -3528,5 +3528,196 @@ function ensureJournalEntryCanCancel(entry: JournalEntry | null): asserts entry 
 - ❌ **أي تعديلات على إعدادات النشر السحابي أو البنية التحتية (Deployment changes)**.
 - ❌ **أي تعديلات على الـ schema أو الـ RBAC بعد المرحلة 14A-B-1**.
 
+---
+
+## Phase 15A: Audit Trail / Activity Log
+
+> تم تنفيذ المرحلة 15A بالكامل مع **216/216 e2e tests passing** عبر جميع مجموعات الاختبارات، وبناء سليم ونظيف تماماً للـ backend والـ frontend. توفر هذه المرحلة سجلاً رقابياً وتدقيقياً مركزياً غير قابل للتعديل أو الحذف (Append-Only & Tamper-Evident) يسجل كافة الأنشطة الإدارية والأمنية والمالية عبر المنظومة، مع عزل صارم للمستأجرين على مستوى `companyId`، ونظام حجب آلي وتشفير للمعلومات الحساسة (Masking & Redaction)، وواجهات قراءة واستعلام مدعومة بالترقيم التسلسلي والبحث المتقدم، وواجهة استعراض وتتبع متكاملة في الواجهة الأمامية عبر المسار `/admin/audit-logs`، مع حماية ثوابت النظام المحاسبي واستقلالية سجلات إقفال الفترات السابقة `PeriodCloseAuditLog`.
+
+### Completed Commits (Phase 15A)
+
+- `85cf076` — `docs(phase-15a): add audit trail architecture plan`
+- `f52450e` — `feat(phase-15a): add audit log schema and permissions`
+- `3f95836` — `feat(phase-15a): add audit log backend skeleton`
+- `1d32a2f` — `feat(phase-15a): add audit logging service helpers`
+- `ff7ba93` — `feat(phase-15a): integrate audit logging across business flows`
+- `15cc849` — `test(phase-15a): add audit log filtering e2e coverage`
+- `7bc6dee` — `feat(phase-15a): add audit log frontend viewer`
+
+---
+
+### 1. Scope (النطاق المحقق)
+1. **Centralized tenant-scoped audit trail**: سجل تدقيق مركزي معزول بالكامل لكل شركة مستأجرة بواسطة `companyId`.
+2. **Append-only activity log model**: نموذج بيانات تسلسلي يمنع التعديل أو الحذف برمجياً ومحمي بالثوابت الرقابية.
+3. **Read-only audit-log APIs**: واجهات برمجية مخصصة للاستعلام المتقدم والتفاصيل والمخطط الزمني للكيانات ومعاينة التصدير.
+4. **Audit logging helpers and redaction utilities**: دوال خدمة مساعدة وحجب آلي وتطهير لجميع البيانات والمدخلات الحساسة قبل التخزين.
+5. **Business-flow audit integrations**: تكامل شامل مع تدفقات المحاسبة، إقفال الفترات، المدفوعات، المبيعات، المشتريات، والمطابقة البنكية.
+6. **Frontend viewer at `/admin/audit-logs`**: واجهة مستخدم تفاعلية متكاملة محكومة بالصلاحيات مع فلاتر شاملة وتفاصيل السجلات ومخطط الكيانات.
+7. **Export preview only, no direct file download**: احتساب ومعاينة عدد السجلات المطابقة للتصدير فقط دون تفعيل تحميل ملفات مباشر حرصاً على أمان البيانات.
+8. **No changes to core accounting semantics**: الحفاظ التام والكامل على دلالات وسلوك المحاسبة والدفعات ودفتر الأستاذ العام.
+
+---
+
+### 2. Data Model (نموذج البيانات)
+تم إدخال نموذج `AuditLog` والتعدادات المرتبطة به في مخطط Prisma (`schema.prisma`):
+
+- **التعدادات الرقابية (Audit Enums)**:
+  - `AuditActorType`: `USER` (مستخدم بشري) | `SYSTEM` (عمليات النظام الآلية) | `API_KEY` (مفاتيح التكامل البرمجي).
+  - `AuditCategory`: 11 تصنيفاً شاملاً تغطي:
+    `AUTH` (الأمان والمصادقة)، `USER` (إدارة المستخدمين)، `RBAC` (الأدوار والصلاحيات)، `ACCOUNTING` (المحاسبة والقيود)، `FINANCIAL_REPORTING` (التقارير المالية)، `SALES` (المبيعات والفواتير)، `PURCHASES` (المشتريات)، `PAYMENTS` (المدفوعات والتحصيلات)، `RECONCILIATION` (المطابقة البنكية)، `PERIOD_CLOSE` (إقفال الفترات)، `SYSTEM` (تهيئة النظام).
+  - `AuditSeverity`: `INFO` | `WARNING` | `ERROR` | `SECURITY`.
+  - `AuditStatus`: `SUCCESS` | `FAILURE` | `BLOCKED`.
+
+- **نموذج `AuditLog`**:
+  - `id`: المعرّف الفريد للسجل (UUID).
+  - `companyId` (String?): معرّف الشركة المستأجرة (عزل تام للمستأجرين).
+  - `actorUserId` (String?) و `actorType`: هوية ونوع المنفذ للعملية.
+  - `category`, `event`, `severity`, `status`: تصنيف الحدث، اسم المعاملة، ومستوى الأهمية والنتيجة.
+  - `entityType`, `entityId`, `action`: نوع الكيان المتأثر (مثل `JournalEntry`, `SalesInvoice`) ومعرّفه ونوع الإجراء.
+  - `requestId`, `route`, `method`, `ipAddress`, `userAgent`: سياق الطلب البرمجي، ومعرّف الربط (Correlation ID)، وعنوان الشبكة والعميل.
+  - `before`, `after`, `metadata` (Json?): حمولة التغييرات والبيانات الوصفية بعد الحجب والتطهير.
+  - `message` (String?): ملخص نصي مقروء للعملية.
+  - `createdAt` (DateTime): الطابع الزمني لإنشاء السجل.
+  - **العلاقات (Relations)**: علاقة مع نموذج `Company` ومع نموذج `User`.
+  - **الفهارس المتقدمة (Indexes)**:
+    - `@@index([companyId, createdAt])` (الترتيب الزمني واستعلامات الشركة).
+    - `@@index([companyId, category, createdAt])` (التصفية بالتصنيف والتاريخ).
+    - `@@index([companyId, entityType, entityId])` (المخطط الزمني وتتبع الكيان).
+    - `@@index([companyId, actorUserId, createdAt])` (تتبع نشاط المستخدم).
+    - `@@index([companyId, severity, status])` (رصد التنبيهات والأخطاء).
+    - `@@index([companyId, requestId])` (تتبع الطلب بالـ Request ID).
+  - **استقلالية `PeriodCloseAuditLog`**: جدول `PeriodCloseAuditLog` السابق المخصص لإقفال الفترات بقي مستقلاً تماماً في مكانه ولم يتم حذفه أو استبداله لضمان التوافقية الرجعية وسلامة الرقابة المحاسبية.
+
+---
+
+### 3. RBAC (الأذونات والصلاحيات)
+تم تسجيل وتأمين أذونات مخصصة لسجل التدقيق مدمجة في نظام الصلاحيات:
+- **`audit_log.read`**: استعراض قائمة سجلات التدقيق، والتفاصيل الكاملة للسجل، والمخطط الزمني للكيانات، والوصول لشاشة العرض.
+- **`audit_log.export`**: تشغيل واجهة معاينة التصدير واستعراض إحصائيات السجلات المطابقة للشروط.
+- **`audit_log.admin`**: صلاحية إدارية محجوزة للاستخدامات الإدارية المستقبلية المتقدمة.
+- **سلوك البوابات في الواجهة**: المستخدم المحروم من `audit_log.read` يُحجب عنه الوصول وتُعرض له شاشة عدم تصريح واضحة. وزر معاينة التصدير لا يظهر ولا يُفعل إلا لمن يملك صلاحية `audit_log.export`.
+
+---
+
+### 4. APIs (واجهات برمجة التطبيقات)
+المسارات المتاحة تحت البادئة `/api/audit-logs`:
+
+- `GET /api/audit-logs`: استعراض سجلات التدقيق الخاصة بشركة المستخدم المستأجرة بترقيم تسلسلي مرن (`cursor-based pagination`).
+- `GET /api/audit-logs/:id`: جلب التفاصيل الشاملة لسجل تدقيق معين وحمولات الـ JSON وبيانات الطلب.
+- `GET /api/audit-logs/entity/:entityType/:entityId`: استرجاع المخطط الزمني الكامل للتغييرات التي طرأت على كيان محدد.
+- `GET /api/audit-logs/export-preview`: استرجاع عدد السجلات المطابقة لشروط الفلترة وإشعار النظام بالمعاينة دون تحميل ملفات.
+
+#### معاملات التصفية المدعومة (Query Filters):
+- `fromDate` و `toDate`: نطاق زمني بتنسيق ISO Date.
+- `category`: أحد التصنيفات الـ 11 المعتمدة.
+- `event`: تصفية باسم الحدث المحدد.
+- `severity`: مستوى الأهمية (`INFO`, `WARNING`, `ERROR`, `SECURITY`).
+- `status`: حالة النتيجة (`SUCCESS`, `FAILURE`, `BLOCKED`).
+- `actorUserId`: معرّف المستخدم المنفذ.
+- `entityType` و `entityId`: نوع الكيان ومعرّفه المستهدف.
+- `requestId`: معرّف الطلب الشبكي.
+- `limit` (1-200): عدد السجلات المسترجعة (افتراضياً 100 في الـ backend و 50 في الـ frontend).
+- `cursor`: معرّف السجل الأخير لجلب الصفحة التالية بسلاسة.
+
+---
+
+### 5. Redaction and Privacy (سياسة الخصوصية وحجب البيانات)
+يوفر نظام التدقيق حماية صارمة لمنع تسريب البيانات الحساسة والسرية:
+- **حجب المفاتيح الحساسة (Sensitive Keys Masking)**:
+  حجب تلقائي بالرمز `***REDACTED***` لكافة الحقول الحساسة وما يشابهها:
+  `password`, `hash`, `token`, `secret`, `apiKey`, `refreshToken`, `accessToken`, `authorization`, `cookie`, `iban`, `accountNumber`, `creditCard`, `cvv`.
+- **أمان وحجم الحمولات (JSON-Safe & Truncation)**:
+  معالجة الحمولات لتكون آمنة من الحلقات التكرارية (`circular references`) وتقليص السلاسل النصية الطويلة لعدم تضخيم قاعدة البيانات.
+- **استبعاد محتويات الملفات والمصادقات**:
+  استبعاد المحتوى الخام لملفات كشوف الحسابات (CSV raw content) من الحمولات والاحتفاظ فقط ببيانات المعالجة الإحصائية (اسم الملف، عدد الأسطر، المعاملات).
+- **أمان الواجهة الأمامية**:
+  لا تقوم الواجهة الأمامية بأي محاولة لفك التشفير أو كشف الحجب (No client-side unredaction)، ولا يتم تخزين أي سجلات أو تفاصيل تدقيق في `localStorage` أو `sessionStorage`.
+
+---
+
+### 6. Audit Integrations (تكاملات أحداث الأعمال)
+تم ربط تسجيل أحداث التدقيق بسلاسة عبر العمليات الحيوية:
+- **المحاسبة (Accounting Core)**:
+  - إنشاء مسودة قيد يدوي (`JOURNAL_CREATED`).
+  - تعديل مسودة قيد يدوي (`JOURNAL_UPDATED`).
+  - ترحيل قيد يدوي (`JOURNAL_POSTED`).
+  - إلغاء قيد مسودة يدوي (`JOURNAL_CANCELLED`).
+- **إقفال الفترات (Period Close)**:
+  - إقفال فترة محاسبية شهرية (`PERIOD_CLOSED`).
+  - إعادة فتح فترة محاسبية (`PERIOD_REOPENED`).
+  - إقفال سنة مالية (`FISCAL_YEAR_CLOSED`).
+  - إعادة فتح سنة مالية (`FISCAL_YEAR_REOPENED`).
+- **المدفوعات (Payments Settlement)**:
+  - ترحيل سند قبض عميل لدفعة فاتورة مبيعات (`AR_PAYMENT_POSTED`).
+  - ترحيل سند صرف مورد لدفعة فاتورة مشتريات (`AP_PAYMENT_POSTED`).
+- **المبيعات (Sales Invoices)**:
+  - إنشاء فاتورة مبيعات مسودة (`SALES_INVOICE_CREATED`).
+  - إصدار وترحيل فاتورة مبيعات (`SALES_INVOICE_ISSUED`).
+  - إلغاء فاتورة مبيعات (`SALES_INVOICE_CANCELLED`).
+- **المشتريات (Purchase Invoices)**:
+  - إنشاء فاتورة مشتريات مسودة (`PURCHASE_INVOICE_CREATED`).
+  - استلام وترحيل فاتورة مشتريات (`PURCHASE_INVOICE_RECEIVED`).
+  - إلغاء فاتورة مشتريات (`PURCHASE_INVOICE_CANCELLED`).
+- **المطابقة البنكية (Bank Reconciliation)**:
+  - إنشاء وتعديل وحذف الحسابات البنكية (`BANK_ACCOUNT_CREATED`, `UPDATED`, `DELETED`).
+  - استيراد كشف حساب بنكي CSV بنجاح (`BANK_STATEMENT_IMPORTED`).
+  - حظر ومحاولة استيراد كشف بنكي مكرر (`BANK_STATEMENT_DUPLICATE_BLOCKED`).
+  - إنشاء مطابقة بنكية (`RECONCILIATION_MATCH_CREATED`).
+  - إلغاء مطابقة بنكية (`RECONCILIATION_MATCH_DELETED`).
+
+---
+
+### 7. Frontend Workspace (واجهة مستعرض سجلات التدقيق)
+مسار الصفحة: `/admin/audit-logs`
+- **حماية الصلاحيات**: تشترط صلاحية `audit_log.read`، مع إظهار بطاقة توجيهية وودية للمستخدمين غير المصرح لهم.
+- **شريط الفلاتر الشامل (Filter Bar)**:
+  - اختيار التواريخ من/إلى، التصنيف، الحدث، مستوى الأهمية، النتيجة، معرّف المستخدم المنفذ، نوع ومعرّف الكيان، معرّف الطلب، وحد النتائج.
+  - أزرار تطبيق التصفية وإعادة الضبط السريع.
+- **جدول السجلات التفاعلي**:
+  - عرض التوقيت، المستخدم المنفذ، التصنيف، الحدث، الكيان المستهدف، الحالة، ومستوى الأهمية.
+  - شارات ملونة بدقة:
+    - `INFO` / `SUCCESS`: أخضر زمردي هادئ.
+    - `WARNING` / `BLOCKED`: أصفر كهرماني تحذيري.
+    - `ERROR` / `SECURITY`: أحمر وبنفسجي داكن.
+- **نافذة تفاصيل السجل (Details Modal)**:
+  - عرض كامل لبيانات السجل والطلب والشبكة ومعرّف الربط والرسالة.
+  - استعراض منسق وأنيق لبيانات JSON للقراءة فقط عبر تبويبات `Metadata` و `Before` و `After` مع عدم إمكانية تعديلها برمجياً.
+- **نافذة المخطط الزمني للكيان (Entity Timeline Modal)**:
+  - زر مباشر لاستعراض التاريخ الكامل لأي كيان محدد زمنيّاً من نقطة إنشائه وحتى آخر تعديل طرأ عليه.
+- **نافذة معاينة التصدير (Export Preview Modal)**:
+  - مقيدة بصلاحية `audit_log.export` وتعرض عدد السجلات المطابقة للشروط ورسالة النظام وتنويه الأمان بعدم وجود تصدير مباشر.
+- **تجربة استخدام احترافية (Enterprise UX)**:
+  - ترقيم تسلسلي مرن (`Cursor-based Next Page`)، وحالات التحميل، ورسائل الخطأ، وحالة فراغ البيانات، وتوافق كامل مع الاتجاه من اليمين لليسار (RTL).
+
+---
+
+### 8. Accounting and Safety Invariants (الثوابت المحاسبية والأمان)
+- **أثر جانبي آمن (Side-Effect Only)**: عمليات كتابة سجلات التدقيق مصممة كأثر جانبي آمن؛ أي فشل غير حرج في تسجيل التدقيق لا يجهض المعاملة المحاسبية الأصلية ما لم تكن المعاملة داخل `$transaction` ملزمة رقابياً.
+- **عدم المساس بدلالات الدفعات**: لا تتغير حالات الدفعات `Payment.status` إطلاقاً جراء تسجيل التدقيق وتظل متسقة مع قواعد المراحل السابقة.
+- **ثبات دفتر الأستاذ العام**: لا يتم تغيير بنية أو شروط ترحيل أسطر القيود `JournalEntry` أو `JournalEntryLine`.
+- **ثبات إقفال الفترات**: لا يتم تعديل شروط إقفال الفترات أو السنوات المالية أو قيد الأرباح المبقاة المؤجل.
+- **استقلالية التقارير**: التقارير المحاسبية والقوائم المالية تظل مستمرة في القراءة المباشرة دون أي تعديل في صيغها.
+
+---
+
+### 9. Verification Summary (سجل التحقق المعتمد)
+- **Prisma Client Generate**: **PASS** (`Prisma Client v5.22.0`).
+- **Backend Build (`pnpm --filter @erp/backend build`)**: **PASS** (NestJS compiled cleanly).
+- **Backend E2E Tests (`pnpm --filter @erp/backend test:e2e`)**: **PASS = 216/216 tests** عبر مجموعتي الاختبار (`reports.e2e-spec.ts` و `app.e2e-spec.ts`).
+- **Frontend Build (`pnpm --filter @erp/frontend build`)**: **PASS** (Next.js compiled with 20 static routes including `○ /admin/audit-logs`).
+- **حالة شجرة العمل (Working Tree)**: نظيفة ومستقرة تماماً خلال التحقق النهائي في المرحلة 15A-D-1 دون أي تعديل غير مصرح به على الملفات.
+
+---
+
+### 10. Out of Scope (خارج النطاق ومؤجل للمراحل القادمة)
+- ❌ **توليد وتحميل ملفات التصدير الحقيقية (Real File Export Generation - CSV/Excel)**.
+- ❌ **الربط مع أنظمة إدارة الأحداث والأمن الخارجية (SIEM / Syslog Forwarding)**.
+- ❌ **سجلات البلوكشين أو السجلات الخارجية المشفرة (Blockchain / External Ledgers)**.
+- ❌ **اللقطات الكاملة لكل كيان قبل وبعد في كل خطوة (Full Diff Snapshots for every entity)**.
+- ❌ **كشف التهديدات والشذوذ بالذكاء الاصطناعي (AI Anomaly Detection)**.
+- ❌ **الأرشفة الدورية وأتمتة مسح السجلات القديمة (Data Retention Automation)**.
+- ❌ **استعراض سجلات التدقيق عبر المستأجرين (Cross-Tenant Audit Browsing)**.
+- ❌ **أي تعديلات على إعدادات النشر أو خوادم الإنتاج (Deployment / Infrastructure changes)**.
+
 
 
