@@ -730,6 +730,17 @@ export const api = {
   closeFiscalYear: (data: CloseFiscalYearInput) => closeFiscalYear(data),
   reopenFiscalYear: (id: string, data: { reason: string }) =>
     reopenFiscalYear(id, data),
+
+  // ===== Phase 15A: Audit Logs =====
+  getAuditLogs: (params?: AuditLogQueryParams) => getAuditLogs(params),
+  getAuditLogById: (id: string) => getAuditLogById(id),
+  getAuditLogsForEntity: (
+    entityType: string,
+    entityId: string,
+    params?: EntityTimelineQueryParams,
+  ) => getAuditLogsForEntity(entityType, entityId, params),
+  getAuditLogExportPreview: (params?: AuditLogQueryParams) =>
+    getAuditLogExportPreview(params),
 };
 
 
@@ -2702,6 +2713,169 @@ export function reopenFiscalYear(
       method: 'POST',
       body: data,
     },
+  );
+}
+
+// =====================================================
+// Phase 15A: Audit Log Types & API Wrappers
+// =====================================================
+
+export type AuditCategoryKey =
+  | 'AUTH'
+  | 'USER'
+  | 'RBAC'
+  | 'ACCOUNTING'
+  | 'FINANCIAL_REPORTING'
+  | 'SALES'
+  | 'PURCHASES'
+  | 'PAYMENTS'
+  | 'RECONCILIATION'
+  | 'PERIOD_CLOSE'
+  | 'SYSTEM';
+
+export type AuditSeverityKey = 'INFO' | 'WARNING' | 'ERROR' | 'SECURITY';
+
+export type AuditStatusKey = 'SUCCESS' | 'FAILURE' | 'BLOCKED';
+
+export type AuditActorTypeKey = 'USER' | 'SYSTEM' | 'API_KEY';
+
+export interface AuditLogActorUser {
+  id: string;
+  fullName: string;
+  email: string;
+}
+
+export interface AuditLogItem {
+  id: string;
+  companyId: string | null;
+  actorUserId: string | null;
+  actorUser?: AuditLogActorUser | null;
+  actorType: AuditActorTypeKey;
+  category: AuditCategoryKey;
+  event: string;
+  entityType: string | null;
+  entityId: string | null;
+  action: string | null;
+  severity: AuditSeverityKey;
+  status: AuditStatusKey;
+  requestId: string | null;
+  ipAddress: string | null;
+  userAgent: string | null;
+  route: string | null;
+  method: string | null;
+  before: unknown;
+  after: unknown;
+  metadata: unknown;
+  message: string | null;
+  createdAt: string;
+}
+
+export interface AuditLogQueryParams {
+  fromDate?: string;
+  toDate?: string;
+  category?: AuditCategoryKey;
+  event?: string;
+  severity?: AuditSeverityKey;
+  status?: AuditStatusKey;
+  actorUserId?: string;
+  entityType?: string;
+  entityId?: string;
+  requestId?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface EntityTimelineQueryParams {
+  limit?: number;
+  cursor?: string;
+}
+
+export interface AuditLogListResponse {
+  status: 'ok';
+  companyId: string;
+  filters: Record<string, unknown>;
+  data: {
+    items: AuditLogItem[];
+    nextCursor: string | null;
+  };
+}
+
+export interface AuditLogSingleResponse {
+  status: 'ok';
+  companyId: string;
+  data: {
+    item: AuditLogItem;
+  };
+}
+
+export interface AuditLogExportPreviewResponse {
+  status: 'ok';
+  companyId: string;
+  filters: Record<string, unknown>;
+  data: {
+    count: number;
+    exportImplemented: false;
+    message: string;
+  };
+}
+
+export function getAuditLogs(
+  params: AuditLogQueryParams = {},
+): Promise<AuditLogListResponse> {
+  const q = new URLSearchParams();
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  if (params.category) q.set('category', params.category);
+  if (params.event) q.set('event', params.event);
+  if (params.severity) q.set('severity', params.severity);
+  if (params.status) q.set('status', params.status);
+  if (params.actorUserId) q.set('actorUserId', params.actorUserId);
+  if (params.entityType) q.set('entityType', params.entityType);
+  if (params.entityId) q.set('entityId', params.entityId);
+  if (params.requestId) q.set('requestId', params.requestId);
+  if (params.limit !== undefined) q.set('limit', String(params.limit));
+  if (params.cursor) q.set('cursor', params.cursor);
+  const qs = q.toString();
+  return apiRequest<AuditLogListResponse>(`/audit-logs${qs ? `?${qs}` : ''}`);
+}
+
+export function getAuditLogById(id: string): Promise<AuditLogSingleResponse> {
+  return apiRequest<AuditLogSingleResponse>(`/audit-logs/${encodeURIComponent(id)}`);
+}
+
+export function getAuditLogsForEntity(
+  entityType: string,
+  entityId: string,
+  params: EntityTimelineQueryParams = {},
+): Promise<AuditLogListResponse> {
+  const q = new URLSearchParams();
+  if (params.limit !== undefined) q.set('limit', String(params.limit));
+  if (params.cursor) q.set('cursor', params.cursor);
+  const qs = q.toString();
+  return apiRequest<AuditLogListResponse>(
+    `/audit-logs/entity/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}${qs ? `?${qs}` : ''}`,
+  );
+}
+
+export function getAuditLogExportPreview(
+  params: AuditLogQueryParams = {},
+): Promise<AuditLogExportPreviewResponse> {
+  const q = new URLSearchParams();
+  if (params.fromDate) q.set('fromDate', params.fromDate);
+  if (params.toDate) q.set('toDate', params.toDate);
+  if (params.category) q.set('category', params.category);
+  if (params.event) q.set('event', params.event);
+  if (params.severity) q.set('severity', params.severity);
+  if (params.status) q.set('status', params.status);
+  if (params.actorUserId) q.set('actorUserId', params.actorUserId);
+  if (params.entityType) q.set('entityType', params.entityType);
+  if (params.entityId) q.set('entityId', params.entityId);
+  if (params.requestId) q.set('requestId', params.requestId);
+  if (params.limit !== undefined) q.set('limit', String(params.limit));
+  if (params.cursor) q.set('cursor', params.cursor);
+  const qs = q.toString();
+  return apiRequest<AuditLogExportPreviewResponse>(
+    `/audit-logs/export-preview${qs ? `?${qs}` : ''}`,
   );
 }
 

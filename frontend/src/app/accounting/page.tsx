@@ -638,6 +638,14 @@ export default function AccountingPage() {
               إقفال الفترات
             </Link>
           )}
+          {hasPermission('audit_log.read') && (
+            <Link
+              href="/admin/audit-logs"
+              className="rounded-md bg-slate-700 hover:bg-slate-800 text-white text-sm px-4 py-2"
+            >
+              سجل التدقيق
+            </Link>
+          )}
 
           <Link
             href="/dashboard"
