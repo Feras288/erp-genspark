@@ -1,41 +1,25 @@
 'use client';
 
 // =====================================================
-// Phase 6 — Accounting page (Chart of Accounts + Manual
-// Journal Entries).
+// Phase 18A-B-4: Accounting Workspace UX Polish
 //
-// - Loads /api/accounting/accounts and /api/accounting/journal
-//   (companyId from JWT only, via useAuth().user.companyId).
-// - Allow admins / accountants to:
-//
-//   Chart of Accounts (left)
-//     - List active + inactive accounts (paginated, search by code/name)
-//     - Create a new account (code/name/type×normalBalance/parented or top-level)
-//     - Patch an existing account (name / nameAr / type / normalBalance / parent / isActive)
-//     - Soft-delete an account (server returns 409 if any POSTED line references it)
-//
-//   Manual Journal Entries (right)
-//     - List DRAFT/POSTED/CANCELLED entries (paginated, search)
-//     - Create a balanced DRAFT entry (≥2 lines; debit XOR credit on each line;
-//       totalDebit == totalCredit — server computes and rejects)
-//     - Patch a DRAFT entry (notes/reference/description/entryDate; full line replace
-//       if `lines` provided)
-//     - Post a DRAFT entry (server flips DRAFT → POSTED; postedAt set)
-//     - Cancel a DRAFT entry (server flips DRAFT → CANCELLED); server returns 409
-//       on cancelled-again and 409 on posted-cancel ("reverse entries out of scope")
-//
-// - RBAC gating: only users with `accounting.read` can view; `accounts.*` /
-//   `journal.*` gates each row action — buttons are disabled rather than hidden
-//   so the user can see why an action is unavailable.
-// - Decimals are string-typed end to end (no Number arithmetic for money).
-// - No mock data; no localStorage / sessionStorage; access token stays in-memory
-//   inside lib/api only.
-// - No financial reports / Trial Balance / VAT / ZATCA surfaced — out of scope.
+// - Modern Arabic / RTL-friendly SaaS interface.
+// - Standardized PageHeader ("مركز المحاسبة").
+// - Executive navigation cards for Chart of Accounts, Journal,
+//   Financial Reports, Reconciliation, Period Close, and Audit Logs.
+// - Top KPI summary cards for accounts & journal entries.
+// - Modern SectionCard containers for Chart of Accounts & Manual Journals.
+// - Enhanced forms, status badges, and cleaner tables.
+// - Preserves 100% of existing backend API endpoints, parameters, and responses.
+// - Preserves 100% of permissions (`accounting.read`, `accounting.accounts.*`,
+//   `accounting.journal.*`, `gl_journal.read`, `reconciliation.read`,
+//   `period_close.read`, `audit_log.read`).
+// - Decimal columns serialize as strings end to end (no Float coercion).
 // =====================================================
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 import { api, ApiError } from '@/lib/api';
 import type {
@@ -50,6 +34,18 @@ import type {
   UpdateAccountInput,
   UpdateJournalEntryInput,
 } from '@/lib/api';
+import {
+  PageHeader,
+  KpiCard,
+  StatusBadge,
+  EmptyState,
+  LoadingState,
+  ErrorBanner,
+  AccessDeniedState,
+  SectionCard,
+  FilterSection,
+} from '@/components/ui';
+import { fmtDisplayMoney } from '@/lib/ui';
 
 // ---------- Local form state types ----------------------------
 
@@ -88,8 +84,6 @@ const ACCOUNT_TYPES: AccountTypeKey[] = [
   'EXPENSE',
 ];
 
-// Invariant: ASSET + EXPENSE → DEBIT; LIABILITY + EQUITY + REVENUE → CREDIT.
-// Surfaced client-side as a fixed mapping so the user can't pick the wrong side.
 const NORMAL_BALANCE_FOR_TYPE: Record<AccountTypeKey, NormalBalanceKey> = {
   ASSET: 'DEBIT',
   EXPENSE: 'DEBIT',
@@ -133,14 +127,14 @@ function fmtMoney(s: string | number | null | undefined): string {
   const n = Number(s);
   if (!Number.isFinite(n)) return '—';
   return n.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
+    minimumFractionDigits: 2,
     maximumFractionDigits: 4,
   });
 }
 
 function fmtDate(s: string | null | undefined): string {
   if (!s) return '—';
-  return s.slice(0, 19).replace('T', ' ');
+  return s.slice(0, 10);
 }
 
 function arAccountType(t: AccountTypeKey): string {
@@ -162,41 +156,32 @@ function arNormalBalance(b: NormalBalanceKey): string {
   return b === 'DEBIT' ? 'مدين' : 'دائن';
 }
 
-function arStatus(s: JournalEntryStatusKey): string {
-  switch (s) {
-    case 'DRAFT':
-      return 'مسودة';
-    case 'POSTED':
-      return 'مرحّل';
-    case 'CANCELLED':
-      return 'ملغى';
-  }
-}
-
 // ---------- Component --------------------------------------------
 
 export default function AccountingPage() {
   const router = useRouter();
   const { user, loading, hasPermission } = useAuth();
 
-  // ---- permissions ----------------------------------------------
+  // ---- Permissions ----------------------------------------------
   const canRead = !!user && hasPermission('accounting.read');
   const canCreateAccount = !!user && hasPermission('accounting.accounts.create');
   const canUpdateAccount = !!user && hasPermission('accounting.accounts.update');
   const canDeleteAccount = !!user && hasPermission('accounting.accounts.delete');
-  const canCreateJournal = !!user && (
+  const canCreateJournal =
+    !!user &&
     hasPermission('accounting.journal.update') &&
-    hasPermission('accounting.accounts.create') // editing lines requires accounts.create per Phase 6 RBAC chain
-  );
-  // Phase 6 RBAC: PATCH on /journal uses accounting.journal.update; the same
-  // permission gates POST /journal because there's no separate `.create` perm.
-  // The controller only carries `accounting.journal.update` for both create
-  // and update on a journal entry, so we reuse it.
+    hasPermission('accounting.accounts.create');
   const canUpdateJournal = !!user && hasPermission('accounting.journal.update');
   const canPostJournal = !!user && hasPermission('accounting.journal.post');
   const canCancelJournal = !!user && hasPermission('accounting.journal.cancel');
 
-  // ---- accounts list --------------------------------------------
+  // Sub-modules permissions
+  const canReadReports = !!user && hasPermission('gl_journal.read');
+  const canReadRecon = !!user && hasPermission('reconciliation.read');
+  const canReadPeriodClose = !!user && hasPermission('period_close.read');
+  const canReadAuditLog = !!user && hasPermission('audit_log.read');
+
+  // ---- Accounts list --------------------------------------------
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [accountsTotal, setAccountsTotal] = useState(0);
   const [accountPage, setAccountPage] = useState(1);
@@ -207,13 +192,14 @@ export default function AccountingPage() {
   const [rowActionErr, setRowActionErr] = useState<string | null>(null);
   const pageSize = 50;
 
-  // ---- accounts form --------------------------------------------
+  // ---- Accounts form --------------------------------------------
+  const [isAccountFormOpen, setIsAccountFormOpen] = useState(false);
   const [accountForm, setAccountForm] = useState<AccountFormState>(emptyAccountForm());
   const [accountFormErr, setAccountFormErr] = useState<string | null>(null);
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
   const [submittingAccount, setSubmittingAccount] = useState(false);
 
-  // ---- journal list ---------------------------------------------
+  // ---- Journal list ---------------------------------------------
   const [journal, setJournal] = useState<JournalEntry[]>([]);
   const [journalTotal, setJournalTotal] = useState(0);
   const [journalPage, setJournalPage] = useState(1);
@@ -222,7 +208,8 @@ export default function AccountingPage() {
   const [journalErr, setJournalErr] = useState<string | null>(null);
   const [loadingJournal, setLoadingJournal] = useState(true);
 
-  // ---- journal form ---------------------------------------------
+  // ---- Journal form ---------------------------------------------
+  const [isJournalFormOpen, setIsJournalFormOpen] = useState(false);
   const [journalForm, setJournalForm] = useState<JournalFormState>(emptyJournalForm());
   const [journalFormErr, setJournalFormErr] = useState<string | null>(null);
   const [editingJournalId, setEditingJournalId] = useState<string | null>(null);
@@ -231,8 +218,7 @@ export default function AccountingPage() {
   // ---- Routing guards -------------------------------------------
   useEffect(() => {
     if (!loading && !user) router.replace('/login');
-    if (!loading && user && !canRead) router.replace('/dashboard');
-  }, [loading, user, canRead, router]);
+  }, [loading, user, router]);
 
   // ---- Loaders --------------------------------------------------
   const reloadAccounts = () => {
@@ -286,14 +272,12 @@ export default function AccountingPage() {
 
   useEffect(() => {
     const cleanup = reloadAccounts();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountPage, accountSearch, typeFilter, user, canRead]);
 
   useEffect(() => {
     const cleanup = reloadJournal();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [journalPage, journalSearch, statusFilter, user, canRead]);
@@ -316,8 +300,6 @@ export default function AccountingPage() {
     value: AccountFormState[K],
   ) => setAccountForm((f) => ({ ...f, [key]: value }));
 
-  // When type changes, snap normalBalance to the invariant so the user can't
-  // accidentally post an ASSET/EXPENSE with CREDIT — server will reject too.
   const onAccountTypeChange = (t: AccountTypeKey) => {
     setAccountForm((f) => ({
       ...f,
@@ -338,11 +320,14 @@ export default function AccountingPage() {
       isActive: a.isActive,
     });
     setAccountFormErr(null);
+    setIsAccountFormOpen(true);
   };
+
   const onCancelEditAccount = () => {
     setEditingAccountId(null);
     setAccountForm(emptyAccountForm());
     setAccountFormErr(null);
+    setIsAccountFormOpen(false);
   };
 
   const buildAccountPayload = (): CreateAccountInput | UpdateAccountInput => {
@@ -354,10 +339,17 @@ export default function AccountingPage() {
       throw new Error('الرمز يجب أن يكون من [A-Za-z0-9._-]');
     }
     if (!name) throw new Error('الاسم مطلوب');
-    if (accountForm.type !== 'ASSET' && accountForm.type !== 'EXPENSE' && accountForm.normalBalance !== 'CREDIT') {
+    if (
+      accountForm.type !== 'ASSET' &&
+      accountForm.type !== 'EXPENSE' &&
+      accountForm.normalBalance !== 'CREDIT'
+    ) {
       throw new Error('طبيعة الرصيد لا تطابق النوع المختار');
     }
-    if ((accountForm.type === 'ASSET' || accountForm.type === 'EXPENSE') && accountForm.normalBalance !== 'DEBIT') {
+    if (
+      (accountForm.type === 'ASSET' || accountForm.type === 'EXPENSE') &&
+      accountForm.normalBalance !== 'DEBIT'
+    ) {
       throw new Error('طبيعة الرصيد يجب أن تكون مدين للأصل/مصروف');
     }
     const base = {
@@ -368,7 +360,6 @@ export default function AccountingPage() {
       parentId: accountForm.parentId || undefined,
       isActive: accountForm.isActive,
     };
-    // Code only goes on CREATE — PATCH can't change it once posted.
     if (editingAccountId) {
       return { ...base, parentId: accountForm.parentId || null };
     }
@@ -381,25 +372,31 @@ export default function AccountingPage() {
     setSubmittingAccount(true);
     try {
       const payload = buildAccountPayload();
-      if (editingAccountId) await api.updateAccount(editingAccountId, payload as UpdateAccountInput);
+      if (editingAccountId)
+        await api.updateAccount(editingAccountId, payload as UpdateAccountInput);
       else await api.createAccount(payload as CreateAccountInput);
       onCancelEditAccount();
       reloadAccounts();
     } catch (err) {
       if (err instanceof ApiError) setAccountFormErr(err.message);
       else if (err instanceof Error) setAccountFormErr(err.message);
-      else setAccountFormErr('failed');
+      else setAccountFormErr('فشلت العملية');
     } finally {
       setSubmittingAccount(false);
     }
   };
 
   const onDeleteAccount = async (a: Account) => {
-    if (!window.confirm(`هل تريد حذف الحساب ${a.code} — ${a.name}؟\nسيتم إيقافه وحذفه برمجياً (لا يمكن حذف حساب مرتبط بقيود مرحّلة).`))
+    if (
+      !window.confirm(
+        `هل تريد حذف الحساب ${a.code} — ${a.name}؟\nسيتم إيقافه وحذفه برمجياً (لا يمكن حذف حساب مرتبط بقيود مرحّلة).`,
+      )
+    )
       return;
     setRowActionErr(null);
     try {
       await api.deleteAccount(a.id);
+      if (editingAccountId === a.id) onCancelEditAccount();
       reloadAccounts();
     } catch (err) {
       setRowActionErr(
@@ -407,7 +404,7 @@ export default function AccountingPage() {
           ? err.message
           : err instanceof Error
             ? err.message
-            : 'failed',
+            : 'فشل الحذف',
       );
     }
   };
@@ -425,64 +422,64 @@ export default function AccountingPage() {
       return { ...f, lines };
     });
   };
+
   const addLine = () =>
     setJournalForm((f) => ({ ...f, lines: [...f.lines, emptyLine()] }));
-  const removeLine = (idx: number) => {
-    setJournalForm((f) => {
-      if (f.lines.length <= 2) return f; // server requires ≥2
-      return { ...f, lines: f.lines.filter((_, i) => i !== idx) };
-    });
-  };
 
-  const onEditJournal = (e: JournalEntry) => {
-    if (e.status !== 'DRAFT') {
-      setRowActionErr('لا يمكن تعديل قيد غير مسودة');
-      return;
-    }
-    setEditingJournalId(e.id);
+  const removeLine = (idx: number) =>
+    setJournalForm((f) => ({
+      ...f,
+      lines: f.lines.filter((_, i) => i !== idx),
+    }));
+
+  const onEditJournal = (j: JournalEntry) => {
+    setEditingJournalId(j.id);
     setJournalForm({
-      entryDate: e.entryDate ? e.entryDate.slice(0, 10) : '',
-      description: e.description ?? '',
-      reference: e.reference ?? '',
-      notes: e.notes ?? '',
+      entryDate: j.entryDate ? j.entryDate.slice(0, 10) : '',
+      reference: j.reference ?? '',
+      description: j.description ?? '',
+      notes: j.notes ?? '',
       lines:
-        e.lines && e.lines.length >= 2
-          ? e.lines.map((l) => {
-              const accId = l.debitAccountId ?? l.creditAccountId ?? '';
-              return {
-                accountId: accId,
-                description: l.description ?? '',
-                debit: l.debit,
-                credit: l.credit,
-              };
-            })
+        j.lines && j.lines.length >= 2
+          ? j.lines.map((l) => ({
+              accountId: l.debitAccountId ?? l.creditAccountId ?? '',
+              description: l.description ?? '',
+              debit: l.debit || '',
+              credit: l.credit || '',
+            }))
           : [emptyLine(), emptyLine()],
     });
     setJournalFormErr(null);
+    setIsJournalFormOpen(true);
   };
+
   const onCancelEditJournal = () => {
     setEditingJournalId(null);
     setJournalForm(emptyJournalForm());
     setJournalFormErr(null);
+    setIsJournalFormOpen(false);
   };
 
-  const buildJournalPayload = (): CreateJournalEntryInput | UpdateJournalEntryInput => {
+  const buildJournalPayload = ():
+    | CreateJournalEntryInput
+    | UpdateJournalEntryInput => {
     if (journalForm.lines.length < 2) {
       throw new Error('القيد يجب أن يحتوي على سطرين على الأقل');
     }
     const lines: CreateJournalEntryLineInput[] = [];
-    let td = 0;
-    let tc = 0;
     for (const [idx, l] of journalForm.lines.entries()) {
-      if (!l.accountId) throw new Error(`السطر ${idx + 1}: الحساب مطلوب`);
-      const d = Number(l.debit);
-      const c = Number(l.credit);
-      if (!Number.isFinite(d) || d < 0) throw new Error(`السطر ${idx + 1}: المدين يجب أن يكون رقماً >= 0`);
-      if (!Number.isFinite(c) || c < 0) throw new Error(`السطر ${idx + 1}: الدائن يجب أن يكون رقماً >= 0`);
-      if (d > 0 && c > 0) throw new Error(`السطر ${idx + 1}: لا يمكن أن يكون مدين ودائن معاً`);
-      if (d === 0 && c === 0) throw new Error(`السطر ${idx + 1}: لا يمكن أن يكون كلاهما صفراً`);
-      td += d;
-      tc += c;
+      if (!l.accountId) throw new Error(`السطر ${idx + 1}: لم يتم اختيار حساب`);
+      const d = Number(l.debit || '0');
+      const c = Number(l.credit || '0');
+      if (!Number.isFinite(d) || !Number.isFinite(c)) {
+        throw new Error(`السطر ${idx + 1}: مبالغ غير صحيحة`);
+      }
+      if (d <= 0 && c <= 0) {
+        throw new Error(`السطر ${idx + 1}: يجب إدخال مدين أو دائن`);
+      }
+      if (d > 0 && c > 0) {
+        throw new Error(`السطر ${idx + 1}: لا يمكن أن يكون السطر مدين ودائن معاً`);
+      }
       lines.push({
         accountId: l.accountId,
         description: l.description.trim() || undefined,
@@ -490,23 +487,16 @@ export default function AccountingPage() {
         credit: l.credit.trim() || '0.0000',
       });
     }
-    // Server still enforces balance; we just pre-empt a 400 here so the user
-    // can see the mismatch before submitting.
-    if (Math.abs(td - tc) > 1e-6) {
-      throw new Error(`القيد غير متوازن: مدين=${td.toFixed(4)} ≠ دائن=${tc.toFixed(4)}`);
-    }
-    const header = {
+    const base = {
       entryDate: journalForm.entryDate || undefined,
-      description: journalForm.description.trim() || undefined,
       reference: journalForm.reference.trim() || undefined,
+      description: journalForm.description.trim() || undefined,
       notes: journalForm.notes.trim() || undefined,
     };
     if (editingJournalId) {
-      // On PATCH we send the full lines if any change is needed; backend will
-      // rebuild totals and validate again.
-      return { ...header, lines };
+      return { ...base, lines };
     }
-    return { ...header, lines };
+    return { ...base, lines };
   };
 
   const onSubmitJournal = async (e: React.FormEvent) => {
@@ -515,29 +505,30 @@ export default function AccountingPage() {
     setSubmittingJournal(true);
     try {
       const payload = buildJournalPayload();
-      if (editingJournalId) await api.updateJournalEntry(editingJournalId, payload as UpdateJournalEntryInput);
-      else await api.createJournalEntry(payload as CreateJournalEntryInput);
+      if (editingJournalId)
+        await api.updateJournalEntry(
+          editingJournalId,
+          payload as UpdateJournalEntryInput,
+        );
+      else
+        await api.createJournalEntry(payload as CreateJournalEntryInput);
       onCancelEditJournal();
       reloadJournal();
     } catch (err) {
       if (err instanceof ApiError) setJournalFormErr(err.message);
       else if (err instanceof Error) setJournalFormErr(err.message);
-      else setJournalFormErr('failed');
+      else setJournalFormErr('فشلت العملية');
     } finally {
       setSubmittingJournal(false);
     }
   };
 
-  const onPostJournal = async (e: JournalEntry) => {
-    if (e.status !== 'DRAFT') {
-      setRowActionErr('لا يمكن ترحيل قيد غير مسودة');
-      return;
-    }
-    if (!window.confirm(`هل تريد ترحيل القيد ${e.entryNumber}؟\nسيتم قفل القيد وتغيير حالته إلى مرحّل.`))
+  const onPostJournal = async (j: JournalEntry) => {
+    if (!window.confirm(`هل تريد ترحيل القيد ${j.entryNumber} الآن؟ لا يمكن التراجع عن الترحيل.`))
       return;
     setRowActionErr(null);
     try {
-      await api.postJournalEntry(e.id, {});
+      await api.postJournalEntry(j.id, {});
       reloadJournal();
     } catch (err) {
       setRowActionErr(
@@ -545,21 +536,16 @@ export default function AccountingPage() {
           ? err.message
           : err instanceof Error
             ? err.message
-            : 'failed',
+            : 'فشل الترحيل',
       );
     }
   };
 
-  const onCancelJournal = async (e: JournalEntry) => {
-    if (e.status !== 'DRAFT') {
-      setRowActionErr('لا يمكن إلغاء قيد مرحّل في هذه المرحلة (يلزم قيد عكسي)');
-      return;
-    }
+  const onCancelJournal = async (j: JournalEntry) => {
     const reason = window.prompt('سبب الإلغاء (اختياري):') ?? undefined;
     setRowActionErr(null);
     try {
-      await api.cancelJournalEntry(e.id, reason ? { reason } : {});
-      if (editingJournalId === e.id) onCancelEditJournal();
+      await api.cancelJournalEntry(j.id, reason ? { reason } : {});
       reloadJournal();
     } catch (err) {
       setRowActionErr(
@@ -567,39 +553,27 @@ export default function AccountingPage() {
           ? err.message
           : err instanceof Error
             ? err.message
-            : 'failed',
+            : 'فشل الإلغاء',
       );
     }
   };
 
-  // ---- Rendering guards -----------------------------------------
   if (loading) {
     return (
-      <main className="min-h-screen flex items-center justify-center p-8">
-        <p className="text-slate-500">...جاري التحميل</p>
+      <main className="min-h-screen p-8 flex items-center justify-center">
+        <LoadingState message="جاري تحميل مركز المحاسبة..." />
       </main>
     );
   }
-  if (!user) return null;
 
-  if (!canRead) {
+  if (!user || !canRead) {
     return (
-      <main className="min-h-screen p-8 bg-slate-50 flex items-center justify-center">
-        <div className="rounded-2xl border border-rose-200 bg-white p-8 max-w-md text-center shadow-md">
-          <div className="w-12 h-12 rounded-full bg-rose-100 text-rose-600 mx-auto flex items-center justify-center mb-4 text-2xl font-bold">
-            🚫
-          </div>
-          <h1 className="text-xl font-bold text-slate-800 mb-2">غير مصرح — Access Denied</h1>
-          <p className="text-slate-600 text-sm mb-6 leading-relaxed">
-            تتطلب هذه الصفحة توفر صلاحية <code className="bg-slate-100 px-1.5 py-0.5 rounded text-rose-600 text-xs">accounting.read</code>. يرجى مراجعة مسؤول النظام.
-          </p>
-          <Link
-            href="/dashboard"
-            className="inline-block rounded-xl bg-slate-800 hover:bg-slate-900 text-white text-sm font-medium px-5 py-2.5 transition-colors shadow-sm"
-          >
-            العودة إلى لوحة المعلومات
-          </Link>
-        </div>
+      <main className="min-h-screen p-8">
+        <AccessDeniedState
+          title="غير مصرح بعرض المحاسبة"
+          description="لا يملك حسابك الحالي صلاحية accounting.read المطلوبة للوصول إلى مركز المحاسبة."
+          requiredPermission="accounting.read"
+        />
       </main>
     );
   }
@@ -607,7 +581,7 @@ export default function AccountingPage() {
   const totalAccountsPages = Math.max(1, Math.ceil(accountsTotal / pageSize));
   const totalJournalPages = Math.max(1, Math.ceil(journalTotal / 20));
 
-  // ---- Live total preview for the right-side journal form -------
+  // Live balance calculation for journal form
   const liveTotals = (() => {
     let td = 0;
     let tc = 0;
@@ -624,190 +598,286 @@ export default function AccountingPage() {
     };
   })();
 
+  const postedJournalsCount = journal.filter((j) => j.status === 'POSTED').length;
+  const draftJournalsCount = journal.filter((j) => j.status === 'DRAFT').length;
+
   return (
-    <main className="min-h-screen p-8">
-      <header className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold text-slate-800">المحاسبة</h1>
-          <p className="text-sm text-slate-500">
-            دليل الحسابات والقيود اليدوية داخل شركتك ({user.companyId}). للاطلاع
-            على ميزان المراجعة وقائمة الدخل والميزانية العمومية، انتقل إلى صفحة
-            القوائم المالية.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {hasPermission('gl_journal.read') && (
+    <main className="min-h-screen p-4 sm:p-8 max-w-7xl mx-auto space-y-6">
+      {/* 1. Standardized Modern Page Header */}
+      <PageHeader
+        title="مركز المحاسبة"
+        subtitle="إدارة القيود، الحسابات، التقارير، الإقفال، والمراجعة من مكان واحد."
+        eyebrow="المحاسبة"
+        actions={
+          <div className="flex items-center gap-2">
             <Link
-              href="/accounting/reports"
-              className="rounded-md bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2"
+              href="/dashboard"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs sm:text-sm font-medium transition-colors shadow-xs"
             >
-              القوائم المالية
+              ← لوحة التحكم
             </Link>
-          )}
-          {hasPermission('reconciliation.read') && (
-            <Link
-              href="/accounting/reconciliation"
-              className="rounded-md bg-teal-600 hover:bg-teal-700 text-white text-sm px-4 py-2"
-            >
-              المطابقة البنكية
-            </Link>
-          )}
-          {hasPermission('period_close.read') && (
-            <Link
-              href="/accounting/period-close"
-              className="rounded-md bg-purple-600 hover:bg-purple-700 text-white text-sm px-4 py-2"
-            >
-              إقفال الفترات
-            </Link>
-          )}
-          {hasPermission('audit_log.read') && (
-            <Link
-              href="/admin/audit-logs"
-              className="rounded-md bg-slate-700 hover:bg-slate-800 text-white text-sm px-4 py-2"
-            >
-              سجل التدقيق
-            </Link>
-          )}
+          </div>
+        }
+      />
 
+      {/* 2. Executive Quick Navigation Strip (Permission-Gated) */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+        {canReadReports && (
           <Link
-            href="/dashboard"
-            className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-4 py-2"
+            href="/accounting/reports"
+            className="p-3.5 rounded-xl border border-indigo-100 bg-indigo-50/40 hover:bg-indigo-50 hover:border-indigo-200 transition-all flex items-center justify-between group shadow-2xs"
           >
-            لوحة المعلومات
+            <div>
+              <div className="text-xs font-bold text-indigo-950 group-hover:text-indigo-600 transition-colors">
+                القوائم المالية الختامية
+              </div>
+              <div className="text-[11px] text-indigo-600/80 mt-0.5">
+                ميزان المراجعة، الدخل، والميزانية
+              </div>
+            </div>
+            <span className="text-indigo-600 font-bold text-sm">←</span>
           </Link>
-        </div>
-      </header>
+        )}
 
+        {canReadRecon && (
+          <Link
+            href="/accounting/reconciliation"
+            className="p-3.5 rounded-xl border border-teal-100 bg-teal-50/40 hover:bg-teal-50 hover:border-teal-200 transition-all flex items-center justify-between group shadow-2xs"
+          >
+            <div>
+              <div className="text-xs font-bold text-teal-950 group-hover:text-teal-600 transition-colors">
+                المطابقة والتسوية البنكية
+              </div>
+              <div className="text-[11px] text-teal-600/80 mt-0.5">
+                مطابقة كشوف الحساب بالمدفوعات
+              </div>
+            </div>
+            <span className="text-teal-600 font-bold text-sm">←</span>
+          </Link>
+        )}
+
+        {canReadPeriodClose && (
+          <Link
+            href="/accounting/period-close"
+            className="p-3.5 rounded-xl border border-purple-100 bg-purple-50/40 hover:bg-purple-50 hover:border-purple-200 transition-all flex items-center justify-between group shadow-2xs"
+          >
+            <div>
+              <div className="text-xs font-bold text-purple-950 group-hover:text-purple-600 transition-colors">
+                إقفال الفترات والسنوات
+              </div>
+              <div className="text-[11px] text-purple-600/80 mt-0.5">
+                قفل الفترات المحاسبية والسنة
+              </div>
+            </div>
+            <span className="text-purple-600 font-bold text-sm">←</span>
+          </Link>
+        )}
+
+        {canReadAuditLog && (
+          <Link
+            href="/admin/audit-logs"
+            className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-slate-100 hover:border-slate-300 transition-all flex items-center justify-between group shadow-2xs"
+          >
+            <div>
+              <div className="text-xs font-bold text-slate-800 group-hover:text-slate-900 transition-colors">
+                سجل التدقيق والمراجعة
+              </div>
+              <div className="text-[11px] text-slate-500 mt-0.5">
+                تتبع العمليات والمستخدمين
+              </div>
+            </div>
+            <span className="text-slate-600 font-bold text-sm">←</span>
+          </Link>
+        )}
+      </div>
+
+      {/* 3. Executive KPI Cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <KpiCard
+          label="إجمالي دليل الحسابات"
+          value={accountsTotal}
+          helperText="حسابات معرفة في النظام"
+          tone="info"
+        />
+        <KpiCard
+          label="الحسابات النشطة"
+          value={activeAccounts.length}
+          helperText="جاهزة للتسجيل والقيود"
+          tone="success"
+        />
+        <KpiCard
+          label="إجمالي القيود اليومية"
+          value={journalTotal}
+          helperText="إجمالي القيود المسجلة"
+          tone="neutral"
+        />
+        <KpiCard
+          label="قيود مرحّلة (POSTED)"
+          value={postedJournalsCount}
+          helperText="مؤكدة في دفتر الأستاذ"
+          tone="success"
+        />
+      </div>
+
+      {/* Error Banners */}
       {rowActionErr && (
-        <div className="mb-4 rounded-md bg-rose-50 border border-rose-200 text-rose-800 p-3 text-sm">
-          {rowActionErr}
-        </div>
+        <ErrorBanner
+          title="خطأ في تنفيذ الإجراء"
+          message={rowActionErr}
+          tone="danger"
+        />
       )}
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        {/* ====== Chart of Accounts ====== */}
-        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-          <div className="mb-4 flex items-center justify-between gap-2">
-            <h2 className="text-xl font-semibold text-slate-800">دليل الحسابات</h2>
-            <span className="text-xs text-slate-500">
-              {accountsTotal} حساباً في شركتك
-            </span>
-          </div>
+      {/* 4. Split Layout: Chart of Accounts & Journal Entries */}
+      <div className="grid gap-6 lg:grid-cols-2 items-start">
+        {/* ====== Column 1: Chart of Accounts ====== */}
+        <SectionCard
+          title="دليل الحسابات (Chart of Accounts)"
+          description={`إجمالي ${accountsTotal} حساباً معرفاً في شركتك.`}
+          actions={
+            canCreateAccount ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (isAccountFormOpen && !editingAccountId) {
+                    onCancelEditAccount();
+                  } else {
+                    setEditingAccountId(null);
+                    setAccountForm(emptyAccountForm());
+                    setIsAccountFormOpen(true);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 transition-colors shadow-xs"
+              >
+                {isAccountFormOpen && !editingAccountId ? 'إغلاق النموذج' : '+ حساب جديد'}
+              </button>
+            ) : undefined
+          }
+        >
+          {/* Account Form */}
+          {isAccountFormOpen && (
+            <form
+              onSubmit={onSubmitAccount}
+              className="mb-4 rounded-xl border border-slate-200 bg-slate-50/75 p-4 space-y-3"
+            >
+              <div className="text-xs font-bold text-slate-800 border-b border-slate-200/80 pb-1.5">
+                {editingAccountId ? 'تعديل بيانات الحساب' : 'إضافة حساب جديد إلى الدليل'}
+              </div>
 
-          {/* ---- Account form ---- */}
-          <form
-            onSubmit={onSubmitAccount}
-            className="mb-4 rounded-md border border-slate-200 bg-slate-50 p-3 space-y-3"
-          >
-            <div className="grid grid-cols-2 gap-2">
-              <label className="text-xs text-slate-600">
-                الرمز
-                <input
-                  value={accountForm.code}
-                  onChange={(e) => setAccountField('code', e.target.value)}
-                  disabled={!!editingAccountId}
-                  placeholder="مثال: 1000"
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm disabled:bg-slate-100"
-                  dir="ltr"
-                />
-              </label>
-              <label className="text-xs text-slate-600">
-                الاسم (عربي إنجليزي)
-                <input
-                  value={accountForm.name}
-                  onChange={(e) => setAccountField('name', e.target.value)}
-                  placeholder="Cash / النقدية"
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                  dir="auto"
-                />
-              </label>
-              <label className="text-xs text-slate-600">
-                الاسم بالعربي (اختياري)
-                <input
-                  value={accountForm.nameAr}
-                  onChange={(e) => setAccountField('nameAr', e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                />
-              </label>
-              <label className="text-xs text-slate-600 col-span-2 flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={accountForm.isActive}
-                  onChange={(e) => setAccountField('isActive', e.target.checked)}
-                />
-                نشط
-              </label>
-              <label className="text-xs text-slate-600">
-                النوع
-                <select
-                  value={accountForm.type}
-                  onChange={(e) => onAccountTypeChange(e.target.value as AccountTypeKey)}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                >
-                  {ACCOUNT_TYPES.map((t) => (
-                    <option key={t} value={t}>
-                      {t} — {arAccountType(t)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="text-xs text-slate-600">
-                طبيعة الرصيد
-                <input
-                  value={arNormalBalance(accountForm.normalBalance)}
-                  readOnly
-                  className="mt-1 w-full rounded-md border border-slate-300 bg-slate-100 px-2 py-1 text-sm"
-                  dir="rtl"
-                />
-              </label>
-              <label className="text-xs text-slate-600 col-span-2">
-                حساب الأب (اختياري)
-                <select
-                  value={accountForm.parentId}
-                  onChange={(e) => setAccountField('parentId', e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                  dir="ltr"
-                >
-                  <option value="">— بدون (حساب رئيسي) —</option>
-                  {activeAccounts
-                    .filter((a) => a.id !== editingAccountId)
-                    .map((a) => (
-                      <option key={a.id} value={a.id}>
-                        {a.code} — {a.name} ({a.type})
+              {accountFormErr && <ErrorBanner message={accountFormErr} tone="danger" />}
+
+              <div className="grid grid-cols-2 gap-3">
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">الرمز (Code) *</span>
+                  <input
+                    value={accountForm.code}
+                    onChange={(e) => setAccountField('code', e.target.value)}
+                    disabled={!!editingAccountId}
+                    placeholder="1010"
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono disabled:bg-slate-100 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                    dir="ltr"
+                  />
+                </label>
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">الاسم *</span>
+                  <input
+                    value={accountForm.name}
+                    onChange={(e) => setAccountField('name', e.target.value)}
+                    placeholder="النقدية وما في حكمها"
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  />
+                </label>
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">الاسم بالعربي (اختياري)</span>
+                  <input
+                    value={accountForm.nameAr}
+                    onChange={(e) => setAccountField('nameAr', e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  />
+                </label>
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">نوع الحساب *</span>
+                  <select
+                    value={accountForm.type}
+                    onChange={(e) =>
+                      onAccountTypeChange(e.target.value as AccountTypeKey)
+                    }
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  >
+                    {ACCOUNT_TYPES.map((t) => (
+                      <option key={t} value={t}>
+                        {t} — {arAccountType(t)}
                       </option>
                     ))}
-                </select>
-              </label>
-            </div>
+                  </select>
+                </label>
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">طبيعة الرصيد</span>
+                  <input
+                    value={arNormalBalance(accountForm.normalBalance)}
+                    readOnly
+                    className="w-full rounded-lg border border-slate-200 bg-slate-100 px-2.5 py-1.5 text-xs text-slate-600 font-semibold"
+                  />
+                </label>
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">حساب الأب (رئيسي)</span>
+                  <select
+                    value={accountForm.parentId}
+                    onChange={(e) => setAccountField('parentId', e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                    dir="ltr"
+                  >
+                    <option value="">— حساب رئيسي مستقل —</option>
+                    {activeAccounts
+                      .filter((a) => a.id !== editingAccountId)
+                      .map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.code} — {a.name}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <div className="col-span-2 flex items-center gap-2 pt-1">
+                  <input
+                    type="checkbox"
+                    id="acc-is-active"
+                    checked={accountForm.isActive}
+                    onChange={(e) => setAccountField('isActive', e.target.checked)}
+                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <label htmlFor="acc-is-active" className="text-xs text-slate-700 font-medium">
+                    الحساب نشط ويقبل تسجيل العمليات
+                  </label>
+                </div>
+              </div>
 
-            {accountFormErr && (
-              <p className="text-xs text-rose-700">{accountFormErr}</p>
-            )}
-
-            <div className="flex gap-2">
-              <button
-                type="submit"
-                disabled={
-                  submittingAccount ||
-                  (editingAccountId ? !canUpdateAccount : !canCreateAccount)
-                }
-                className="rounded-md bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white text-xs px-3 py-1.5"
-              >
-                {editingAccountId ? 'حفظ التعديلات' : 'إنشاء الحساب'}
-              </button>
-              {editingAccountId && (
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200/80">
                 <button
                   type="button"
                   onClick={onCancelEditAccount}
-                  className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs px-3 py-1.5"
+                  className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-600 hover:bg-slate-100"
                 >
-                  إلغاء التعديل
+                  إلغاء
                 </button>
-              )}
-            </div>
-          </form>
+                <button
+                  type="submit"
+                  disabled={
+                    submittingAccount ||
+                    (editingAccountId ? !canUpdateAccount : !canCreateAccount)
+                  }
+                  className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold disabled:opacity-40 shadow-xs"
+                >
+                  {submittingAccount
+                    ? 'جاري الحفظ...'
+                    : editingAccountId
+                      ? 'حفظ التعديلات'
+                      : 'إنشاء الحساب'}
+                </button>
+              </div>
+            </form>
+          )}
 
-          {/* ---- Account list filters ---- */}
+          {/* Account Filter Bar */}
           <div className="mb-3 flex flex-wrap gap-2">
             <input
               type="search"
@@ -816,9 +886,9 @@ export default function AccountingPage() {
                 setAccountSearch(e.target.value);
                 setAccountPage(1);
               }}
-              placeholder="ابحث بالرمز أو الاسم"
-              className="flex-1 min-w-[200px] rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-              dir="ltr"
+              placeholder="ابحث بالرمز أو اسم الحساب..."
+              className="flex-1 min-w-[180px] rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+              dir="rtl"
             />
             <select
               value={typeFilter}
@@ -826,102 +896,110 @@ export default function AccountingPage() {
                 setTypeFilter(e.target.value as typeof typeFilter);
                 setAccountPage(1);
               }}
-              className="rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
             >
               <option value="">كل الأنواع</option>
               {ACCOUNT_TYPES.map((t) => (
                 <option key={t} value={t}>
-                  {t}
+                  {t} — {arAccountType(t)}
                 </option>
               ))}
             </select>
           </div>
 
-          {accountsErr && (
-            <p className="text-xs text-rose-700 mb-2">{accountsErr}</p>
-          )}
+          {accountsErr && <ErrorBanner message={accountsErr} tone="danger" />}
 
-          {/* ---- Account list table ---- */}
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-xs text-slate-500 border-b border-slate-200">
+          {/* Accounts Table */}
+          <div className="overflow-x-auto border border-slate-100 rounded-xl">
+            <table className="w-full text-right text-xs">
+              <thead className="bg-slate-50 text-slate-600 border-b border-slate-200/80 font-semibold">
                 <tr>
-                  <th className="text-start py-2 px-2">الرمز</th>
-                  <th className="text-start py-2 px-2">الاسم</th>
-                  <th className="text-start py-2 px-2">النوع</th>
-                  <th className="text-start py-2 px-2">طبيعة</th>
-                  <th className="text-start py-2 px-2">الحالة</th>
-                  <th className="text-start py-2 px-2">إجراءات</th>
+                  <th className="py-2.5 px-3">الرمز</th>
+                  <th className="py-2.5 px-3">اسم الحساب</th>
+                  <th className="py-2.5 px-2">النوع</th>
+                  <th className="py-2.5 px-2">الطبيعة</th>
+                  <th className="py-2.5 px-2">الحالة</th>
+                  <th className="py-2.5 px-2 text-center">الإجراءات</th>
                 </tr>
               </thead>
-              <tbody>
-                {loadingAccounts && (
+              <tbody className="divide-y divide-slate-100">
+                {loadingAccounts ? (
                   <tr>
-                    <td colSpan={6} className="text-center text-slate-400 py-4">...جاري التحميل</td>
+                    <td colSpan={6} className="py-8 text-center text-slate-400">
+                      <LoadingState message="جاري تحميل الحسابات..." />
+                    </td>
                   </tr>
-                )}
-                {!loadingAccounts && accounts.length === 0 && (
+                ) : accounts.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="text-center text-slate-400 py-4">
-                      لا توجد حسابات. أنشئ الحساب الأول من النموذج أعلاه.
+                    <td colSpan={6} className="py-8 text-center text-slate-400">
+                      لا توجد حسابات مطابقة للبحث.
                     </td>
                   </tr>
+                ) : (
+                  accounts.map((a) => (
+                    <tr key={a.id} className="hover:bg-slate-50/60 transition-colors">
+                      <td className="py-2 px-3 font-mono font-bold text-slate-900" dir="ltr">
+                        {a.code}
+                      </td>
+                      <td className="py-2 px-3 text-slate-800 font-medium">
+                        <div>{a.name}</div>
+                        {a.nameAr && (
+                          <div className="text-[10px] text-slate-400">{a.nameAr}</div>
+                        )}
+                      </td>
+                      <td className="py-2 px-2 text-slate-600 font-sans">
+                        {arAccountType(a.type)}
+                      </td>
+                      <td className="py-2 px-2 text-slate-500">
+                        {arNormalBalance(a.normalBalance)}
+                      </td>
+                      <td className="py-2 px-2">
+                        {a.deletedAt ? (
+                          <StatusBadge status="neutral" label="محذوف" />
+                        ) : a.isActive ? (
+                          <StatusBadge status="success" label="نشط" />
+                        ) : (
+                          <StatusBadge status="warning" label="موقوف" />
+                        )}
+                      </td>
+                      <td className="py-2 px-2">
+                        <div className="flex items-center justify-center gap-1">
+                          <button
+                            type="button"
+                            disabled={!canUpdateAccount || !!a.deletedAt}
+                            onClick={() => onEditAccount(a)}
+                            className="px-2 py-0.5 rounded text-[11px] border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 disabled:opacity-40"
+                          >
+                            تعديل
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!canDeleteAccount || !!a.deletedAt}
+                            onClick={() => onDeleteAccount(a)}
+                            className="px-2 py-0.5 rounded text-[11px] border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 disabled:opacity-40"
+                          >
+                            حذف
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))
                 )}
-                {accounts.map((a) => (
-                  <tr key={a.id} className="border-b border-slate-100">
-                    <td className="py-2 px-2 font-mono" dir="ltr">{a.code}</td>
-                    <td className="py-2 px-2">
-                      <div>{a.name}</div>
-                      {a.nameAr && (
-                        <div className="text-xs text-slate-500">{a.nameAr}</div>
-                      )}
-                    </td>
-                    <td className="py-2 px-2" dir="ltr">{arAccountType(a.type)}</td>
-                    <td className="py-2 px-2">{arNormalBalance(a.normalBalance)}</td>
-                    <td className="py-2 px-2">
-                      {a.deletedAt
-                        ? <span className="text-rose-600">محذوف</span>
-                        : a.isActive
-                          ? <span className="text-emerald-600">نشط</span>
-                          : <span className="text-amber-600">موقوف</span>}
-                    </td>
-                    <td className="py-2 px-2">
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          disabled={!canUpdateAccount || !!a.deletedAt}
-                          onClick={() => onEditAccount(a)}
-                          className="text-xs rounded-md bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white px-2 py-1"
-                        >
-                          تعديل
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!canDeleteAccount || !!a.deletedAt}
-                          onClick={() => onDeleteAccount(a)}
-                          className="text-xs rounded-md bg-rose-600 hover:bg-rose-700 disabled:bg-slate-300 text-white px-2 py-1"
-                        >
-                          حذف
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
               </tbody>
             </table>
           </div>
 
-          {/* ---- Pagination ---- */}
-          <div className="mt-3 flex items-center justify-between text-xs">
-            <span className="text-slate-500">
+          {/* Accounts Pagination */}
+          <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
+            <span>
               صفحة {accountPage} من {totalAccountsPages}
             </span>
-            <div className="flex gap-2">
+            <div className="flex gap-1.5">
               <button
                 type="button"
                 disabled={accountPage <= 1}
                 onClick={() => setAccountPage((p) => Math.max(1, p - 1))}
-                className="rounded-md bg-slate-200 hover:bg-slate-300 disabled:bg-slate-100 text-slate-800 px-2 py-1"
+                className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40"
               >
                 السابق
               </button>
@@ -929,206 +1007,247 @@ export default function AccountingPage() {
                 type="button"
                 disabled={accountPage >= totalAccountsPages}
                 onClick={() => setAccountPage((p) => p + 1)}
-                className="rounded-md bg-slate-200 hover:bg-slate-300 disabled:bg-slate-100 text-slate-800 px-2 py-1"
+                className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40"
               >
                 التالي
               </button>
             </div>
           </div>
-        </section>
+        </SectionCard>
 
-        {/* ====== Manual Journal Entries ====== */}
-        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-          <div className="mb-4 flex items-center justify-between gap-2">
-            <h2 className="text-xl font-semibold text-slate-800">القيود اليومية</h2>
-            <span className="text-xs text-slate-500">
-              {journalTotal} قيداً في شركتك
-            </span>
-          </div>
-
-          {/* ---- Journal form ---- */}
-          <form
-            onSubmit={onSubmitJournal}
-            className="mb-4 rounded-md border border-slate-200 bg-slate-50 p-3 space-y-3"
-          >
-            <div className="grid grid-cols-2 gap-2">
-              <label className="text-xs text-slate-600">
-                تاريخ القيد (اختياري)
-                <input
-                  type="date"
-                  value={journalForm.entryDate}
-                  onChange={(e) => setJournalField('entryDate', e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                  dir="ltr"
-                />
-              </label>
-              <label className="text-xs text-slate-600">
-                المرجع
-                <input
-                  value={journalForm.reference}
-                  onChange={(e) => setJournalField('reference', e.target.value)}
-                  placeholder="INV-001"
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                  dir="ltr"
-                />
-              </label>
-              <label className="text-xs text-slate-600 col-span-2">
-                الوصف (سطور القيد)
-                <input
-                  value={journalForm.description}
-                  onChange={(e) => setJournalField('description', e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                />
-              </label>
-              <label className="text-xs text-slate-600 col-span-2">
-                ملاحظات
-                <textarea
-                  value={journalForm.notes}
-                  onChange={(e) => setJournalField('notes', e.target.value)}
-                  rows={2}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                />
-              </label>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead className="text-slate-500 border-b border-slate-200">
-                  <tr>
-                    <th className="text-start py-1 px-2">الحساب</th>
-                    <th className="text-start py-1 px-2">الوصف</th>
-                    <th className="text-start py-1 px-2">مدين</th>
-                    <th className="text-start py-1 px-2">دائن</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {journalForm.lines.map((line, idx) => {
-                    const a = accountById.get(line.accountId);
-                    const bothSet = Number(line.debit) > 0 && Number(line.credit) > 0;
-                    const bothZero = Number(line.debit) === 0 && Number(line.credit) === 0;
-                    const lineErr = bothSet || bothZero;
-                    return (
-                      <tr key={idx} className="border-b border-slate-100">
-                        <td className="py-1 px-2">
-                          <select
-                            value={line.accountId}
-                            onChange={(e) => setLine(idx, { accountId: e.target.value })}
-                            className="w-full rounded-md border border-slate-300 px-1 py-0.5 text-xs"
-                            dir="ltr"
-                          >
-                            <option value="">— اختر —</option>
-                            {activeAccounts.map((acc) => (
-                              <option key={acc.id} value={acc.id}>
-                                {acc.code} — {acc.name} ({arNormalBalance(acc.normalBalance)})
-                              </option>
-                            ))}
-                          </select>
-                          {a && (
-                            <div className="text-[10px] text-slate-500 mt-0.5" dir="ltr">
-                              {a.type} · {arNormalBalance(a.normalBalance)}
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-1 px-2">
-                          <input
-                            value={line.description}
-                            onChange={(e) => setLine(idx, { description: e.target.value })}
-                            className="w-full rounded-md border border-slate-300 px-1 py-0.5 text-xs"
-                          />
-                        </td>
-                        <td className="py-1 px-2">
-                          <input
-                            value={line.debit}
-                            onChange={(e) => setLine(idx, { debit: e.target.value })}
-                            placeholder="0.0000"
-                            disabled={Number(line.credit) > 0}
-                            className="w-24 rounded-md border border-slate-300 px-1 py-0.5 text-xs disabled:bg-slate-100"
-                            dir="ltr"
-                          />
-                        </td>
-                        <td className="py-1 px-2">
-                          <input
-                            value={line.credit}
-                            onChange={(e) => setLine(idx, { credit: e.target.value })}
-                            placeholder="0.0000"
-                            disabled={Number(line.debit) > 0}
-                            className="w-24 rounded-md border border-slate-300 px-1 py-0.5 text-xs disabled:bg-slate-100"
-                            dir="ltr"
-                          />
-                        </td>
-                        <td className="py-1 px-2">
-                          <button
-                            type="button"
-                            onClick={() => removeLine(idx)}
-                            disabled={journalForm.lines.length <= 2}
-                            className="text-[10px] rounded-md bg-rose-100 hover:bg-rose-200 disabled:bg-slate-100 text-rose-700 px-1.5 py-0.5"
-                          >
-                            حذف سطر
-                          </button>
-                          {lineErr && (
-                            <div className="text-[10px] text-rose-600 mt-1">
-                              {bothSet ? 'لا يمكن كلاهما' : 'كلاهما صفر'}
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-                <tfoot>
-                  <tr className="border-t border-slate-200 font-semibold">
-                    <td colSpan={2} className="py-1 px-2 text-end">الإجمالي</td>
-                    <td className="py-1 px-2" dir="ltr">{liveTotals.td.toFixed(4)}</td>
-                    <td className="py-1 px-2" dir="ltr">{liveTotals.tc.toFixed(4)}</td>
-                    <td className="py-1 px-2">
-                      {liveTotals.balanced ? (
-                        <span className="text-[10px] text-emerald-600">✓ متوازن</span>
-                      ) : (
-                        <span className="text-[10px] text-amber-600">غير متوازن أو &lt; سطرين</span>
-                      )}
-                    </td>
-                  </tr>
-                </tfoot>
-              </table>
-            </div>
-
-            <div className="flex gap-2 flex-wrap">
+        {/* ====== Column 2: Manual Journal Entries ====== */}
+        <SectionCard
+          title="القيود اليومية (Manual Journal Entries)"
+          description={`إجمالي ${journalTotal} قيداً مسجلاً في النظام.`}
+          actions={
+            canCreateJournal ? (
               <button
                 type="button"
-                onClick={addLine}
-                className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs px-2 py-1"
+                onClick={() => {
+                  if (isJournalFormOpen && !editingJournalId) {
+                    onCancelEditJournal();
+                  } else {
+                    setEditingJournalId(null);
+                    setJournalForm(emptyJournalForm());
+                    setIsJournalFormOpen(true);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-lg bg-teal-600 text-white text-xs font-semibold hover:bg-teal-700 transition-colors shadow-xs"
               >
-                + سطر
+                {isJournalFormOpen && !editingJournalId ? 'إغلاق النموذج' : '+ قيد جديد'}
               </button>
-              <button
-                type="submit"
-                disabled={
-                  submittingJournal ||
-                  !liveTotals.balanced ||
-                  (editingJournalId ? !canUpdateJournal : !canCreateJournal)
-                }
-                className="rounded-md bg-teal-600 hover:bg-teal-700 disabled:bg-slate-300 text-white text-xs px-3 py-1.5"
-              >
-                {editingJournalId ? 'حفظ تعديلات المسودة' : 'إنشاء قيد (DRAFT)'}
-              </button>
-              {editingJournalId && (
+            ) : undefined
+          }
+        >
+          {/* Journal Form */}
+          {isJournalFormOpen && (
+            <form
+              onSubmit={onSubmitJournal}
+              className="mb-4 rounded-xl border border-slate-200 bg-slate-50/75 p-4 space-y-3"
+            >
+              <div className="text-xs font-bold text-slate-800 border-b border-slate-200/80 pb-1.5">
+                {editingJournalId ? 'تعديل مسودة القيد اليومي' : 'إنشاء قيد يدوي متوازن (DRAFT)'}
+              </div>
+
+              {journalFormErr && <ErrorBanner message={journalFormErr} tone="danger" />}
+
+              <div className="grid grid-cols-2 gap-3">
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">تاريخ القيد</span>
+                  <input
+                    type="date"
+                    value={journalForm.entryDate}
+                    onChange={(e) => setJournalField('entryDate', e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                    dir="ltr"
+                  />
+                </label>
+                <label className="text-xs font-medium text-slate-700">
+                  <span className="block mb-1">المرجع (Reference)</span>
+                  <input
+                    value={journalForm.reference}
+                    onChange={(e) => setJournalField('reference', e.target.value)}
+                    placeholder="JV-2026-001"
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                    dir="ltr"
+                  />
+                </label>
+                <label className="text-xs font-medium text-slate-700 col-span-2">
+                  <span className="block mb-1">الوصف العام للقيد *</span>
+                  <input
+                    value={journalForm.description}
+                    onChange={(e) => setJournalField('description', e.target.value)}
+                    placeholder="تسوية مصروفات أو قيد افتتاحي..."
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  />
+                </label>
+                <label className="text-xs font-medium text-slate-700 col-span-2">
+                  <span className="block mb-1">ملاحظات داخلية</span>
+                  <textarea
+                    rows={1}
+                    value={journalForm.notes}
+                    onChange={(e) => setJournalField('notes', e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  />
+                </label>
+              </div>
+
+              {/* Journal Lines Table */}
+              <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white">
+                <table className="w-full text-right text-xs">
+                  <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+                    <tr>
+                      <th className="py-2 px-2.5">الحساب *</th>
+                      <th className="py-2 px-2.5">البيان</th>
+                      <th className="py-2 px-2.5">مدين (Debit)</th>
+                      <th className="py-2 px-2.5">دائن (Credit)</th>
+                      <th className="py-2 px-2"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {journalForm.lines.map((line, idx) => {
+                      const a = accountById.get(line.accountId);
+                      const bothSet = Number(line.debit) > 0 && Number(line.credit) > 0;
+                      const bothZero = Number(line.debit) === 0 && Number(line.credit) === 0;
+                      const lineErr = bothSet || bothZero;
+                      return (
+                        <tr key={idx}>
+                          <td className="py-1.5 px-2">
+                            <select
+                              value={line.accountId}
+                              onChange={(e) =>
+                                setLine(idx, { accountId: e.target.value })
+                              }
+                              className="w-full rounded border border-slate-200 px-1.5 py-1 text-xs"
+                              dir="rtl"
+                            >
+                              <option value="">— اختر حساباً —</option>
+                              {activeAccounts.map((acc) => (
+                                <option key={acc.id} value={acc.id}>
+                                  {acc.code} — {acc.name}
+                                </option>
+                              ))}
+                            </select>
+                            {a && (
+                              <div className="text-[10px] text-slate-400 font-mono mt-0.5" dir="ltr">
+                                {a.type} • {arNormalBalance(a.normalBalance)}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-1.5 px-2">
+                            <input
+                              value={line.description}
+                              onChange={(e) =>
+                                setLine(idx, { description: e.target.value })
+                              }
+                              placeholder="بيان السطر..."
+                              className="w-full rounded border border-slate-200 px-1.5 py-1 text-xs"
+                            />
+                          </td>
+                          <td className="py-1.5 px-2">
+                            <input
+                              value={line.debit}
+                              onChange={(e) => setLine(idx, { debit: e.target.value })}
+                              placeholder="0.00"
+                              disabled={Number(line.credit) > 0}
+                              className="w-20 rounded border border-slate-200 px-1.5 py-1 text-xs font-mono disabled:bg-slate-100"
+                              dir="ltr"
+                            />
+                          </td>
+                          <td className="py-1.5 px-2">
+                            <input
+                              value={line.credit}
+                              onChange={(e) => setLine(idx, { credit: e.target.value })}
+                              placeholder="0.00"
+                              disabled={Number(line.debit) > 0}
+                              className="w-20 rounded border border-slate-200 px-1.5 py-1 text-xs font-mono disabled:bg-slate-100"
+                              dir="ltr"
+                            />
+                          </td>
+                          <td className="py-1.5 px-2 text-center">
+                            <button
+                              type="button"
+                              onClick={() => removeLine(idx)}
+                              disabled={journalForm.lines.length <= 2}
+                              className="text-rose-500 hover:text-rose-700 disabled:opacity-30 text-xs"
+                              title="حذف السطر"
+                            >
+                              ✕
+                            </button>
+                            {lineErr && (
+                              <div className="text-[9px] text-rose-500">
+                                {bothSet ? 'خطأ' : 'صفر'}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr className="bg-slate-50 border-t border-slate-200 font-semibold text-xs">
+                      <td colSpan={2} className="py-2 px-2.5 text-end text-slate-700">
+                        الإجمالي:
+                      </td>
+                      <td className="py-2 px-2.5 font-mono text-blue-700" dir="ltr">
+                        {liveTotals.td.toFixed(2)}
+                      </td>
+                      <td className="py-2 px-2.5 font-mono text-blue-700" dir="ltr">
+                        {liveTotals.tc.toFixed(2)}
+                      </td>
+                      <td className="py-2 px-2 text-center">
+                        {liveTotals.balanced ? (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800">
+                            ✓ متزن
+                          </span>
+                        ) : (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800">
+                            غير متزن
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+
+              <div className="flex items-center justify-between pt-1">
                 <button
                   type="button"
-                  onClick={onCancelEditJournal}
-                  className="rounded-md bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs px-3 py-1.5"
+                  onClick={addLine}
+                  className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700"
                 >
-                  إلغاء التعديل
+                  + سطر قيد جديد
                 </button>
-              )}
-            </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onCancelEditJournal}
+                    className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-600 hover:bg-slate-100"
+                  >
+                    إلغاء
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={
+                      submittingJournal ||
+                      !liveTotals.balanced ||
+                      (editingJournalId ? !canUpdateJournal : !canCreateJournal)
+                    }
+                    className="px-4 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-xs font-semibold disabled:opacity-40 shadow-xs"
+                  >
+                    {submittingJournal
+                      ? 'جاري الحفظ...'
+                      : editingJournalId
+                        ? 'حفظ تعديل المسودة'
+                        : 'إنشاء مسودة القيد'}
+                  </button>
+                </div>
+              </div>
+            </form>
+          )}
 
-            {journalFormErr && (
-              <p className="text-xs text-rose-700">{journalFormErr}</p>
-            )}
-          </form>
-
-          {/* ---- Journal list filters ---- */}
+          {/* Journal Filter Bar */}
           <div className="mb-3 flex flex-wrap gap-2">
             <input
               type="search"
@@ -1137,9 +1256,9 @@ export default function AccountingPage() {
                 setJournalSearch(e.target.value);
                 setJournalPage(1);
               }}
-              placeholder="ابحث برقم القيد / الوصف / الملاحظات"
-              className="flex-1 min-w-[200px] rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-              dir="ltr"
+              placeholder="ابحث برقم القيد / الوصف / المرجع..."
+              className="flex-1 min-w-[180px] rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+              dir="rtl"
             />
             <select
               value={statusFilter}
@@ -1147,104 +1266,118 @@ export default function AccountingPage() {
                 setStatusFilter(e.target.value as typeof statusFilter);
                 setJournalPage(1);
               }}
-              className="rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
             >
               <option value="">كل الحالات</option>
-              <option value="DRAFT">مسودة</option>
-              <option value="POSTED">مرحّل</option>
-              <option value="CANCELLED">ملغى</option>
+              <option value="DRAFT">مسودة (DRAFT)</option>
+              <option value="POSTED">مرحّل (POSTED)</option>
+              <option value="CANCELLED">ملغى (CANCELLED)</option>
             </select>
           </div>
 
-          {journalErr && (
-            <p className="text-xs text-rose-700 mb-2">{journalErr}</p>
-          )}
+          {journalErr && <ErrorBanner message={journalErr} tone="danger" />}
 
-          {/* ---- Journal list table ---- */}
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-xs text-slate-500 border-b border-slate-200">
+          {/* Journal Table */}
+          <div className="overflow-x-auto border border-slate-100 rounded-xl">
+            <table className="w-full text-right text-xs">
+              <thead className="bg-slate-50 text-slate-600 border-b border-slate-200/80 font-semibold">
                 <tr>
-                  <th className="text-start py-2 px-2">رقم القيد</th>
-                  <th className="text-start py-2 px-2">التاريخ</th>
-                  <th className="text-start py-2 px-2">الحالة</th>
-                  <th className="text-start py-2 px-2">مدين</th>
-                  <th className="text-start py-2 px-2">دائن</th>
-                  <th className="text-start py-2 px-2">إجراءات</th>
+                  <th className="py-2.5 px-3">رقم القيد</th>
+                  <th className="py-2.5 px-2">التاريخ</th>
+                  <th className="py-2.5 px-2">الحالة</th>
+                  <th className="py-2.5 px-2">المدين</th>
+                  <th className="py-2.5 px-2">الدائن</th>
+                  <th className="py-2.5 px-2 text-center">الإجراءات</th>
                 </tr>
               </thead>
-              <tbody>
-                {loadingJournal && (
+              <tbody className="divide-y divide-slate-100">
+                {loadingJournal ? (
                   <tr>
-                    <td colSpan={6} className="text-center text-slate-400 py-4">...جاري التحميل</td>
+                    <td colSpan={6} className="py-8 text-center text-slate-400">
+                      <LoadingState message="جاري تحميل القيود..." />
+                    </td>
                   </tr>
-                )}
-                {!loadingJournal && journal.length === 0 && (
+                ) : journal.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="text-center text-slate-400 py-4">
-                      لا توجد قيود. أنشئ أول قيد متوازن من النموذج أعلاه.
+                    <td colSpan={6} className="py-8 text-center text-slate-400">
+                      لا توجد قيود يومية مسجلة.
                     </td>
                   </tr>
+                ) : (
+                  journal.map((j) => (
+                    <tr key={j.id} className="hover:bg-slate-50/60 transition-colors">
+                      <td className="py-2 px-3 font-mono font-bold text-slate-900" dir="ltr">
+                        {j.entryNumber}
+                      </td>
+                      <td className="py-2 px-2 text-slate-500 font-mono" dir="ltr">
+                        {fmtDate(j.entryDate)}
+                      </td>
+                      <td className="py-2 px-2">
+                        {j.status === 'POSTED' ? (
+                          <StatusBadge status="success" label="مرحّل" />
+                        ) : j.status === 'DRAFT' ? (
+                          <StatusBadge status="warning" label="مسودة" />
+                        ) : (
+                          <StatusBadge status="neutral" label="ملغى" />
+                        )}
+                        {j._count && (
+                          <span className="ms-1 text-[10px] text-slate-400 font-mono">
+                            ({j._count.lines})
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 px-2 font-mono font-semibold text-slate-800" dir="ltr">
+                        {fmtMoney(j.totalDebit)}
+                      </td>
+                      <td className="py-2 px-2 font-mono font-semibold text-slate-800" dir="ltr">
+                        {fmtMoney(j.totalCredit)}
+                      </td>
+                      <td className="py-2 px-2">
+                        <div className="flex items-center justify-center gap-1">
+                          <button
+                            type="button"
+                            disabled={!canUpdateJournal || j.status !== 'DRAFT'}
+                            onClick={() => onEditJournal(j)}
+                            className="px-2 py-0.5 rounded text-[11px] border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 disabled:opacity-40"
+                          >
+                            تعديل
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!canPostJournal || j.status !== 'DRAFT'}
+                            onClick={() => onPostJournal(j)}
+                            className="px-2 py-0.5 rounded text-[11px] bg-emerald-600 hover:bg-emerald-700 text-white font-medium disabled:opacity-40"
+                          >
+                            ترحيل
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!canCancelJournal || j.status !== 'DRAFT'}
+                            onClick={() => onCancelJournal(j)}
+                            className="px-2 py-0.5 rounded text-[11px] border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 disabled:opacity-40"
+                          >
+                            إلغاء
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))
                 )}
-                {journal.map((e) => (
-                  <tr key={e.id} className="border-b border-slate-100">
-                    <td className="py-2 px-2 font-mono" dir="ltr">{e.entryNumber}</td>
-                    <td className="py-2 px-2 text-xs" dir="ltr">{fmtDate(e.entryDate)}</td>
-                    <td className="py-2 px-2">
-                      {e.status === 'DRAFT' && <span className="text-amber-700">مسودة</span>}
-                      {e.status === 'POSTED' && <span className="text-emerald-700">مرحّل</span>}
-                      {e.status === 'CANCELLED' && <span className="text-rose-700">ملغى</span>}
-                      {e._count && (
-                        <span className="ms-2 text-[10px] text-slate-500" dir="ltr">({e._count.lines} سطر)</span>
-                      )}
-                    </td>
-                    <td className="py-2 px-2" dir="ltr">{fmtMoney(e.totalDebit)}</td>
-                    <td className="py-2 px-2" dir="ltr">{fmtMoney(e.totalCredit)}</td>
-                    <td className="py-2 px-2">
-                      <div className="flex gap-1 flex-wrap">
-                        <button
-                          type="button"
-                          disabled={!canUpdateJournal || e.status !== 'DRAFT'}
-                          onClick={() => onEditJournal(e)}
-                          className="text-[11px] rounded-md bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white px-2 py-1"
-                        >
-                          تعديل
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!canPostJournal || e.status !== 'DRAFT'}
-                          onClick={() => onPostJournal(e)}
-                          className="text-[11px] rounded-md bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white px-2 py-1"
-                        >
-                          ترحيل
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!canCancelJournal || e.status !== 'DRAFT'}
-                          onClick={() => onCancelJournal(e)}
-                          className="text-[11px] rounded-md bg-rose-600 hover:bg-rose-700 disabled:bg-slate-300 text-white px-2 py-1"
-                        >
-                          إلغاء
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
               </tbody>
             </table>
           </div>
 
-          {/* ---- Pagination ---- */}
-          <div className="mt-3 flex items-center justify-between text-xs">
-            <span className="text-slate-500">
+          {/* Journal Pagination */}
+          <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
+            <span>
               صفحة {journalPage} من {totalJournalPages}
             </span>
-            <div className="flex gap-2">
+            <div className="flex gap-1.5">
               <button
                 type="button"
                 disabled={journalPage <= 1}
                 onClick={() => setJournalPage((p) => Math.max(1, p - 1))}
-                className="rounded-md bg-slate-200 hover:bg-slate-300 disabled:bg-slate-100 text-slate-800 px-2 py-1"
+                className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40"
               >
                 السابق
               </button>
@@ -1252,20 +1385,17 @@ export default function AccountingPage() {
                 type="button"
                 disabled={journalPage >= totalJournalPages}
                 onClick={() => setJournalPage((p) => p + 1)}
-                className="rounded-md bg-slate-200 hover:bg-slate-300 disabled:bg-slate-100 text-slate-800 px-2 py-1"
+                className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40"
               >
                 التالي
               </button>
             </div>
           </div>
-        </section>
+        </SectionCard>
       </div>
 
-      <p className="mt-6 text-xs text-slate-400">
-        ملاحظة: كل الأرقام (Debit / Credit) نصوص بصرف Decimal @db.Decimal(18,4)
-        من الـ backend — لا Number في الواجهة. لا توجد قيود آلية من المبيعات أو
-        المشتريات هنا (لا AR / AP / VAT / ZATCA)، ولا توجد ميزانيات مراجعة أو
-        قوائم مالية — هذه خارج نطاق Phase 6.
+      <p className="text-xs text-slate-400 text-center leading-relaxed">
+        القيم والأرصدة المحاسبية تتبع معيار القيود المزدوجة الدقيقة. الترحيل ينقل القيد نهائياً لدفتر الأستاذ العام والقوائم المالية.
       </p>
     </main>
   );
